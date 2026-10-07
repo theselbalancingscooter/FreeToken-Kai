@@ -73,6 +73,7 @@ class ServerArgs(SchedulerConfig):
     # prompt_tokens_details.cached_tokens, Anthropic cache_read_input_tokens, Responses
     # input_tokens_details.cached_tokens). Mirrors sglang's --enable-cache-report.
     enable_cache_report: bool = False
+    anthropic_inline_system: str = "auto"
     # Comma-separated hostname allowlist for client-supplied image URLs; empty admits any domain.
     allowed_media_domains: str = ""
     # Directory file:// image refs may be read from; empty rejects local files.
@@ -217,6 +218,8 @@ def parse_args(
             return "qwen3_coder"
         if "qwen" in marker:
             return "qwen25"
+        if "deepseek_v41" in marker or "deepseekv41" in marker:
+            return "deepseekv41"
         if "deepseek" in marker and ("v4" in marker or "deepseek_v4" in marker):
             return "deepseekv32"
         if "deepseek" in marker and ("v3.2" in marker or "v32" in marker):
@@ -622,6 +625,14 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--anthropic-inline-system",
+        choices=("auto", "preserve", "fold"),
+        default=ServerArgs.anthropic_inline_system,
+        help="Preserve inline system instructions when supported by the renderer, "
+        "or fold them into nearby user/tool content without hoisting the prompt prefix.",
+    )
+
+    parser.add_argument(
         "--sampling-defaults",
         type=str,
         default=ServerArgs.sampling_defaults,
@@ -653,6 +664,7 @@ def parse_args(
             "qwen3_coder",
             "mistral",
             "deepseekv32",
+            "deepseekv41",
             "gemma4",
             "glm47",
             "minimax",
@@ -686,8 +698,8 @@ def parse_args(
         choices=["auto", *MOE_STRATEGIES],
         help=(
             "How the routed experts are served. 'auto' resolves a MoE model to the offload family "
-            "(offload, or hybrid when a `ft bench bw` profile recommends it); resident "
-            "'fused' experts must be requested explicitly."
+            "(offload, or hybrid when a `ft bench bw` profile recommends it), and to resident "
+            "'fused' experts on unified-memory GPUs (GB10 / DGX Spark)."
         ),
     )
 
@@ -719,6 +731,17 @@ def parse_args(
         help=(
             "Where a PLE n-gram table lives. 'disk' (default) reads rows straight from the "
             "checkpoint files; 'pinned' preloads the whole table into page-locked host RAM."
+        ),
+    )
+
+    parser.add_argument(
+        "--swa-decoder-replay",
+        default=ServerArgs.swa_decoder_replay,
+        choices=["bounded", "exact"],
+        help=(
+            "DeepSeek-V4.1 Decoder SWA Bounded Replay. 'bounded' (default) runs the 20 decoder layers "
+            "on each prompt's last 128 tokens with their sliding window truncated there, as in the "
+            "tech report; 'exact' runs them on every prompt token (the reference numerics)."
         ),
     )
 

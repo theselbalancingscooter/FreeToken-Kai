@@ -29,6 +29,7 @@ _SMALL_BANK_FEAT_BYTES = 256 * 1024
 # Rows of OffloadMoeCache.hybrid_stats (the hybrid kernel indexes them by these numbers).
 HYBRID_STAT_MISSING, HYBRID_STAT_ACTIVE, HYBRID_STAT_FETCHED, HYBRID_STAT_STEPS = range(4)
 
+from freetoken.kernel.fast_index_copy import default_blocks_per_bank
 from freetoken.utils import init_logger
 from freetoken.utils.prefill_profile import active as _prefill_profile
 from freetoken.utils.prefill_profile import major_faults as _major_faults
@@ -292,6 +293,7 @@ class OffloadMoeCache:
         # Source pointers are per layer (_copy_src_ptrs[layer_id] -> [num_banks] device
         # tensor); dst/feat are layer-invariant.
         self._copy_fused_ok = False
+        self._copy_blocks_per_bank = 8
         self._copy_dst_ptrs: torch.Tensor | None = None
         self._copy_src_ptrs: list[torch.Tensor] | None = None
         self._copy_feat_bytes: torch.Tensor | None = None
@@ -476,6 +478,7 @@ class OffloadMoeCache:
         elif self._gather_bank_ids:
             self._gather_dst_ptrs = self._copy_dst_ptrs[self._gather_bank_ids].contiguous()
             self._gather_feat_bytes = self._copy_feat_bytes[self._gather_bank_ids].contiguous()
+        self._copy_blocks_per_bank = default_blocks_per_bank(self.device)
         self._copy_fused_ok = True
 
     def validate_rebuild(self, cache_size: int) -> None:
@@ -1247,6 +1250,7 @@ class OffloadMoeCache:
                 self.evict_slots,
                 self.src_indices,
                 self.num_indices,
+                blocks_per_bank=self._copy_blocks_per_bank,
             )
             return
 
@@ -1263,20 +1267,9 @@ class OffloadMoeCache:
 
 
 def iter_offload_moe_layers(model) -> Iterator:
-    from freetoken.layers import BaseOP, OffloadMoELayer
+    from freetoken.layers import OffloadMoELayer, iter_moe_layers
 
-    if isinstance(model, OffloadMoELayer):
-        yield model
-
-    if not isinstance(model, BaseOP):
-        return
-
-    for value in model.__dict__.values():
-        if isinstance(value, BaseOP):
-            yield from iter_offload_moe_layers(value)
-        elif isinstance(value, (list, tuple)):
-            for item in value:
-                yield from iter_offload_moe_layers(item)
+    return (layer for layer in iter_moe_layers(model) if isinstance(layer, OffloadMoELayer))
 
 
 def attach_offload_moe_cache(model, cache: OffloadMoeCache) -> list:
