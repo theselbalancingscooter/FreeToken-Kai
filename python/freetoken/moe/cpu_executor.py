@@ -53,8 +53,14 @@ _FLAG_SYNC = os.getenv("FREETOKEN_CPU_MOE_FLAG_SYNC", "1") != "0"
 # sizes plus any eager padded sizes); more than that is unheard of, and the overflow
 # just keeps the host-func path for the extra combos.
 _FLAG_SLOTS_PER_LAYER = 16
-# Pool threads spin up to 50 ms before they park. FREETOKEN_CPU_MOE_SPIN=0 opts out.
-_SPIN_WAIT = os.getenv("FREETOKEN_CPU_MOE_SPIN", "1") != "0"
+# Pool threads spin up to 50 ms before they park (upstream #619). FREETOKEN_CPU_MOE_SPIN=0 opts
+# out, =1 forces it on; unset is automatic: on where the pool's CPUs are its own, off under
+# --pp-size, where every rank runs a pool on the same cores (Kai). Measured with Flash-Next on
+# two RTX 3060s (hybrid, 7 threads per rank on a 10-core host, --spec-mtp 5): a verify window
+# took 224 ms spinning against 158 ms parked, -30% of the tokens; the same build on one RTX
+# 2060 (Ornith, 11 threads on 16 cores, one rank) gained 3-6% spinning.
+_SPIN_WAIT_ENV = os.getenv("FREETOKEN_CPU_MOE_SPIN")
+_SPIN_WAIT = _SPIN_WAIT_ENV != "0"
 
 # Activation ids must match ActKind in csrc/cpu_moe/cpu_moe_ext.cpp. Id 3 is the
 # clamped (up + 1) swiglu: "swigluoai" runs it in the generic GEMV epilogue,
@@ -119,9 +125,18 @@ def physical_core_cpus() -> list[int]:
 
 
 def _spin_wait_ok(core_ids: list[int], coord_core: int) -> bool:
-    """Spin only if each pool thread owns a distinct CPU and two CPUs stay free for the main and CUDA callback threads."""
+    """Spin only if each pool thread owns a distinct CPU and two CPUs stay free for the main and
+    CUDA callback threads -- and, unless FREETOKEN_CPU_MOE_SPIN=1 says otherwise, not under
+    --pp-size: the ranks' pools are pinned to the same cores, so their spinners take the CPUs
+    the other rank's workers, host-side launches and the flag coordinator need (see _SPIN_WAIT)."""
     if not _SPIN_WAIT or not hasattr(os, "sched_getaffinity"):
         return False
+    if _SPIN_WAIT_ENV != "1":
+        from freetoken.distributed import try_get_pp_info
+
+        pp = try_get_pp_info()
+        if pp is not None and getattr(pp, "size", 1) > 1:
+            return False
     pool = list(core_ids) + ([coord_core] if coord_core >= 0 else [])
     if len(set(pool)) != len(pool):
         return False
