@@ -135,12 +135,24 @@ def fresh_ctx(page_size: int = 64, **fields):
 
 
 def fill_weights(op, seed: int, device: torch.device, scale: float = 0.05) -> None:
+    """Random floats / zeroed ints for every state-dict tensor of an op tree, and random expert
+    banks for its resident MoE layers (since upstream #601 they live outside the state dict and
+    are attached after the dense weights load; upstream's test_skeleton fills them the same way)."""
+    from freetoken.layers import iter_moe_layers
+
     gen = torch.Generator(device=device).manual_seed(seed)
     for tensor in op.state_dict().values():
         if tensor.is_floating_point():
             tensor.normal_(0.0, scale, generator=gen)
         else:
             tensor.zero_()
+    for layer in iter_moe_layers(op):
+        if getattr(layer, "_expert_banks", None) is not None or getattr(layer, "quant_method", None) is None:
+            continue
+        layer._expert_banks = {
+            role: torch.randn((layer.num_experts, *spec.shape), generator=gen, device=device, dtype=spec.dtype) * scale
+            for role, spec in layer.quant_method.layout().items()
+        }
 
 
 class Fixture:
