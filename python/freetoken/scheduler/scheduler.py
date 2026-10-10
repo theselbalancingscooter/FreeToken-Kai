@@ -167,6 +167,10 @@ class Scheduler(SchedulerIOMixin):
             log=logger.info_rank0,
             decode_log_interval=config.decode_log_interval,
         )
+        # FT_KERNEL_PROFILE=N: one decode step in N under the torch profiler (utils/kernel_profile)
+        from freetoken.utils.kernel_profile import KernelProfiler
+
+        self._kernel_profiler = KernelProfiler.from_env(logger.warning, rank=config.tp_info.rank)
 
         # Initialize the I/O mixin
         super().__init__(config, self.engine.tp_cpu_group)
@@ -1216,7 +1220,13 @@ class Scheduler(SchedulerIOMixin):
         batch.input_ids = self.token_pool[input_mapping]
         if self.toolcall_anchor_id is not None and not batch.is_prefill:
             self.cache_manager.snapshot_toolcall_anchor(batch.reqs)
-        forward_output = self.engine.forward_batch(batch, sample_args)
+        kp = getattr(self, "_kernel_profiler", None)
+        if kp is not None and (batch.spec_verify or not batch.is_prefill) and kp.due():
+            label = f"{'verify window' if batch.spec_verify else 'decode step'}, {batch.input_ids.numel()} rows"
+            with kp.profile(label):
+                forward_output = self.engine.forward_batch(batch, sample_args)
+        else:
+            forward_output = self.engine.forward_batch(batch, sample_args)
         if batch.spec_verify:
             # the window's accepted tokens land at their own positions (variable count)
             req = batch.reqs[0]
