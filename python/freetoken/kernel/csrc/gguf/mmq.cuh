@@ -473,6 +473,47 @@ __launch_bounds__(WARP_SIZE_GGUF* NWARPS_Q8_0, 2)
       vec_dot_q8_0_q8_1_mul_mat>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
 }
 
+// FreeToken: an 8-token tile for the few rows of an MTP verify window (K+1 = 5..8). The 4-token
+// tile above reads the weights twice for 6 rows. 8 warps x 64 rows keeps the q8_0 tile loader's
+// nwarps*QI8_0 <= mmq_y, and mmq_x == nwarps as the y-tile loader assumes.
+#define MMQ_X_Q8_0_W8 8
+#define MMQ_Y_Q8_0_W8 64
+#define NWARPS_Q8_0_W8 8
+
+template <typename scalar_t, bool need_check>
+static __global__ void
+#if defined(USE_ROCM)
+__launch_bounds__(WARP_SIZE_GGUF* NWARPS_Q8_0_W8, 2)
+#endif
+    mul_mat_q8_0_w8(
+        const void* __restrict__ vx,
+        const void* __restrict__ vy,
+        scalar_t* __restrict__ dst,
+        const int ncols_x,
+        const int nrows_x,
+        const int ncols_y,
+        const int nrows_y,
+        const int nrows_dst) {
+  const int mmq_x = MMQ_X_Q8_0_W8;
+  const int mmq_y = MMQ_Y_Q8_0_W8;
+  const int nwarps = NWARPS_Q8_0_W8;
+
+  mul_mat_q<
+      scalar_t,
+      QK8_0,
+      QR8_0,
+      QI8_0,
+      false,
+      block_q8_0,
+      mmq_x,
+      mmq_y,
+      nwarps,
+      allocate_tiles_q8_0<mmq_y>,
+      load_tiles_q8_0<mmq_y, nwarps, need_check>,
+      VDR_Q8_0_Q8_1_MMQ,
+      vec_dot_q8_0_q8_1_mul_mat>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+}
+
 template <typename scalar_t>
 static void ggml_mul_mat_q8_0_q8_1_cuda(
     const void* vx,
@@ -484,6 +525,21 @@ static void ggml_mul_mat_q8_0_q8_1_cuda(
     const int nrows_y,
     const int nrows_dst,
     cudaStream_t stream) {
+  if (ncols_y > MMQ_X_Q8_0) {
+    // more rows than the 4-token tile: the 8-token tile reads each weight tile half as often
+    const int block_num_x = (nrows_x + MMQ_Y_Q8_0_W8 - 1) / MMQ_Y_Q8_0_W8;
+    const int block_num_y = (ncols_y + MMQ_X_Q8_0_W8 - 1) / MMQ_X_Q8_0_W8;
+    const dim3 block_nums(block_num_x, block_num_y, 1);
+    const dim3 block_dims(WARP_SIZE_GGUF, NWARPS_Q8_0_W8, 1);
+    if (nrows_x % MMQ_Y_Q8_0_W8 == 0) {
+      mul_mat_q8_0_w8<scalar_t, false>
+          <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+    } else {
+      mul_mat_q8_0_w8<scalar_t, true>
+          <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+    }
+    return;
+  }
   const int mmq_x = MMQ_X_Q8_0;
   const int mmq_y = MMQ_Y_Q8_0;
   const int nwarps = NWARPS_Q8_0;
