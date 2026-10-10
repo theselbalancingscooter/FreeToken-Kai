@@ -735,6 +735,20 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-expert-gguf",
+        type=str,
+        default=ServerArgs.moe_expert_gguf,
+        metavar="FILE",
+        help=(
+            "Read the routed experts from this GGUF file (one shard, e.g. the Q2_0 build of the "
+            "same model) while every other weight comes from --model. The GGUF's block bytes are "
+            "the expert banks (2.25 bit for Q2_0: half the host RAM and the per-token traffic of "
+            "NVFP4, twice the experts per GPU cache). Needs --moe-strategy offload or hybrid; the "
+            "experts of every layer must share one ggml type (Q2_0 or Q4_0). Qwen3.8-Flash-Next."
+        ),
+    )
+
+    parser.add_argument(
         "--swa-decoder-replay",
         default=ServerArgs.swa_decoder_replay,
         choices=["bounded", "exact"],

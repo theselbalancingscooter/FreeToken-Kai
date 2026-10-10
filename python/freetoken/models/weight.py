@@ -267,28 +267,40 @@ def ftw_lacks_vision(model_path: str) -> bool:
     return not any(name.startswith(VISION_KEY_PREFIXES) for name in ftw_tensor_names(model_path, "weight"))
 
 
-def load_q4_0_moe_expert_sources(
+def load_gguf_moe_expert_sources(
     model_path: str,
     model_config,
     *,
+    quant_format: str,
     dummy: bool = False,
     layer_sink=None,
 ) -> dict:
-    """Load (or fabricate, with ``dummy=True``) packed GGUF Q4_0 expert source banks.
-    ``layer_sink`` (converter) streams each completed layer's banks; ignored for dummy."""
+    """Load (or fabricate, with ``dummy=True``) packed GGUF expert source banks of
+    ``quant_format`` (``q4_0`` / ``q2_0``) through the model module's ``load_<fmt>_expert_sources``
+    / ``dummy_<fmt>_expert_sources`` hooks. ``layer_sink`` (converter) streams each completed
+    layer's banks; ignored for dummy."""
     _config, spec = _spec_for_model_path(model_path)
     if dummy:
-        builder = _model_override(spec, "dummy_q4_0_expert_sources")
-        assert builder is not None, "model defines no dummy_q4_0_expert_sources"
+        builder = _model_override(spec, f"dummy_{quant_format}_expert_sources")
+        assert builder is not None, f"model defines no dummy_{quant_format}_expert_sources"
         return builder(model_config)
-    loader = _load_attr(spec.module, "load_q4_0_expert_sources")
+    loader = _model_override(spec, f"load_{quant_format}_expert_sources")
+    if loader is None:
+        raise NotImplementedError(
+            f"{spec.module} reads no {quant_format} expert banks from GGUF (no load_{quant_format}_expert_sources)"
+        )
     return loader(model_path, model_config, layer_sink=layer_sink)
+
+
+def load_q4_0_moe_expert_sources(model_path: str, model_config, *, dummy: bool = False, layer_sink=None) -> dict:
+    return load_gguf_moe_expert_sources(model_path, model_config, quant_format="q4_0", dummy=dummy, layer_sink=layer_sink)
 
 
 __all__ = [
     "load_weight",
     "load_vision_weight",
     "ftw_lacks_vision",
+    "load_gguf_moe_expert_sources",
     "load_q4_0_moe_expert_sources",
     "iter_expert_tensors_parallel",
 ]

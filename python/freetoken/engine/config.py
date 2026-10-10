@@ -34,6 +34,10 @@ class EngineConfig:
     quant_backend: str | None = None
     # PLE table backend: "disk" (default) reads rows from the checkpoint files per fill, "pinned" preloads the table into page-locked host RAM.
     ple_backend: str = "disk"
+    # --moe-expert-gguf: read the routed experts from this GGUF file (one shard; its block bytes
+    # become the expert banks, q2_0 / q4_0) while every other weight stays with --model. The
+    # expert format tag is read from the file at config time (models/qwen4_exp/gguf_experts.py).
+    moe_expert_gguf: str | None = None
     # DeepSeek-V4.1 Decoder SWA Bounded Replay: "bounded" (default) runs the decoder layers on each
     # prompt's last window; "exact" runs them on every token.
     swa_decoder_replay: str = "bounded"
@@ -246,6 +250,15 @@ class EngineConfig:
         config = _load_attr(spec.module, spec.parse_config)(hf_config)
         if embed_quant is not None:
             config = replace(config, embed_quant=embed_quant)
+        if self.moe_expert_gguf:
+            # the routed experts come packed from a GGUF: the format tag the cache / kernels /
+            # CPU executor dispatch on is the file's, and the model's own expert scheme steps
+            # aside for them (layers/moe.make_moe_layer)
+            from freetoken.models.qwen4_exp.gguf_experts import gguf_expert_format
+
+            fmt = gguf_expert_format(self.moe_expert_gguf)
+            logger.info_rank0(f"routed experts from GGUF: {self.moe_expert_gguf} ({fmt} banks)")
+            config = replace(config, expert_quant=fmt, moe_weight_format=fmt, moe_expert_gguf=self.moe_expert_gguf)
         return replace(config, quant=quant)
 
     @cached_property

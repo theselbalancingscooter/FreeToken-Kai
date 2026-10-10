@@ -1,15 +1,54 @@
-# GGUF 3-bit and 2-bit experts: what stops you (2026-09-07)
+# GGUF experts: the 2.25-bit bank (2026-10-10) and what stopped the 3-bit idea (2026-09-07)
 
-Nothing in this fork uses GGUF. This page exists so that the next person who has the same idea can
-find out in ten minutes what took a day, and then decide with the numbers in front of them.
+## Q2_0 experts from a GGUF: `--moe-expert-gguf`
+
+Since 2026-10-10 the fork serves Qwen3.8-Flash-Next with its routed experts read from a llama.cpp
+checkpoint while everything else -- the dense projections, the PLE table, the vision tower --
+keeps coming from the safetensors checkpoint named by `--model`:
+
+```bash
+ft serve --model models/Qwen3.8-Flash-Next-NVFP4 \
+  --moe-expert-gguf models/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf \
+  --moe-strategy hybrid ...   # the rest as for the NVFP4 checkpoint
+```
+
+What it is for: [ISTA-DASLab's GSQ-RCO builds](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF)
+quantise the experts to ggml's **Q2_0** -- 64 weights per fp16 scale, codes -1 / 0 / +1,
+**2.25 bits per weight** -- and calibrate them. The expert banks shrink from 63.5 GiB (NVFP4) to
+34 GB, the bytes a decode step reads per token from 1.18 GB to 0.66 GB, and the same GPU cache
+holds twice the experts. The experts of every layer in these builds share one ggml type, which is
+the condition the section below explains. Only shard 1 is read (shard 2 holds the PLE table, which
+the fork takes from the safetensors checkpoint in FP8 instead).
+
+How it works: the GGUF's block bytes **are** the banks -- nothing is repacked -- and the kernels
+dequantise inside the K-loop: the borrowed ggml MMVQ kernel on the GPU
+(`vec_dot_q2_0_q8_1`, W2A8) and the CPU executor's `q2_0_dot_i8_*` (AVX-VNNI / AVX2 / scalar,
+W2A8 against Q8_0 activations). The checkpoint's own expert scheme steps aside for these layers;
+`--dense-quant fp8` and the MTP draft head still work, the head's bf16 experts being rounded to
+Q2_0 with ggml's reference quantizer (amax delta) at load. The GGUF is parsed by a small reader of
+the fork's own (`models/gguf/rawreader.py`): gguf-py 0.19.0 predates Q2_0 and refuses the file.
+Q4_0 experts load through the same path.
+
+What it costs: quality. Measured on two RTX 3060s against the NVFP4 build on the same ten
+prompts, the Q2_0 build answered 9 of 10 (the miss: a translation that kept English terms),
+every code task included, but thought 35% longer in total; ISTA-DASLab reports LiveCodeBench
+81.1 against 87.4 for bf16, AIME and GPQA unchanged. Treat it as the fast tier and NVFP4 as the
+accurate one. Prefill goes through the MMVQ kernel for now (one GEMV per token and expert), so it
+is slower than the NVFP4 grouped GEMM; a tiled MMQ path is the next step if that matters.
+
+Refused: experts whose ggml type varies by layer (every "UD" community build), IQ types (codebooks),
+and anything that is not Q2_0 or Q4_0.
+
+The rest of this page is the 2026-09-07 survey that found the blockers above, kept for the numbers.
 
 **The idea.** A 125B MoE with NVFP4 experts needs 63 GiB of host RAM for the banks. The published
 GGUF quantisations of the same checkpoint are much smaller — UD-Q2_K_XL is 78.9 GB in total against
 135 GB. If FreeToken could serve those, the RAM problem would be solved by arithmetic rather than by
 the file mapping in [bank-ram.md](bank-ram.md).
 
-**The conclusion.** It is possible, it is not cheap, and the published quantisations do not load as
-they are. If you want smaller experts today, `--moe-bank-ram` is the shorter road.
+**The conclusion (2026-09-07).** It is possible, it is not cheap, and the published quantisations do
+not load as they are. If you want smaller experts today, `--moe-bank-ram` is the shorter road.
+(2026-10-10: a uniform Q2_0 build appeared and the loader above serves it.)
 
 ## The blocker you will hit first
 

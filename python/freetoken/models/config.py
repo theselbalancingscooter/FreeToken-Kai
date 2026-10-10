@@ -330,6 +330,9 @@ class ModelConfig:
     has_attn_bias: bool = False
     has_router_bias: bool = False
     moe_weight_format: str | None = None
+    # --moe-expert-gguf: the GGUF file the routed experts are read from (its block bytes are the
+    # banks; expert_quant / moe_weight_format carry its format tag). None = the checkpoint's own.
+    moe_expert_gguf: str | None = None
     swiglu_limit: float | None = None
     hidden_act_alpha: float = 1.702
     # Full DeepseekV4Args payload for the DSV4-specific machinery (MLA sparse attention,

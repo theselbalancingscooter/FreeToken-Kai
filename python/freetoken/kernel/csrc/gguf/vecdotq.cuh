@@ -552,6 +552,48 @@ vec_dot_q4_0_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ b
   return vec_dot_q4_0_q8_1_impl<VDR_Q4_0_Q8_1_MMVQ>(v, u, __half2float(bq4_0->d), bq8_1->ds);
 }
 
+#define VDR_Q2_0_Q8_1_MMVQ 1
+
+// Q2_0 x Q8_1 (FreeToken addition; ggml added Q2_0 in 2026 after the b2899 kernels above).
+// One int of qs = 16 weights. The 2-bit plane k of its four bytes holds the weights 4m+k
+// (m = byte 0..3), so the activations it pairs with are a stride-4 gather of the 16 int8
+// activations: transpose the four activation ints bytewise (prmt) once, then four dp4a.
+// w = (code - 1) * d: the -1 contributes -d * sum(a). Each thread owns half of a q8_1
+// block (16 of its 32 weights) and subtracts half of that block's sum (ds.y); the two
+// threads that share the block add up to the whole, exactly as q4_0's -8 term does.
+static __device__ __forceinline__ float
+vec_dot_q2_0_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1, const int& iqs) {
+#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM || defined USE_MUSA
+  const block_q2_0* bq2_0 = (const block_q2_0*)vbq;
+  const int k = iqs;                       // 0..3: which 16-weight group of the 64
+  const block_q8_1* y = bq8_1 + (k >> 1);  // the 32-weight q8_1 block holding the group
+  const int base = (k & 1) * 4;            // the group's first int within that block
+  const int v = get_int_from_uint8(bq2_0->qs, k);
+  const int u0 = get_int_from_int8_aligned(y->qs, base + 0);
+  const int u1 = get_int_from_int8_aligned(y->qs, base + 1);
+  const int u2 = get_int_from_int8_aligned(y->qs, base + 2);
+  const int u3 = get_int_from_int8_aligned(y->qs, base + 3);
+  // bytewise 4x4 transpose: t_j = [u0.b_j, u1.b_j, u2.b_j, u3.b_j]
+  const int lo01 = __byte_perm(u0, u1, 0x5140);  // [u0.b0, u1.b0, u0.b1, u1.b1]
+  const int lo23 = __byte_perm(u2, u3, 0x5140);
+  const int hi01 = __byte_perm(u0, u1, 0x7362);  // [u0.b2, u1.b2, u0.b3, u1.b3]
+  const int hi23 = __byte_perm(u2, u3, 0x7362);
+  const int t0 = __byte_perm(lo01, lo23, 0x5410);
+  const int t1 = __byte_perm(lo01, lo23, 0x7632);
+  const int t2 = __byte_perm(hi01, hi23, 0x5410);
+  const int t3 = __byte_perm(hi01, hi23, 0x7632);
+  int sumi = 0;
+  sumi = __dp4a((v >> 0) & 0x03030303, t0, sumi);
+  sumi = __dp4a((v >> 2) & 0x03030303, t1, sumi);
+  sumi = __dp4a((v >> 4) & 0x03030303, t2, sumi);
+  sumi = __dp4a((v >> 6) & 0x03030303, t3, sumi);
+  const float2 ds8f = __half22float2(y->ds);
+  return __half2float(bq2_0->d) * (sumi * ds8f.x - 0.5f * ds8f.y);
+#else
+  return 0.0f;
+#endif
+}
+
 template <int mmq_y>
 static __device__ __forceinline__ void allocate_tiles_q4_0(int** x_ql, half2** x_dm, int** x_qh, int** x_sc) {
   __shared__ int tile_x_qs[mmq_y * (WARP_SIZE_GGUF) + mmq_y];

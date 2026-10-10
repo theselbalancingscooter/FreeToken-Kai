@@ -570,6 +570,19 @@ torch::Tensor ggml_moe_a8_vec(
             quant_X.stride(0),
             stream);
         break;
+      case 42:  // ggml Q2_0 (FreeToken addition)
+        moe_vec_q2_0_q8_1_cuda<scalar_t>(
+            (void*)W.data_ptr(),
+            (void*)quant_X.data_ptr(),
+            (scalar_t*)Y.data_ptr(),
+            (int*)topk_ids.data_ptr(),
+            top_k,
+            tokens,
+            col,
+            row,
+            quant_X.stride(0),
+            stream);
+        break;
       case 3:
         moe_vec_q4_1_q8_1_cuda<scalar_t>(
             (void*)W.data_ptr(),

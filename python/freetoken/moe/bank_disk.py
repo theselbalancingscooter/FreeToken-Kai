@@ -216,6 +216,7 @@ _WIDEST_ROW_BLOCK_BYTES = {
     "bf16": lambda H, I: 2 * I * H * 2,
     "fp8_block": lambda H, I: 2 * I * H,
     "q4_0": lambda H, I: 2 * I * (H // 32) * 18,
+    "q2_0": lambda H, I: 2 * I * (H // 64) * 18,
     "nvfp4": lambda H, I: 2 * I * (H // 2),
     "mxfp4": lambda H, I: 2 * I * (H // 2),
     "ds_fp4": lambda H, I: 2 * I * (H // 2),

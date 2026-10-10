@@ -72,6 +72,14 @@ The fork adds nine things upstream does not have:
    where the transient comes from, while the MoE runs once over the whole chunk, so an offloaded
    bank crosses the bus fewer times per prompt (a 20k-token prompt: 490 → 722 tok/s on a 2060,
    437 → 546 on two 3060s). See [prefill-chunk.md](prefill-chunk.md).
+10. **2.25-bit expert banks from a GGUF** (`--moe-expert-gguf FILE`): Qwen3.8-Flash-Next's
+   routed experts read from ISTA-DASLab's calibrated Q2_0 build while the dense weights, the
+   PLE table and the vision tower stay with the safetensors checkpoint. The banks go from
+   63.5 GiB to 34 GB, a decode step reads 0.66 GB of experts per token instead of 1.18, and the
+   same GPU cache holds twice the experts; the ggml MMVQ kernel and the CPU executor dequantise
+   the blocks in place (W2A8). It is the fast tier, not the accurate one: on ten prompts the
+   Q2_0 build matched NVFP4 on 9 (all code tasks included) and thought 35% longer. See
+   [gguf.md](gguf.md).
 
 Experimental: `--prefix-disk-cache DIR` keeps the prefix cache of a hybrid GDN model on disk,
 so a long prompt the in-memory cache has let go of -- or one sent before a restart -- is read back

@@ -8,6 +8,7 @@ use their own providers until they get a method.
 
 from __future__ import annotations
 
+import functools
 import glob
 import math
 import os
@@ -159,29 +160,30 @@ def build_expert_banks(
 _PARALLEL_CHUNK = 8 << 20  # default O_DIRECT chunk for the parallel reader
 
 
-def _q4_0_banks(model_path, model_config, device, dtype, dummy, parallel=False, workers=8, chunk=_PARALLEL_CHUNK, decode_target="gpu", layer_sink=None) -> ExpertBanks:
+def _gguf_banks(fmt, model_path, model_config, device, dtype, dummy, parallel=False, workers=8, chunk=_PARALLEL_CHUNK, decode_target="gpu", layer_sink=None) -> ExpertBanks:
     if parallel:
         raise NotImplementedError(
-            "parallel reader not implemented for q4_0: GGUF is a single packed file "
+            f"parallel reader not implemented for {fmt}: GGUF is a single packed file "
             "(not safetensors), so the common reader doesn't apply -- it needs a GGUF-native "
             "parallel reader (parse the tensor table, chunked O_DIRECT over the one file)"
         )
-    from freetoken.models.weight import load_q4_0_moe_expert_sources
+    from freetoken.models.weight import load_gguf_moe_expert_sources
 
-    # Native GGUF Q4_0 routed experts: packed block bytes streamed to the GPU and
+    # Native GGUF routed experts (q4_0 / q2_0): packed block bytes streamed to the GPU and
     # dequantized inside the borrowed ggml MoE kernels (no bf16 expert copy). Banks are
     # per-layer HostBanks (pin-after-fill), so conversion streams each completed layer's
     # gate_up + down straight through the sink (dummy fabricates in one shot -> not streamed).
     sink = None if dummy else layer_sink
-    sources = load_q4_0_moe_expert_sources(model_path, model_config, dummy=dummy, layer_sink=sink)
+    sources = load_gguf_moe_expert_sources(model_path, model_config, quant_format=fmt, dummy=dummy, layer_sink=sink)
     return ExpertBanks(
-        "q4_0", {name: sources[name] for name in _BANK_SCHEMAS["q4_0"]}, streamed=sink is not None
+        fmt, {name: sources[name] for name in _BANK_SCHEMAS[fmt]}, streamed=sink is not None
     )
 
 
 # expert formats that still load through their own provider (GGUF)
 _PROVIDERS = {
-    "q4_0": _q4_0_banks,
+    "q4_0": functools.partial(_gguf_banks, "q4_0"),
+    "q2_0": functools.partial(_gguf_banks, "q2_0"),
 }
 
 

@@ -77,7 +77,10 @@ _ACT_IDS = {
 }
 
 # Weight-format ids must match WFmt in csrc/cpu_moe/cpu_moe_ext.cpp.
-_WFMT_IDS = {"bf16": 0, "nvfp4": 1, "mxfp4_triton": 2, "ds_fp4": 3, "q4_0": 4}
+_WFMT_IDS = {"bf16": 0, "nvfp4": 1, "mxfp4_triton": 2, "ds_fp4": 3, "q4_0": 4, "q2_0": 5}
+# the newest format id the compiled extension must know (max_weight_format()); an older build
+# would take weight_format 5 for nvfp4 without a word, so the executor refuses it up front
+_WFMT_ABI_MIN = {"q2_0": 5}
 
 
 def compiled_extension_supports(activation: str) -> bool:
@@ -212,6 +215,15 @@ class CpuMoeExecutor:
                     f"{activation!r} (max generic act id {supported}); rebuild it "
                     "with `python setup.py build_ext --inplace` (or reinstall the "
                     "wheel) before serving this model on the cpu/hybrid backend."
+                )
+        if fmt in _WFMT_ABI_MIN:
+            known = getattr(_cpu_moe, "max_weight_format", lambda: 4)()
+            if known < _WFMT_ABI_MIN[fmt]:
+                raise RuntimeError(
+                    f"the compiled _cpu_moe extension predates the {fmt!r} expert format "
+                    f"(max weight format id {known}); rebuild it with `python setup.py "
+                    "build_ext --inplace` (or reinstall the wheel) before serving this "
+                    "model on the cpu/hybrid backend."
                 )
 
         self.num_layers = int(cache.num_layers)
@@ -450,6 +462,8 @@ class CpuMoeExecutor:
 
         if fmt == "q4_0":
             return self._resolve_q4_0_banks(banks)
+        if fmt == "q2_0":
+            return self._resolve_q4_0_banks(banks, block=64)
 
         if fmt == "mxfp4_triton":
             return self._resolve_mxfp4_banks(banks)
@@ -483,11 +497,12 @@ class CpuMoeExecutor:
         )
         return ptrs, (H, I)
 
-    def _resolve_q4_0_banks(self, banks: dict) -> tuple[dict, tuple[int, int]]:
-        """Native GGUF Q4_0 schema (gemma4 GGUF): per-32 blocks (fp16 scale + 16 nibble
-        bytes), row-major over K -- the *same* packed banks the GPU offload path streams.
-        gate_up is [S, 2I, H//32*18], down is [S, H, I//32*18]; the C++ W4A16 GEMV reads a
-        row in place (18 bytes / 32 K) and dequantizes weights inside the K-loop."""
+    def _resolve_q4_0_banks(self, banks: dict, block: int = 32) -> tuple[dict, tuple[int, int]]:
+        """Native GGUF Q4_0 / Q2_0 schema: per-``block`` blocks (fp16 scale + 16 packed bytes:
+        32 nibbles for Q4_0, 64 two-bit codes for Q2_0), row-major over K -- the *same* packed
+        banks the GPU offload path streams. gate_up is [S, 2I, H//block*18], down is
+        [S, H, I//block*18]; the C++ W*A8 GEMV reads a row in place (18 bytes per block of K)
+        and dequantizes weights inside the K-loop."""
         gate_up, down = banks["gate_up"], banks["down"]
         assert gate_up[0].dtype == torch.uint8 and down[0].dtype == torch.uint8, (
             gate_up[0].dtype, down[0].dtype,
@@ -495,9 +510,9 @@ class CpuMoeExecutor:
         I = int(gate_up[0].shape[1] // 2)
         H = int(down[0].shape[1])
         assert gate_up[0].shape[1] == 2 * I
-        assert H % 32 == 0 and I % 32 == 0, (H, I)
-        assert int(gate_up[0].shape[2]) == (H // 32) * 18, (gate_up[0].shape, H)
-        assert int(down[0].shape[2]) == (I // 32) * 18, (down[0].shape, I)
+        assert H % block == 0 and I % block == 0, (H, I, block)
+        assert int(gate_up[0].shape[2]) == (H // block) * 18, (gate_up[0].shape, H, block)
+        assert int(down[0].shape[2]) == (I // block) * 18, (down[0].shape, I, block)
         ptrs = dict(
             gate_up_ptr=self._make_table(gate_up).data_ptr(),
             down_ptr=self._make_table(down).data_ptr(),

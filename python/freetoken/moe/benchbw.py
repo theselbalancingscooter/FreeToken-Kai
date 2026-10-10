@@ -311,6 +311,10 @@ def _offload_bank_specs(fmt: str, H: int, I: int) -> dict[str, tuple[int, torch.
             "gate_up_packed": (2 * I * (H // 2), u8), "gate_up_scale": (2 * I * (H // 32), u8),
             "down_packed": (H * (I // 2), u8), "down_scale": (H * (I // 32), u8),
         }
+    if fmt in ("q4_0", "q2_0"):
+        # native GGUF blocks: fp16 scale + 16 packed bytes per 32 (Q4_0) / 64 (Q2_0) weights
+        block = 32 if fmt == "q4_0" else 64
+        return {"gate_up": (2 * I * (H // block) * 18, u8), "down": (H * (I // block) * 18, u8)}
     raise NotImplementedError(fmt)
 
 

@@ -65,6 +65,17 @@ typedef struct {
   int8_t qs[QK8_0];  // quants
 } block_q8_1;
 
+// ggml Q2_0 (2026, ggml type 42): 64 weights per block, fp16 delta + 2 bits per weight
+// (00 = -1, 01 = 0, 10 = +1, 11 = +2), i.e. w = (code - 1) * d. Byte j holds the weights
+// 4j..4j+3, weight 4j+k in bits 2k..2k+1. 18 bytes per 64 weights = 2.25 bpw.
+#define QK2_0 64
+#define QR2_0 4
+#define QI2_0 (QK2_0 / (4 * QR2_0))
+typedef struct {
+  half d;                 // delta
+  uint8_t qs[QK2_0 / 4];  // 2-bit codes
+} block_q2_0;
+
 #define QR2_K 4
 #define QI2_K (QK_K / (4 * QR2_K))
 typedef struct {

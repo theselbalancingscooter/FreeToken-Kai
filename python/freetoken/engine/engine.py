@@ -1290,10 +1290,10 @@ class Engine:
             del weight
 
     def _quantize_mtp_experts(self) -> None:
-        """Quantize the captured bf16 experts to the native NVFP4 bank layout, into pinned host
-        tensors -- right after the dense weights, so the bf16 copy (1.6 GB for 256 x 512) is gone
-        before the expert banks load. ``_append_mtp_bank`` hands the result to the cache."""
-        from freetoken.kernel.triton.nvfp4_quant import nvfp4_expert_bank_specs, quantize_nvfp4_experts
+        """Quantize the captured bf16 experts to the model's bank layout (native NVFP4, or
+        ggml Q2_0 when --moe-expert-gguf serves Q2_0 banks), into pinned host tensors -- right
+        after the dense weights, so the bf16 copy (1.6 GB for 256 x 512) is gone before the
+        expert banks load. ``_append_mtp_bank`` hands the result to the cache."""
         from freetoken.moe.legacy_format import canonical_role
 
         raw = self._mtp_raw
@@ -1303,14 +1303,35 @@ class Engine:
         if gate_up.shape[-1] != down.shape[-2]:  # [E, H, 2I] / [E, I, H] storage -> [E, 2I, H] / [E, H, I]
             gate_up, down = gate_up.transpose(1, 2).contiguous(), down.transpose(1, 2).contiguous()
         e, two_i, h = gate_up.shape
-        host = {
-            n: _pinned_empty(shape, dt)
-            for n, (shape, dt) in nvfp4_expert_bank_specs(e, h, two_i // 2).items()
-        }
-        quantize_nvfp4_experts(gate_up, down, chunk=8, device=self.device, out=host)
-        # the quantizer names its outputs the way the FTW files do; the cache keys its banks
-        # by the expert kernel's canonical roles (gate_up_packed -> gate_up, down_packed -> down)
-        host = {canonical_role(name): tensor for name, tensor in host.items()}
+        bank_fmt = getattr(self.config.model_config, "moe_weight_format", None)
+        if bank_fmt == "q2_0":
+            # the same reference quantizer ggml uses (amax delta, codes -1/0/+1); the routed
+            # experts come calibrated from the GGUF, the head's are rounded here
+            from freetoken.models.gguf.dequant import quantize_q2_0
+
+            i = two_i // 2
+            host = {
+                "gate_up": _pinned_empty((e, two_i, h // 64 * 18), torch.uint8),
+                "down": _pinned_empty((e, h, i // 64 * 18), torch.uint8),
+            }
+            chunk = 32
+            for e0 in range(0, e, chunk):
+                e1 = min(e, e0 + chunk)
+                host["gate_up"][e0:e1].copy_(quantize_q2_0(gate_up[e0:e1].to(self.device)).cpu())
+                host["down"][e0:e1].copy_(quantize_q2_0(down[e0:e1].to(self.device)).cpu())
+            label = "Q2_0"
+        else:
+            from freetoken.kernel.triton.nvfp4_quant import nvfp4_expert_bank_specs, quantize_nvfp4_experts
+
+            host = {
+                n: _pinned_empty(shape, dt)
+                for n, (shape, dt) in nvfp4_expert_bank_specs(e, h, two_i // 2).items()
+            }
+            quantize_nvfp4_experts(gate_up, down, chunk=8, device=self.device, out=host)
+            # the quantizer names its outputs the way the FTW files do; the cache keys its banks
+            # by the expert kernel's canonical roles (gate_up_packed -> gate_up, down_packed -> down)
+            host = {canonical_role(name): tensor for name, tensor in host.items()}
+            label = "NVFP4"
         del gate_up, down
         self._mtp_raw = {}
         self._mtp_bank_host = host
@@ -1318,7 +1339,7 @@ class Engine:
         torch.cuda.synchronize(self.device)
         torch.cuda.empty_cache()
         logger.info(
-            f"MTP draft head: {e}-expert layer quantized to NVFP4 "
+            f"MTP draft head: {e}-expert layer quantized to {label} "
             f"({self._mtp_bank_bytes / 2**20:.0f} MB pinned)"
         )
 
@@ -1330,8 +1351,8 @@ class Engine:
             return 0
         from freetoken.moe.host_banks import HostResidency
 
-        assert banks.quant_format == "nvfp4", (
-            f"the MTP expert bank is written in the native nvfp4 layout; this run uses "
+        assert banks.quant_format in ("nvfp4", "q2_0"), (
+            f"the MTP expert bank is written in the native nvfp4 (or q2_0) layout; this run uses "
             f"{banks.quant_format!r} (use --moe-strategy hybrid/cpu, or --quant-backend moe.nvfp4=triton)"
         )
         missing = sorted(set(banks.sources) - set(host))

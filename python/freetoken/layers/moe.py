@@ -7,6 +7,7 @@ from freetoken.distributed import DistributedCommunicator, get_tp_info
 from freetoken.moe import is_offload_moe_strategy
 from freetoken.moe.bank_disk import apply_permutation
 from freetoken.moe.fused import fused_topk
+from freetoken.moe.fused_gguf import GGUF_EXPERT_FORMATS
 from freetoken.moe.offload_cache import OffloadMoeCache
 from freetoken.utils import decode_sample as _ds
 
@@ -604,16 +605,18 @@ class OffloadMoELayer(MoELayer):
                 hidden_states, topk_weights, topk_ids, view, layer=self, is_prefill=is_prefill
             )
         fmt = cache.quant_format
-        if fmt == "q4_0":
-            # Native GGUF Q4_0 experts: dequant-in-kernel grouped GEMV (MMVQ) over the
+        if fmt in GGUF_EXPERT_FORMATS:
+            # Native GGUF experts (q4_0 / q2_0): dequant-in-kernel grouped GEMV (MMVQ) over the
             # streamed packed banks; topk_ids already index the cache slots / layer.
-            from freetoken.moe.fused_q4_0 import fused_experts_gguf_q4_0
+            from freetoken.moe.fused_gguf import fused_experts_gguf_format
 
             gate_up, down = views
-            return fused_experts_gguf_q4_0(
-                hidden_states, gate_up, down, topk_weights, topk_ids, self.activation
+            return fused_experts_gguf_format(
+                fmt, hidden_states, gate_up, down, topk_weights, topk_ids, self.activation
             )
-        raise AssertionError(f"offload experts without a quant method only serve q4_0 banks, got {fmt!r}")
+        raise AssertionError(
+            f"offload experts without a quant method only serve {sorted(GGUF_EXPERT_FORMATS)} banks, got {fmt!r}"
+        )
 
 
 def _prefill_group_continuation() -> bool:
@@ -779,6 +782,11 @@ def make_moe_layer(
     """
     offload = is_offload_moe_strategy(config.moe_strategy)
     layer_cls = (offload_cls or OffloadMoELayer) if offload else (resident_cls or MoELayer)
+    if offload and quant_config is not None and getattr(config, "moe_weight_format", None) in GGUF_EXPERT_FORMATS:
+        # --moe-expert-gguf: the routed experts come packed from a GGUF and dispatch on the
+        # cache's format tag; the checkpoint's own expert scheme (NVFP4 ...) must not bind a
+        # method to them. The dense layers keep the config as it is.
+        quant_config = None
     kwargs = dict(
         num_experts=num_experts if num_experts is not None else config.num_experts,
         top_k=top_k if top_k is not None else config.num_experts_per_tok,

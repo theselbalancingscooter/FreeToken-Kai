@@ -1234,7 +1234,130 @@ q4dot_fn select_q4dot() {
   return q4_0_dot_i8_scalar;
 }
 
-enum WFmt { WF_BF16 = 0, WF_NVFP4 = 1, WF_MXFP4 = 2, WF_DSFP4 = 3, WF_Q4_0 = 4 };
+// -------------------------------- Q2_0 (W2A8) --------------------------------
+// ggml Q2_0 (2026): per-64 block = fp16 scale d + 16 bytes; byte j holds elements 4j..4j+3,
+// element 4j+k in bits 2k..2k+1, and w = (code - 1) * d (codes 0..3 -> -1, 0, +1, +2).
+// W2A8 like the Q4_0 path: activations pre-quantized to Q8_0 (per-32 int8 + fp32 scale).
+// Shifting and masking the 16 bytes yields the 2-bit PLANES: plane k = the 16 elements
+// 4j+k, j = 0..15, a stride-4 subset of the block. So the activations of every 64-block are
+// permuted ONCE per token / route into plane order (permute_q8_planes64: elem 4j+k -> slot
+// 16k+j) and the kernels read them contiguously. The block's two Q8_0 scales (elements 0..31
+// = j < 8 of every plane, 32..63 = j >= 8) split each plane in half: over the 32 bytes of
+// planes (k, k+1) the 8 int32 lanes of the integer dot see the scales [s0 s0 s1 s1 s0 s0 s1 s1].
+using q2dot_fn = float (*)(const uint8_t*, const int8_t*, const float*, int);
+
+// In place: a Q8_0-quantized row in natural order (K % 64 == 0) -> plane order per 64-block.
+inline void permute_q8_planes64(int8_t* aq, int K) {
+  int8_t tmp[64];
+  for (int b = 0; b < K / 64; ++b) {
+    int8_t* blk = aq + (size_t)b * 64;
+    for (int e = 0; e < 64; ++e) tmp[(e & 3) * 16 + (e >> 2)] = blk[e];
+    std::memcpy(blk, tmp, 64);
+  }
+}
+
+float q2_0_dot_i8_scalar(const uint8_t* w, const int8_t* aq, const float* asb, int K) {
+  float acc = 0.0f;
+  const int nb = K / 64;
+  for (int b = 0; b < nb; ++b) {
+    const uint8_t* blk = w + (size_t)b * 18;
+    uint16_t dh;
+    std::memcpy(&dh, blk, sizeof(dh));
+    const uint8_t* q = blk + 2;
+    const int8_t* a = aq + (size_t)b * 64;  // plane order: a[16k + j] pairs with element 4j+k
+    int s0 = 0, s1 = 0;                     // elements 0..31 (j < 8) / 32..63 (j >= 8)
+    for (int k = 0; k < 4; ++k) {
+      for (int j = 0; j < 16; ++j) {
+        const int wq = (int)((q[j] >> (2 * k)) & 0x03) - 1;
+        const int prod = wq * (int)a[16 * k + j];
+        if (j < 8) s0 += prod; else s1 += prod;
+      }
+    }
+    acc += fp16_to_f32(dh) * (asb[2 * b] * (float)s0 + asb[2 * b + 1] * (float)s1);
+  }
+  return acc;
+}
+
+#if CPU_MOE_X86
+// Planes (k, k+1) of one block as 32 int8 weights in [-1, 2]: bytes 0..15 = plane k, 16..31 =
+// plane k+1 (the shift crosses byte lanes inside the 16-bit shift, the 0x03 mask drops it).
+__attribute__((target("avx2")))
+static inline void q2_planes(const uint8_t* blk, __m256i& w01, __m256i& w23) {
+  const __m128i m3 = _mm_set1_epi8(0x03);
+  const __m256i one = _mm256_set1_epi8(1);
+  const __m128i qb = _mm_loadu_si128(reinterpret_cast<const __m128i*>(blk + 2));
+  const __m128i p0 = _mm_and_si128(qb, m3);
+  const __m128i p1 = _mm_and_si128(_mm_srli_epi16(qb, 2), m3);
+  const __m128i p2 = _mm_and_si128(_mm_srli_epi16(qb, 4), m3);
+  const __m128i p3 = _mm_and_si128(_mm_srli_epi16(qb, 6), m3);
+  w01 = _mm256_sub_epi8(_mm256_set_m128i(p1, p0), one);
+  w23 = _mm256_sub_epi8(_mm256_set_m128i(p3, p2), one);
+}
+
+// The per-lane scale vector of one block: d * [s0 s0 s1 s1 s0 s0 s1 s1] (see the plane note).
+__attribute__((target("avx2,f16c")))
+static inline __m256 q2_lane_scale(uint16_t dh, const float* asb2) {
+  const __m256 s = _mm256_setr_ps(asb2[0], asb2[0], asb2[1], asb2[1], asb2[0], asb2[0], asb2[1], asb2[1]);
+  return _mm256_mul_ps(_mm256_set1_ps(q4_scale(dh)), s);
+}
+
+// AVX2 W2A8: VPMADDUBSW + VPMADDWD with the sign trick (|w| <= 2, so no int16 saturation).
+__attribute__((target("avx2,fma,f16c")))
+float q2_0_dot_i8_avx2(const uint8_t* w, const int8_t* aq, const float* asb, int K) {
+  const __m256i ones16 = _mm256_set1_epi16(1);
+  __m256 accF = _mm256_setzero_ps();
+  const int nb = K / 64;
+  for (int b = 0; b < nb; ++b) {
+    const uint8_t* blk = w + (size_t)b * 18;
+    _mm_prefetch(reinterpret_cast<const char*>(blk) + 512, _MM_HINT_T0);
+    uint16_t dh;
+    std::memcpy(&dh, blk, sizeof(dh));
+    __m256i w01, w23;
+    q2_planes(blk, w01, w23);
+    const __m256i a01 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(aq + (size_t)b * 64));
+    const __m256i a23 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(aq + (size_t)b * 64 + 32));
+    const __m256i d01 = _mm256_madd_epi16(
+        _mm256_maddubs_epi16(_mm256_sign_epi8(w01, w01), _mm256_sign_epi8(a01, w01)), ones16);
+    const __m256i d23 = _mm256_madd_epi16(
+        _mm256_maddubs_epi16(_mm256_sign_epi8(w23, w23), _mm256_sign_epi8(a23, w23)), ones16);
+    accF = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_add_epi32(d01, d23)), q2_lane_scale(dh, asb + 2 * b), accF);
+  }
+  return hsum256(accF);
+}
+
+// AVX-VNNI W2A8: one VPDPBUSD per 32 weights.
+__attribute__((target("avx2,avxvnni,fma,f16c")))
+float q2_0_dot_i8_vnni(const uint8_t* w, const int8_t* aq, const float* asb, int K) {
+  __m256 accF = _mm256_setzero_ps();
+  const int nb = K / 64;
+  for (int b = 0; b < nb; ++b) {
+    const uint8_t* blk = w + (size_t)b * 18;
+    _mm_prefetch(reinterpret_cast<const char*>(blk) + 512, _MM_HINT_T0);
+    uint16_t dh;
+    std::memcpy(&dh, blk, sizeof(dh));
+    __m256i w01, w23;
+    q2_planes(blk, w01, w23);
+    const __m256i a01 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(aq + (size_t)b * 64));
+    const __m256i a23 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(aq + (size_t)b * 64 + 32));
+    __m256i di = _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), _mm256_sign_epi8(w01, w01), _mm256_sign_epi8(a01, w01));
+    di = _mm256_dpbusd_avx_epi32(di, _mm256_sign_epi8(w23, w23), _mm256_sign_epi8(a23, w23));
+    accF = _mm256_fmadd_ps(_mm256_cvtepi32_ps(di), q2_lane_scale(dh, asb + 2 * b), accF);
+  }
+  return hsum256(accF);
+}
+#endif  // CPU_MOE_X86
+
+q2dot_fn select_q2dot() {
+  const IsaTier t = pick_isa();
+#if CPU_MOE_X86
+  if (cpu_has_avxvnni()) return q2_0_dot_i8_vnni;
+  if (t >= ISA_AVX2) return q2_0_dot_i8_avx2;
+#endif
+  (void)t;
+  return q2_0_dot_i8_scalar;
+}
+
+enum WFmt { WF_BF16 = 0, WF_NVFP4 = 1, WF_MXFP4 = 2, WF_DSFP4 = 3, WF_Q4_0 = 4, WF_Q2_0 = 5 };
 
 // Each ctor pointer arg is the address of a CPU int64 array of length
 // num_layers (one base address per layer, built by cpu_executor.py's
@@ -1271,9 +1394,11 @@ struct CpuMoeExecutor {
   nvi8dot_fn nvi8dot = nullptr;  // AVX-VNNI W4A8 nvfp4 dot (nullptr -> use fp32 nvdot)
   bool use_vnni = false;         // nvfp4 + AVX-VNNI: decode via int8 VPDPBUSD (W4A8)
   bool use_q4a8 = false;       // q4_0: always W4A8 (llama.cpp Q4_0 x Q8_0); int8 pre-quant
+  bool use_q2a8 = false;       // q2_0: W2A8, the Q8_0 activations permuted into plane order
   dsdot_fn dsdot;
   mxgemv_fn mxgemv;
   q4dot_fn q4dot;
+  q2dot_fn q2dot;
   // ds_fp4: the caller already FP8-round-tripped the input activations on the GPU
   // (same reference grid), so submit() must not repeat it on the host-callback
   // thread. That scalar per-element pass is single-threaded ON THE DECODE CRITICAL
@@ -1283,7 +1408,8 @@ struct CpuMoeExecutor {
   bool input_prequant = false;
   // ds_fp4 activation round-trip block (the checkpoint's fp8 block); set via set_act_block.
   int act_block = 128;
-  // Q4_0 packed-row byte strides (H/32*18 for gate_up over K=H, I/32*18 for down over K=I).
+  // Q4_0 / Q2_0 packed-row byte strides (H/32*18 or H/64*18 for gate_up over K=H, the same
+  // of I for down over K=I).
   int q4_gu_row_bytes = 0, q4_dn_row_bytes = 0;
   float e2m1_lut[16];
   float e4m3_lut[256];
@@ -1405,23 +1531,34 @@ struct CpuMoeExecutor {
     dsdot = select_dsdot();
     mxgemv = select_mxgemv();
     q4dot = select_q4dot();
+    q2dot = select_q2dot();
+    if (weight_format < WF_BF16 || weight_format > WF_Q2_0)
+      throw std::runtime_error("CPU MoE: unknown weight_format " + std::to_string(weight_format));
     if (weight_format == WF_Q4_0) {
       if (H % 32 != 0 || I % 32 != 0)
         throw std::runtime_error("Q4_0 CPU MoE requires H and I to be multiples of 32");
       q4_gu_row_bytes = (H / 32) * 18;  // K = H (gate_up rows)
       q4_dn_row_bytes = (I / 32) * 18;  // K = I (down rows)
     }
+    if (weight_format == WF_Q2_0) {
+      if (H % 64 != 0 || I % 64 != 0)
+        throw std::runtime_error("Q2_0 CPU MoE requires H and I to be multiples of 64");
+      q4_gu_row_bytes = (H / 64) * 18;
+      q4_dn_row_bytes = (I / 64) * 18;
+    }
     isa = c.name;
     // nvfp4 (AVX-VNNI only): W4A8 int8 decode when the CPU supports it. q4_0 is always
-    // W4A8 (activations pre-quantized to Q8_0); select_q4dot picks VPDPBUSD / VPMADDUBSW
-    // / scalar for the tier, so the tag reflects which of those q4dot resolved to.
+    // W4A8 (activations pre-quantized to Q8_0), q2_0 always W2A8; select_q4dot / select_q2dot
+    // pick VPDPBUSD / VPMADDUBSW / scalar for the tier, so the tag reflects which one resolved.
     nvi8dot = select_nvi8dot();
     use_vnni = (weight_format == WF_NVFP4) && (nvi8dot != nullptr);
     use_q4a8 = (weight_format == WF_Q4_0);
+    use_q2a8 = (weight_format == WF_Q2_0);
     const char* q4tag = use_q4a8 ? (cpu_has_avxvnni() ? "+vnni(q4_0-w4a8)" : "+q4_0-w4a8") : "";
+    const char* q2tag = use_q2a8 ? (cpu_has_avxvnni() ? "+vnni(q2_0-w2a8)" : "+q2_0-w2a8") : "";
     const char* vnni_tag =
         cpu_has_avx512vnni() ? "+avx512vnni(nvfp4-w4a8)" : "+vnni(nvfp4-w4a8)";
-    isa_str = std::string(c.name) + (use_vnni ? vnni_tag : "") + q4tag;
+    isa_str = std::string(c.name) + (use_vnni ? vnni_tag : "") + q4tag + q2tag;
     isa = isa_str.c_str();
     for (int i = 0; i < 16; ++i) e2m1_lut[i] = kE2M1[i];
     for (int i = 0; i < 256; ++i) e4m3_lut[i] = e4m3_decode((uint8_t)i);
@@ -1443,8 +1580,8 @@ struct CpuMoeExecutor {
         gas_scratch.assign(static_cast<size_t>(max_tokens) * top_k * (I / 16), 0);
       }
     }
-    // q4_0 W4A8: per-32-block Q8_0 activations (int8 + fp32 scale) for input + intermediate.
-    if (use_q4a8) {
+    // q4_0 W4A8 / q2_0 W2A8: per-32-block Q8_0 activations (int8 + fp32 scale) for input + intermediate.
+    if (use_q4a8 || use_q2a8) {
       xi8_scratch.assign(static_cast<size_t>(max_tokens) * H, 0);
       xas_scratch.assign(static_cast<size_t>(max_tokens) * (H / 32), 0);
       gi8_scratch.assign(static_cast<size_t>(max_tokens) * top_k * I, 0);
@@ -1516,6 +1653,11 @@ struct CpuMoeExecutor {
           gu_packed_l + ((size_t)e * (2 * I) + row) * (size_t)q4_gu_row_bytes;
       return q4dot(w, xi8, xas, H);  // W4A8: int8 activations (Q8_0), scale in xas
     }
+    if (fmt == WF_Q2_0) {
+      const uint8_t* w =
+          gu_packed_l + ((size_t)e * (2 * I) + row) * (size_t)q4_gu_row_bytes;
+      return q2dot(w, xi8, xas, H);  // W2A8: plane-ordered int8 activations, scales in xas
+    }
     const size_t r = (size_t)e * (2 * I) + row;
     if (use_vnni)
       return nvi8dot(gu_packed_l + r * (size_t)(H / 2), gu_scale_l + r * (size_t)(H / 16),
@@ -1537,6 +1679,10 @@ struct CpuMoeExecutor {
     if (fmt == WF_Q4_0) {
       const uint8_t* w = dn_packed_l + ((size_t)e * H + row) * (size_t)q4_dn_row_bytes;
       return q4dot(w, gi8, gas, I);  // W4A8: int8 activations (Q8_0), scale in gas
+    }
+    if (fmt == WF_Q2_0) {
+      const uint8_t* w = dn_packed_l + ((size_t)e * H + row) * (size_t)q4_dn_row_bytes;
+      return q2dot(w, gi8, gas, I);
     }
     const size_t r = (size_t)e * H + row;
     if (use_vnni)
@@ -1627,9 +1773,9 @@ struct CpuMoeExecutor {
     const float* xe = needs_di ? xe_scratch.data() + (size_t)tok * (H / 2) : nullptr;
     const float* xo = needs_di ? xo_scratch.data() + (size_t)tok * (H / 2) : nullptr;
     const int8_t* xi8 =
-        (use_vnni || use_q4a8) ? xi8_scratch.data() + (size_t)tok * H : nullptr;
+        (use_vnni || use_q4a8 || use_q2a8) ? xi8_scratch.data() + (size_t)tok * H : nullptr;
     const float* xas = use_vnni ? xas_scratch.data() + (size_t)tok * (H / 16)
-                     : use_q4a8 ? xas_scratch.data() + (size_t)tok * (H / 32)
+                     : (use_q4a8 || use_q2a8) ? xas_scratch.data() + (size_t)tok * (H / 32)
                                   : nullptr;
     bf16_t* g_row = g_scratch.data() + ((size_t)tok * top_k + k) * I;
     const int i0 = static_cast<int>(ib) * IBLK;
@@ -1688,9 +1834,9 @@ struct CpuMoeExecutor {
         const bf16_t* g_row = g_scratch.data() + gr * I;
         const float* ge = needs_di ? ge_scratch.data() + gr * (I / 2) : nullptr;
         const float* go = needs_di ? go_scratch.data() + gr * (I / 2) : nullptr;
-        const int8_t* gi8 = (use_vnni || use_q4a8) ? gi8_scratch.data() + gr * I : nullptr;
+        const int8_t* gi8 = (use_vnni || use_q4a8 || use_q2a8) ? gi8_scratch.data() + gr * I : nullptr;
         const float* gas = use_vnni ? gas_scratch.data() + gr * (I / 16)
-                         : use_q4a8 ? gas_scratch.data() + gr * (I / 32)
+                         : (use_q4a8 || use_q2a8) ? gas_scratch.data() + gr * (I / 32)
                                       : nullptr;
         acc += gemm2_dot(down_l, dn_packed_l, dn_scale_l, dn_global_l, e, h, g_row, ge, go, gi8,
                          gas) * w_out;
@@ -1820,9 +1966,10 @@ struct CpuMoeExecutor {
   // (reused across every down output row).
   void prep_g_row(int64_t r) {
     bf16_t* g = g_scratch.data() + (size_t)r * I;
-    if (use_q4a8) {  // q4_0 W4A8: Q8_0-quantize the intermediate row for the down GEMV.
+    if (use_q4a8 || use_q2a8) {  // W4A8 / W2A8: Q8_0-quantize the intermediate row for the down GEMV.
       quant_q8_0(g, I, gi8_scratch.data() + (size_t)r * I,
                  gas_scratch.data() + (size_t)r * (I / 32));
+      if (use_q2a8) permute_q8_planes64(gi8_scratch.data() + (size_t)r * I, I);
       return;
     }
     if (fmt == WF_DSFP4) fp8_roundtrip_bf16(g, g, I, act_block);
@@ -1872,8 +2019,8 @@ struct CpuMoeExecutor {
     barrier(local_sense);
     // Row-major fp4: prepare the intermediate rows (per token,route) before the down
     // GEMV -- ds_fp4 FP8 round-trips (DSV4 act_quant), both deinterleave to fp32; q4_0
-    // W4A8 Q8_0-quantizes. Needs all of pass1 done (a full row spans every iblk).
-    if (needs_di || use_q4a8) {
+    // W4A8 / W2A8 Q8_0-quantize. Needs all of pass1 done (a full row spans every iblk).
+    if (needs_di || use_q4a8 || use_q2a8) {
       for (;;) {
         int64_t r = prt_next.fetch_add(1, std::memory_order_relaxed);
         if (r >= prt_total) break;
@@ -2063,7 +2210,7 @@ struct CpuMoeExecutor {
     if (need > g_scratch.size()) g_scratch.resize(need);
     p1_total = static_cast<int64_t>(t->num_tokens) * top_k * n_iblk;
     p2_total = static_cast<int64_t>(t->num_tokens) * n_hblk;
-    prt_total = (needs_di || use_q4a8) ? static_cast<int64_t>(t->num_tokens) * top_k : 0;
+    prt_total = (needs_di || use_q4a8 || use_q2a8) ? static_cast<int64_t>(t->num_tokens) * top_k : 0;
     p1_next.store(0, std::memory_order_relaxed);
     p2_next.store(0, std::memory_order_relaxed);
     prt_next.store(0, std::memory_order_relaxed);
@@ -2103,8 +2250,8 @@ struct CpuMoeExecutor {
                         xas_scratch.data() + (size_t)tok * (H / 16));
       }
     }
-    // q4_0 W4A8: Q8_0-quantize the per-token input once (single-threaded, tiny for decode).
-    if (use_q4a8) {
+    // q4_0 W4A8 / q2_0 W2A8: Q8_0-quantize the per-token input once (single-threaded, tiny for decode).
+    if (use_q4a8 || use_q2a8) {
       const size_t xn = static_cast<size_t>(t->num_tokens) * H;
       if (xn > xi8_scratch.size()) {
         xi8_scratch.resize(xn);
@@ -2112,9 +2259,11 @@ struct CpuMoeExecutor {
         gi8_scratch.resize(static_cast<size_t>(t->num_tokens) * top_k * I);
         gas_scratch.resize(static_cast<size_t>(t->num_tokens) * top_k * (I / 32));
       }
-      for (int tok = 0; tok < t->num_tokens; ++tok)
+      for (int tok = 0; tok < t->num_tokens; ++tok) {
         quant_q8_0(t->x + (size_t)tok * H, H, xi8_scratch.data() + (size_t)tok * H,
                    xas_scratch.data() + (size_t)tok * (H / 32));
+        if (use_q2a8) permute_q8_planes64(xi8_scratch.data() + (size_t)tok * H, H);
+      }
     }
     {
       std::lock_guard<std::mutex> lk(task_mtx);
@@ -2392,6 +2541,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   // (act_apply falls through to gelu_tanh); the probe turns a stale extension
   // into a loud rebuild instruction instead of wrong model outputs.
   m.def("max_generic_act_id", []() { return static_cast<int>(ACT_SWIGLU_CLAMP); });
+  // ABI capability marker: the highest WFmt this build implements (q2_0 = 5). An older
+  // build would take an unknown id for nvfp4; cpu_executor.py refuses it up front.
+  m.def("max_weight_format", []() { return static_cast<int>(WF_Q2_0); });
   // --moe-bank-prefetch: whether this build can advise mapped rows (Linux only).
   m.def("bank_prefetch_supported", []() { return CPU_MOE_HAS_BANK_PREFETCH == 1; });
 }

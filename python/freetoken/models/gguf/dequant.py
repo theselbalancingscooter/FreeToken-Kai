@@ -25,6 +25,9 @@ GGML_Q4_0 = 2
 GGML_Q8_0 = 8
 GGML_Q6_K = 14
 GGML_BF16 = 30
+# 2026 ggml additions (ggml.h: Q1_0 = 41, Q2_0 = 42). gguf-py 0.19.0 does not list them, so
+# checkpoints carrying them go through models/gguf/rawreader.py instead of GGUFReader.
+GGML_Q2_0 = 42
 
 # (block numel, bytes per block) per ggml type.
 BLOCK_SHAPE: dict[int, tuple[int, int]] = {
@@ -34,6 +37,7 @@ BLOCK_SHAPE: dict[int, tuple[int, int]] = {
     GGML_Q4_0: (32, 18),
     GGML_Q8_0: (32, 34),
     GGML_Q6_K: (256, 210),
+    GGML_Q2_0: (64, 18),
 }
 
 GGML_NAME = {
@@ -43,6 +47,7 @@ GGML_NAME = {
     GGML_Q4_0: "Q4_0",
     GGML_Q8_0: "Q8_0",
     GGML_Q6_K: "Q6_K",
+    GGML_Q2_0: "Q2_0",
 }
 
 
@@ -77,6 +82,40 @@ def dequant_q4_0(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
     hi = (qs >> 4).to(torch.float32)
     q = torch.cat([lo, hi], dim=1)  # [N,32]
     return ((q - 8.0) * d).reshape(-1).to(out_dtype)
+
+
+def dequant_q2_0(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
+    """Q2_0: per 64-elem block = fp16 scale ``d`` + 16 bytes of 2-bit codes; ``w = d*(q-1)``.
+
+    Byte ``j`` holds elements ``4j..4j+3``, element ``4j+k`` in bits ``2k..2k+1``
+    (``00=-1, 01=0, 10=+1, 11=+2``). 18 bytes per 64 weights = 2.25 bits per weight.
+    """
+    raw = raw.reshape(-1, 18)
+    d = _f16_scales(raw, 0, 2)  # [N,1]
+    qs = raw[:, 2:18]  # [N,16] uint8
+    planes = torch.stack([(qs >> (2 * k)) & 0x03 for k in range(4)], dim=2)  # [N,16,4]: elem 4j+k
+    q = planes.reshape(-1, 64).to(torch.float32)
+    return ((q - 1.0) * d).reshape(-1).to(out_dtype)
+
+
+def quantize_q2_0(w: torch.Tensor) -> torch.Tensor:
+    """bf16/fp32 ``[..., K]`` (``K % 64 == 0``) -> packed Q2_0 rows ``[..., K//64*18]`` (uint8).
+
+    ggml's reference quantizer (``quantize_row_q2_0_ref``): the block delta is its max
+    magnitude and ``q = clamp(round(w / d) + 1, 0, 3)``, so a block only ever uses the codes
+    for -1, 0 and +1. Used for the MTP draft head's bf16 experts when the model's banks are
+    Q2_0; the routed experts come packed from the GGUF.
+    """
+    *lead, K = w.shape
+    assert K % 64 == 0, f"Q2_0 needs K % 64 == 0, got {K}"
+    nb = K // 64
+    x = w.reshape(-1, nb, 64).to(torch.float32)
+    d = x.abs().amax(dim=-1, keepdim=True)  # [N,nb,1]
+    inv = torch.where(d > 0, 1.0 / d, torch.zeros_like(d))
+    q = (torch.round(x * inv) + 1.0).clamp_(0.0, 3.0).to(torch.uint8).reshape(-1, nb, 16, 4)
+    packed = q[..., 0] | (q[..., 1] << 2) | (q[..., 2] << 4) | (q[..., 3] << 6)  # [N,nb,16]
+    d16 = d.to(torch.float16).contiguous().view(torch.uint8).reshape(-1, nb, 2)
+    return torch.cat([d16, packed], dim=-1).reshape(*lead, nb * 18)
 
 
 def dequant_q6_k(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
@@ -118,6 +157,7 @@ def dequant_q6_k(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
 _DEQUANT = {
     GGML_Q4_0: dequant_q4_0,
     GGML_Q6_K: dequant_q6_k,
+    GGML_Q2_0: dequant_q2_0,
 }
 
 
@@ -144,10 +184,13 @@ __all__ = [
     "GGML_Q4_0",
     "GGML_Q8_0",
     "GGML_Q6_K",
+    "GGML_Q2_0",
     "GGML_NAME",
     "BLOCK_SHAPE",
     "row_bytes",
     "dequant_q4_0",
+    "dequant_q2_0",
+    "quantize_q2_0",
     "dequant_q6_k",
     "dequantize",
 ]

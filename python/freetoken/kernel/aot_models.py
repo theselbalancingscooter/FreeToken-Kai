@@ -94,6 +94,9 @@ def expert_bank_row_bytes(fmt: str, hidden_size: int, moe_intermediate_size: int
     if fmt == "q4_0":
         # gemma4/gguf.py _q4_0_expert_specs: GGML Q4_0 rows, 32 elems -> 18 bytes
         return {"gate_up": 2 * I * (H // 32 * 18), "down": H * (I // 32 * 18)}
+    if fmt == "q2_0":
+        # qwen4_exp/gguf_experts.py: GGML Q2_0 rows, 64 elems -> 18 bytes
+        return {"gate_up": 2 * I * (H // 64 * 18), "down": H * (I // 64 * 18)}
     if fmt in ("nvfp4", "nvfp4_marlin", "nvfp4_b12x"):
         # models/nvfp4_banks.py: packed e2m1 pairs + per-16 fp8-e4m3 scales + fp16
         # per-row globals; marlin/b12x repacks are byte-identical with the globals
