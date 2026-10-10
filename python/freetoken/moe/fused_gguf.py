@@ -41,7 +41,12 @@ def mmq_min_rows() -> int:
 
 def _mmq(hidden_states, gate_up_q, down_q, topk_ids, act_fn, qt, num_tokens, top_k, n2, h):
     from freetoken.kernel.gguf import ggml_moe_a8, ggml_moe_get_block_size
-    from freetoken.moe.fused import moe_align_block_size
+    # the Triton aligner, not sgl-kernel's: the expert dimension here is the slot cache (2,857
+    # rows on two 3060s), and sgl's moe_align_block_size indexes its shared-memory cumsum by
+    # expert, which overruns past ~992 experts (the same cap MARLIN_MAX_CACHE_SIZE guards) --
+    # an illegal address at the first verify window or graph capture. The Triton one is what
+    # Turing runs every prefill through and takes any count; both are capture-safe.
+    from freetoken.kernel.triton.moe_align import moe_align_block_size
 
     num_slots = int(gate_up_q.shape[0])
     block = int(ggml_moe_get_block_size(qt))
