@@ -529,7 +529,9 @@ def causal_conv1d_decode(
     if isinstance(activation, bool):
         activation = "silu" if activation else None
 
-    x = x.unsqueeze(-1)  # [batch, dim, 1]
+    squeeze = x.dim() == 2
+    if squeeze:
+        x = x.unsqueeze(-1)  # [batch, dim, 1]; a verify window hands in [batch, dim, seqlen]
     batch, dim, seqlen = x.shape
     _, width = weight.shape
     assert 2 <= width <= 4, f"causal_conv1d triton fallback supports width 2..4, got {width}"
@@ -584,7 +586,7 @@ def causal_conv1d_decode(
         num_warps=4,
         num_stages=2,
     )
-    return out.squeeze(-1)
+    return out.squeeze(-1) if squeeze else out
 
 
 # ---------------------------------------------------------------------------

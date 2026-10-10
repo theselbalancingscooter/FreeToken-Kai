@@ -52,6 +52,35 @@ def causal_conv1d_varlen(
     return x
 
 
+def causal_conv1d_window(
+    x: torch.Tensor,                # [batch, conv_dim, seqlen]: the verify window's conv inputs (in place)
+    conv_state: torch.Tensor,       # [num_slots, conv_dim, state_len>=kernel-1] (in place)
+    weight: torch.Tensor,           # [conv_dim, kernel]
+    conv_state_indices: torch.Tensor,  # [batch] int32 slot id per request
+) -> torch.Tensor:
+    """A few tokens of ONE request through the decode-style update kernel: the state supplies the
+    tokens before the window, the window's last (kernel-1) inputs become the new state, and the
+    output is silu(conv) in place. The same math as the varlen prefill conv over the window, in
+    one small kernel instead of the chunked prefill one (which took 0.2 ms per layer for 4
+    tokens on an RTX 3060)."""
+    from freetoken.kernel.backend import is_sgl_kernel_installed
+
+    if not is_sgl_kernel_installed():
+        from freetoken.kernel.triton.causal_conv1d_triton import (
+            causal_conv1d_decode as triton_causal_conv1d_decode,
+        )
+
+        return triton_causal_conv1d_decode(x, conv_state, weight, conv_state_indices)
+
+    from sgl_kernel import causal_conv1d_update
+
+    causal_conv1d_update(
+        x, conv_state, weight, None, True, None,
+        conv_state_indices.to(torch.int32), _PAD_SLOT_ID,
+    )
+    return x
+
+
 def causal_conv1d_decode(
     x: torch.Tensor,                # [batch, conv_dim] (one token per request)
     conv_state: torch.Tensor,       # [num_slots, conv_dim, state_len>=kernel-1] (in place)

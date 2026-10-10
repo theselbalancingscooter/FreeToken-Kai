@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 from freetoken.core import get_global_ctx
-from freetoken.kernel.causal_conv1d import causal_conv1d_decode, causal_conv1d_varlen
+from freetoken.kernel.causal_conv1d import causal_conv1d_decode, causal_conv1d_varlen, causal_conv1d_window
 from freetoken.layers import BaseOP, GatedRMSNorm, LinearColParallelMerged, LinearReplicated
 from freetoken.layers.quantization import QuantConfig
 from freetoken.models.qwen3_5_moe.gdn_kernels import gdn_decode_fla, gdn_prefill_chunk_fla
@@ -17,6 +17,9 @@ logger = init_logger(__name__)
 # state for the first verify forwards and log the difference (diagnostics)
 _CHECK_GDN = os.environ.get("FT_SPEC_CHECK_GDN") == "1"
 _check_left = [48 * 3]
+_check_conv_left = [48 * 3]
+# FREETOKEN_GDN_WINDOW_CONV=varlen keeps the chunked prefill conv for the verify window (A/B)
+_WINDOW_CONV = os.environ.get("FREETOKEN_GDN_WINDOW_CONV", "update")
 
 
 @dataclass
@@ -143,6 +146,30 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
                                    cu_seqlens, cache_indices, has_initial_state)
         return out.transpose(0, 1)  # [total, conv_dim]
 
+    def _conv_window(self, conv_in: torch.Tensor, cache_indices: torch.Tensor, pool) -> torch.Tensor:
+        """The MTP verify window's conv (one request, K+1 tokens) through the update kernel
+        (kernel/causal_conv1d.causal_conv1d_window) instead of the varlen prefill conv; returns
+        ``[total, conv_dim]`` as a transposed view, like ``_conv_prefill``. FT_SPEC_CHECK_GDN=1
+        runs the varlen conv beside it on a copy of the state for the first windows."""
+        li = pool.local_index(self.layer_id)
+        x = channels_first_copy(conv_in).unsqueeze(0)  # [1, conv_dim, total]
+        if _CHECK_GDN and _check_conv_left[0] > 0:
+            _check_conv_left[0] -= 1
+            ref_state = pool.conv_states[li].clone()
+            total = conv_in.shape[0]
+            cu = torch.tensor([0, total], dtype=torch.int32, device=conv_in.device)
+            ref = causal_conv1d_varlen(
+                channels_first_copy(conv_in), self._conv_weight(), ref_state, cu, cache_indices,
+                torch.ones(1, dtype=torch.bool, device=conv_in.device), max_seq_len=total,
+            )
+        out = causal_conv1d_window(x, pool.conv_states[li], self._conv_weight(), cache_indices)
+        if _CHECK_GDN and "ref" in locals():
+            slot = cache_indices.long()
+            d_out = (out[0].float() - ref.float()).abs().max().item()
+            d_state = (pool.conv_states[li].index_select(0, slot).float() - ref_state.index_select(0, slot).float()).abs().max().item()
+            logger.warning(f"spec conv check layer {self.layer_id} T={conv_in.shape[0]}: |out-ref|max={d_out:.3e} |state-ref|max={d_state:.3e}")
+        return out[0].transpose(0, 1)
+
     def _conv_decode(self, conv_in: torch.Tensor, table_idx: torch.Tensor, pool) -> torch.Tensor:
         """Single-token causal conv update (fused sgl_kernel) by ``table_idx`` slot;
         updates conv state in place, no host loop -> CUDA-graph capturable.
@@ -214,8 +241,12 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
             prev_conv = (
                 pool.conv_states[li].index_select(0, fla.cache_indices.long()).clone() if spec else None
             )
-            mixed = self._conv_prefill(
-                conv_in, pool, fla.cu_seqlens, fla.cache_indices, fla.has_initial_state)
+            if spec and _WINDOW_CONV == "update" and fla.cache_indices.numel() == 1:
+                # the few rows of one request: the decode-style update kernel, not the chunked prefill conv
+                mixed = self._conv_window(conv_in, fla.cache_indices, pool)
+            else:
+                mixed = self._conv_prefill(
+                    conv_in, pool, fla.cu_seqlens, fla.cache_indices, fla.has_initial_state)
             # fla chunk handles GQA in-kernel: q/k stay at num_k_heads, v at num_v_heads.
             qf, kf, vf = torch.split(mixed, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
             q = qf.reshape(1, total, self.num_k_heads, self.head_k_dim).to(dtype)
