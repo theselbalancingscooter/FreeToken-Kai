@@ -709,6 +709,34 @@ def _atomic_write_json(path: str, obj: dict) -> None:
     os.replace(tmp, path)
 
 
+def merge_profile(existing: dict | None, result: dict) -> dict:
+    """``result`` plus the formats / models of ``existing`` this run did not measure.
+
+    The profile is one file per GPU and a run only measures what it was asked for
+    (``--dtype q2_0``); writing it out alone used to drop the nvfp4 / mxfp4 entries the
+    runtime reads for every other model (the hybrid fetch split then silently fell back to
+    a fetch cap of 1). An ``existing`` of another version or another GPU is not merged.
+    """
+    if not isinstance(existing, dict) or existing.get("version") != result.get("version"):
+        return result
+    if (existing.get("gpu") or {}).get("uuid") != (result.get("gpu") or {}).get("uuid"):
+        return result
+    merged = dict(result)
+    carried = []
+    for section in ("dtype_kernels", "dtypes", "workloads"):
+        old = existing.get(section) or {}
+        new = dict(result.get(section) or {})
+        for key, value in old.items():
+            if key not in new:
+                new[key] = value
+                if section != "dtypes":
+                    carried.append(f"{section}:{key}")
+        merged[section] = new
+    if carried:
+        merged["carried_over"] = sorted(carried)
+    return merged
+
+
 def run_benchbw(
     out_path: str | None = None,
     threshold: float = 2.0,
@@ -820,6 +848,16 @@ def run_benchbw(
     }
 
     out_path = os.path.expanduser(out_path or default_out_path(gpu["uuid"]))
+    existing = None
+    if os.path.isfile(out_path):
+        try:
+            with open(out_path) as f:
+                existing = json.load(f)
+        except (OSError, ValueError) as e:
+            logger.warning(f"benchbw: could not read the existing profile {out_path} ({e}); writing a fresh one")
+    result = merge_profile(existing, result)
+    if result.get("carried_over"):
+        logger.info(f"benchbw: kept the earlier measurements of {', '.join(result['carried_over'])} from {out_path}")
     _atomic_write_json(out_path, result)
     result["out_path"] = out_path
     if prog_on:
