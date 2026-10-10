@@ -371,6 +371,24 @@ torch::Tensor ggml_moe_a8(
             sorted_token_ids.sizes()[0],
             stream);
         break;
+      case 42:  // ggml Q2_0 (FreeToken addition)
+        ggml_moe_q2_0_q8_1_cuda(
+            (void*)quant_X.data_ptr(),
+            (void*)W.data_ptr(),
+            (scalar_t*)Y.data_ptr(),
+            (int*)sorted_token_ids.data_ptr(),
+            (int*)expert_ids.data_ptr(),
+            (int*)num_tokens_post_padded.data_ptr(),
+            W.stride(0),
+            col,
+            row,
+            tokens,
+            padded,
+            row,
+            top_k,
+            sorted_token_ids.sizes()[0],
+            stream);
+        break;
       case 3:
         ggml_moe_q4_1_q8_1_cuda(
             (void*)quant_X.data_ptr(),
@@ -826,6 +844,8 @@ int64_t ggml_moe_get_block_size(int64_t type) {
   switch (type) {
     case 2:
       return MOE_X_Q4_0;
+    case 42:
+      return MOE_X_Q2_0;
     case 3:
       return MOE_X_Q4_1;
     case 6:

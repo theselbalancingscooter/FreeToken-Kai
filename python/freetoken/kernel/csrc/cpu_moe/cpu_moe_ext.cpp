@@ -1244,7 +1244,10 @@ q4dot_fn select_q4dot() {
 // 16k+j) and the kernels read them contiguously. The block's two Q8_0 scales (elements 0..31
 // = j < 8 of every plane, 32..63 = j >= 8) split each plane in half: over the 32 bytes of
 // planes (k, k+1) the 8 int32 lanes of the integer dot see the scales [s0 s0 s1 s1 s0 s0 s1 s1].
-using q2dot_fn = float (*)(const uint8_t*, const int8_t*, const float*, int);
+// The codes are fed to the u8 x s8 dot as they are (0..3); the "- 1" of every code is the
+// block's activation sum, which is taken once per token / route as the same 8 int32 lanes
+// (q2_lane_sums64: ``alanes``) and subtracted from the lane dots before the scales apply.
+using q2dot_fn = float (*)(const uint8_t*, const int8_t*, const float*, const int32_t*, int);
 
 // In place: a Q8_0-quantized row in natural order (K % 64 == 0) -> plane order per 64-block.
 inline void permute_q8_planes64(int8_t* aq, int K) {
@@ -1256,7 +1259,21 @@ inline void permute_q8_planes64(int8_t* aq, int K) {
   }
 }
 
-float q2_0_dot_i8_scalar(const uint8_t* w, const int8_t* aq, const float* asb, int K) {
+// Per 64-block of a plane-ordered row: the 8 int32 lane sums the u8 x s8 dot of planes (0,1)
+// and (2,3) would see for an all-ones weight -- lane l = bytes 4l..4l+3 of both 32-byte halves.
+inline void q2_lane_sums64(const int8_t* aq, int K, int32_t* out) {
+  for (int b = 0; b < K / 64; ++b) {
+    const int8_t* blk = aq + (size_t)b * 64;
+    int32_t* o = out + (size_t)b * 8;
+    for (int l = 0; l < 8; ++l) {
+      int s = 0;
+      for (int m = 0; m < 4; ++m) s += (int)blk[4 * l + m] + (int)blk[32 + 4 * l + m];
+      o[l] = s;
+    }
+  }
+}
+
+float q2_0_dot_i8_scalar(const uint8_t* w, const int8_t* aq, const float* asb, const int32_t*, int K) {
   float acc = 0.0f;
   const int nb = K / 64;
   for (int b = 0; b < nb; ++b) {
@@ -1279,31 +1296,30 @@ float q2_0_dot_i8_scalar(const uint8_t* w, const int8_t* aq, const float* asb, i
 }
 
 #if CPU_MOE_X86
-// Planes (k, k+1) of one block as 32 int8 weights in [-1, 2]: bytes 0..15 = plane k, 16..31 =
-// plane k+1 (the shift crosses byte lanes inside the 16-bit shift, the 0x03 mask drops it).
+// Planes (k, k+1) of one block as 32 UNSIGNED codes 0..3: bytes 0..15 = plane k, 16..31 =
+// plane k+1 (the 16-bit shift lets bits cross byte lanes; the 0x03 mask drops them).
 __attribute__((target("avx2")))
 static inline void q2_planes(const uint8_t* blk, __m256i& w01, __m256i& w23) {
-  const __m128i m3 = _mm_set1_epi8(0x03);
-  const __m256i one = _mm256_set1_epi8(1);
+  const __m256i m3 = _mm256_set1_epi8(0x03);
   const __m128i qb = _mm_loadu_si128(reinterpret_cast<const __m128i*>(blk + 2));
-  const __m128i p0 = _mm_and_si128(qb, m3);
-  const __m128i p1 = _mm_and_si128(_mm_srli_epi16(qb, 2), m3);
-  const __m128i p2 = _mm_and_si128(_mm_srli_epi16(qb, 4), m3);
-  const __m128i p3 = _mm_and_si128(_mm_srli_epi16(qb, 6), m3);
-  w01 = _mm256_sub_epi8(_mm256_set_m128i(p1, p0), one);
-  w23 = _mm256_sub_epi8(_mm256_set_m128i(p3, p2), one);
+  w01 = _mm256_and_si256(_mm256_set_m128i(_mm_srli_epi16(qb, 2), qb), m3);
+  w23 = _mm256_and_si256(_mm256_set_m128i(_mm_srli_epi16(qb, 6), _mm_srli_epi16(qb, 4)), m3);
 }
 
-// The per-lane scale vector of one block: d * [s0 s0 s1 s1 s0 s0 s1 s1] (see the plane note).
+// The per-lane scale vector of one block: d * [s0 s0 s1 s1 s0 s0 s1 s1] (see the plane note),
+// built from the two adjacent Q8_0 scales with one 8-byte load and one lane permute.
 __attribute__((target("avx2,f16c")))
 static inline __m256 q2_lane_scale(uint16_t dh, const float* asb2) {
-  const __m256 s = _mm256_setr_ps(asb2[0], asb2[0], asb2[1], asb2[1], asb2[0], asb2[0], asb2[1], asb2[1]);
+  const __m256i idx = _mm256_setr_epi32(0, 0, 1, 1, 0, 0, 1, 1);
+  const __m128 s2 = _mm_castsi128_ps(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(asb2)));
+  const __m256 s = _mm256_permutevar8x32_ps(_mm256_castps128_ps256(s2), idx);
   return _mm256_mul_ps(_mm256_set1_ps(q4_scale(dh)), s);
 }
 
-// AVX2 W2A8: VPMADDUBSW + VPMADDWD with the sign trick (|w| <= 2, so no int16 saturation).
+// AVX2 W2A8: VPMADDUBSW (u8 codes x s8 activations, pair sums <= 762) + VPMADDWD, minus the
+// precomputed activation lane sums, times the lane scales.
 __attribute__((target("avx2,fma,f16c")))
-float q2_0_dot_i8_avx2(const uint8_t* w, const int8_t* aq, const float* asb, int K) {
+float q2_0_dot_i8_avx2(const uint8_t* w, const int8_t* aq, const float* asb, const int32_t* alanes, int K) {
   const __m256i ones16 = _mm256_set1_epi16(1);
   __m256 accF = _mm256_setzero_ps();
   const int nb = K / 64;
@@ -1316,18 +1332,18 @@ float q2_0_dot_i8_avx2(const uint8_t* w, const int8_t* aq, const float* asb, int
     q2_planes(blk, w01, w23);
     const __m256i a01 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(aq + (size_t)b * 64));
     const __m256i a23 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(aq + (size_t)b * 64 + 32));
-    const __m256i d01 = _mm256_madd_epi16(
-        _mm256_maddubs_epi16(_mm256_sign_epi8(w01, w01), _mm256_sign_epi8(a01, w01)), ones16);
-    const __m256i d23 = _mm256_madd_epi16(
-        _mm256_maddubs_epi16(_mm256_sign_epi8(w23, w23), _mm256_sign_epi8(a23, w23)), ones16);
-    accF = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_add_epi32(d01, d23)), q2_lane_scale(dh, asb + 2 * b), accF);
+    const __m256i d01 = _mm256_madd_epi16(_mm256_maddubs_epi16(w01, a01), ones16);
+    const __m256i d23 = _mm256_madd_epi16(_mm256_maddubs_epi16(w23, a23), ones16);
+    const __m256i sums = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(alanes + (size_t)b * 8));
+    const __m256i di = _mm256_sub_epi32(_mm256_add_epi32(d01, d23), sums);
+    accF = _mm256_fmadd_ps(_mm256_cvtepi32_ps(di), q2_lane_scale(dh, asb + 2 * b), accF);
   }
   return hsum256(accF);
 }
 
-// AVX-VNNI W2A8: one VPDPBUSD per 32 weights.
+// AVX-VNNI W2A8: one VPDPBUSD per 32 weights, no sign juggling (the codes are unsigned).
 __attribute__((target("avx2,avxvnni,fma,f16c")))
-float q2_0_dot_i8_vnni(const uint8_t* w, const int8_t* aq, const float* asb, int K) {
+float q2_0_dot_i8_vnni(const uint8_t* w, const int8_t* aq, const float* asb, const int32_t* alanes, int K) {
   __m256 accF = _mm256_setzero_ps();
   const int nb = K / 64;
   for (int b = 0; b < nb; ++b) {
@@ -1339,8 +1355,9 @@ float q2_0_dot_i8_vnni(const uint8_t* w, const int8_t* aq, const float* asb, int
     q2_planes(blk, w01, w23);
     const __m256i a01 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(aq + (size_t)b * 64));
     const __m256i a23 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(aq + (size_t)b * 64 + 32));
-    __m256i di = _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), _mm256_sign_epi8(w01, w01), _mm256_sign_epi8(a01, w01));
-    di = _mm256_dpbusd_avx_epi32(di, _mm256_sign_epi8(w23, w23), _mm256_sign_epi8(a23, w23));
+    const __m256i sums = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(alanes + (size_t)b * 8));
+    __m256i di = _mm256_dpbusd_avx_epi32(_mm256_sub_epi32(_mm256_setzero_si256(), sums), w01, a01);
+    di = _mm256_dpbusd_avx_epi32(di, w23, a23);
     accF = _mm256_fmadd_ps(_mm256_cvtepi32_ps(di), q2_lane_scale(dh, asb + 2 * b), accF);
   }
   return hsum256(accF);
@@ -1424,6 +1441,8 @@ struct CpuMoeExecutor {
   // AVX-VNNI W4A8: per-16-block int8 activations [even(8),odd(8)] + per-block scale.
   std::vector<int8_t> xi8_scratch, gi8_scratch;  // [max_tokens*H], [max_tokens*top_k*I]
   std::vector<float> xas_scratch, gas_scratch;   // [max_tokens*H/16], [..*top_k*I/16]
+  // q2_0: the 8 int32 activation lane sums per 64-block (q2_lane_sums64), input / intermediate
+  std::vector<int32_t> xal_scratch, gal_scratch;  // [max_tokens*H/64*8], [..*top_k*I/64*8]
   std::string isa_str;
 
   std::vector<std::thread> workers;
@@ -1587,6 +1606,10 @@ struct CpuMoeExecutor {
       gi8_scratch.assign(static_cast<size_t>(max_tokens) * top_k * I, 0);
       gas_scratch.assign(static_cast<size_t>(max_tokens) * top_k * (I / 32), 0);
     }
+    if (use_q2a8) {
+      xal_scratch.assign(static_cast<size_t>(max_tokens) * (H / 64) * 8, 0);
+      gal_scratch.assign(static_cast<size_t>(max_tokens) * top_k * (I / 64) * 8, 0);
+    }
     for (int t = 0; t < num_threads; ++t)
       workers.emplace_back([this, t] { worker_loop(t); });
   }
@@ -1643,7 +1666,7 @@ struct CpuMoeExecutor {
   inline float gemm1_dot(const bf16_t* gate_up_l, const uint8_t* gu_packed_l,
                          const uint8_t* gu_scale_l, const uint16_t* gu_global_l, int e, int row,
                          const bf16_t* x, const float* xe, const float* xo, const int8_t* xi8,
-                         const float* xas) {
+                         const float* xas, const int32_t* xal = nullptr) {
     if (fmt == WF_BF16) {
       const bf16_t* w = gate_up_l + ((size_t)e * (2 * I) + row) * H;
       return dot(w, x, H);
@@ -1656,7 +1679,7 @@ struct CpuMoeExecutor {
     if (fmt == WF_Q2_0) {
       const uint8_t* w =
           gu_packed_l + ((size_t)e * (2 * I) + row) * (size_t)q4_gu_row_bytes;
-      return q2dot(w, xi8, xas, H);  // W2A8: plane-ordered int8 activations, scales in xas
+      return q2dot(w, xi8, xas, xal, H);  // W2A8: plane-ordered int8 activations, scales in xas
     }
     const size_t r = (size_t)e * (2 * I) + row;
     if (use_vnni)
@@ -1671,7 +1694,7 @@ struct CpuMoeExecutor {
   inline float gemm2_dot(const bf16_t* down_l, const uint8_t* dn_packed_l,
                          const uint8_t* dn_scale_l, const uint16_t* dn_global_l, int e, int row,
                          const bf16_t* g, const float* ge, const float* go, const int8_t* gi8,
-                         const float* gas) {
+                         const float* gas, const int32_t* gal = nullptr) {
     if (fmt == WF_BF16) {
       const bf16_t* w = down_l + ((size_t)e * H + row) * I;
       return dot(w, g, I);
@@ -1682,7 +1705,7 @@ struct CpuMoeExecutor {
     }
     if (fmt == WF_Q2_0) {
       const uint8_t* w = dn_packed_l + ((size_t)e * H + row) * (size_t)q4_dn_row_bytes;
-      return q2dot(w, gi8, gas, I);
+      return q2dot(w, gi8, gas, gal, I);
     }
     const size_t r = (size_t)e * H + row;
     if (use_vnni)
@@ -1777,6 +1800,7 @@ struct CpuMoeExecutor {
     const float* xas = use_vnni ? xas_scratch.data() + (size_t)tok * (H / 16)
                      : (use_q4a8 || use_q2a8) ? xas_scratch.data() + (size_t)tok * (H / 32)
                                   : nullptr;
+    const int32_t* xal = use_q2a8 ? xal_scratch.data() + (size_t)tok * (H / 64) * 8 : nullptr;
     bf16_t* g_row = g_scratch.data() + ((size_t)tok * top_k + k) * I;
     const int i0 = static_cast<int>(ib) * IBLK;
     const int i1 = std::min(I, i0 + IBLK);
@@ -1786,9 +1810,9 @@ struct CpuMoeExecutor {
     for (int i = i0; i < i1; ++i) {
       // gate = row i, up = row I+i
       float gate =
-          gemm1_dot(gate_up_l, gu_packed_l, gu_scale_l, gu_global_l, e, i, x_row, xe, xo, xi8, xas) * w_in;
+          gemm1_dot(gate_up_l, gu_packed_l, gu_scale_l, gu_global_l, e, i, x_row, xe, xo, xi8, xas, xal) * w_in;
       float up = gemm1_dot(gate_up_l, gu_packed_l, gu_scale_l, gu_global_l, e, I + i, x_row,
-                           xe, xo, xi8, xas) * w_in;
+                           xe, xo, xi8, xas, xal) * w_in;
       if (clamped) {
         // clamp(gate, max=lim) * sigmoid(alpha * gate) * (clamp(up, +-lim) + up_bias)
         // -- swigluoai carries the +1 up bias (gpt-oss/MiniMax); swiglu_clamp
@@ -1838,8 +1862,9 @@ struct CpuMoeExecutor {
         const float* gas = use_vnni ? gas_scratch.data() + gr * (I / 16)
                          : (use_q4a8 || use_q2a8) ? gas_scratch.data() + gr * (I / 32)
                                       : nullptr;
+        const int32_t* gal = use_q2a8 ? gal_scratch.data() + gr * (I / 64) * 8 : nullptr;
         acc += gemm2_dot(down_l, dn_packed_l, dn_scale_l, dn_global_l, e, h, g_row, ge, go, gi8,
-                         gas) * w_out;
+                         gas, gal) * w_out;
       }
       y_row[h] = f32_to_bf16(acc);
     }
@@ -1969,7 +1994,10 @@ struct CpuMoeExecutor {
     if (use_q4a8 || use_q2a8) {  // W4A8 / W2A8: Q8_0-quantize the intermediate row for the down GEMV.
       quant_q8_0(g, I, gi8_scratch.data() + (size_t)r * I,
                  gas_scratch.data() + (size_t)r * (I / 32));
-      if (use_q2a8) permute_q8_planes64(gi8_scratch.data() + (size_t)r * I, I);
+      if (use_q2a8) {
+        permute_q8_planes64(gi8_scratch.data() + (size_t)r * I, I);
+        q2_lane_sums64(gi8_scratch.data() + (size_t)r * I, I, gal_scratch.data() + (size_t)r * (I / 64) * 8);
+      }
       return;
     }
     if (fmt == WF_DSFP4) fp8_roundtrip_bf16(g, g, I, act_block);
@@ -2258,11 +2286,18 @@ struct CpuMoeExecutor {
         xas_scratch.resize(xn / 32);
         gi8_scratch.resize(static_cast<size_t>(t->num_tokens) * top_k * I);
         gas_scratch.resize(static_cast<size_t>(t->num_tokens) * top_k * (I / 32));
+        if (use_q2a8) {
+          xal_scratch.resize(xn / 64 * 8);
+          gal_scratch.resize(static_cast<size_t>(t->num_tokens) * top_k * (I / 64) * 8);
+        }
       }
       for (int tok = 0; tok < t->num_tokens; ++tok) {
         quant_q8_0(t->x + (size_t)tok * H, H, xi8_scratch.data() + (size_t)tok * H,
                    xas_scratch.data() + (size_t)tok * (H / 32));
-        if (use_q2a8) permute_q8_planes64(xi8_scratch.data() + (size_t)tok * H, H);
+        if (use_q2a8) {
+          permute_q8_planes64(xi8_scratch.data() + (size_t)tok * H, H);
+          q2_lane_sums64(xi8_scratch.data() + (size_t)tok * H, H, xal_scratch.data() + (size_t)tok * (H / 64) * 8);
+        }
       }
     }
     {

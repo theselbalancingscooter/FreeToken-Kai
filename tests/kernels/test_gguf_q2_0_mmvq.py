@@ -14,12 +14,15 @@ def _reference(x, packed, topk_ids, K):
     from freetoken.models.gguf.dequant import GGML_Q2_0, dequantize
 
     S, N, _ = packed.shape
-    w = dequantize(packed.reshape(-1).cpu(), GGML_Q2_0, torch.float32).reshape(S, N, K).to(x.device)
     T, top_k = topk_ids.shape
     out = torch.empty(T * top_k, N, device=x.device, dtype=torch.float32)
+    cache = {}
     for t in range(T):
         for k in range(top_k):
-            out[t * top_k + k] = x[t].float() @ w[int(topk_ids[t, k])].T
+            e = int(topk_ids[t, k])
+            if e not in cache:
+                cache[e] = dequantize(packed[e].reshape(-1), GGML_Q2_0, torch.float32).reshape(N, K)
+            out[t * top_k + k] = x[t].float() @ cache[e].T
     return out
 
 

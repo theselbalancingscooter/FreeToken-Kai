@@ -62,10 +62,10 @@ from freetoken.utils import init_logger
 logger = init_logger(__name__)
 
 # Formats the CPU MoE C++ kernel can compute AND this bench can build banks for; anything
-# else is offload-only here. (The kernel also does q4_0, but this bench has no q4_0 banks.)
-_CPU_MOE_FORMATS = frozenset({"bf16", "nvfp4", "mxfp4_triton", "ds_fp4"})
+# else is offload-only here.
+_CPU_MOE_FORMATS = frozenset({"bf16", "nvfp4", "mxfp4_triton", "ds_fp4", "q4_0", "q2_0"})
 # Formats this bench can build synthetic (correctly-sized) banks for.
-_BUILDABLE_FORMATS = frozenset({"bf16", "nvfp4", "fp8_block", "mxfp4_triton", "ds_fp4"})
+_BUILDABLE_FORMATS = frozenset({"bf16", "nvfp4", "fp8_block", "mxfp4_triton", "ds_fp4", "q4_0", "q2_0"})
 # Friendlier CLI/display aliases for the internal quant_format strings.
 _FORMAT_ALIASES = {"fp8": "fp8_block", "mxfp4": "mxfp4_triton"}
 _FORMAT_DISPLAY = {"fp8_block": "fp8", "mxfp4_triton": "mxfp4"}
@@ -129,6 +129,8 @@ WORKLOADS: dict[str, Workload] = {
         activation="swiglu_clamp", swiglu_alpha=1.0, swiglu_limit=10.0,
     ),
     "minimax-m2.5": Workload("minimax-m2.5", 3072, 1536, 256, 8, ("nvfp4",)),
+    # Qwen3.8-Flash-Next: the NVFP4 checkpoint, or its experts from the Q2_0 GGUF (--moe-expert-gguf)
+    "flash-next": Workload("flash-next", 2560, 640, 512, 10, ("nvfp4", "q2_0")),
 }
 
 # Per-dtype canonical geometries for the TUNING bench (`--dtype`). The hybrid-vs-offload choice is
@@ -145,6 +147,8 @@ DTYPE_WORKLOADS: dict[str, Workload] = {
     "mxfp4_triton": Workload("dtype:mxfp4", 2880, 2880, 128, 4, ("mxfp4_triton",),
                              activation="gpt_oss_swiglu", swiglu_limit=7.0),
     "ds_fp4": Workload("dtype:ds_fp4", 4096, 2048, 128, 6, ("ds_fp4",), swiglu_limit=7.0, act_block=128),
+    # GGUF Q2_0 experts (Flash-Next's geometry); the hybrid fetch split reads this entry
+    "q2_0": Workload("dtype:q2_0", 2560, 640, 128, 10, ("q2_0",)),
 }
 
 
@@ -381,6 +385,17 @@ def _cpu_moe_bank_sources(fmt: str, H: int, I: int, E: int) -> dict:
         }
         b["gate_up_scale"].fill_(127)  # e8m0 unit exponent
         b["down_scale"].fill_(127)
+        return b
+    if fmt in ("q4_0", "q2_0"):
+        # native GGUF blocks (fp16 scale + 16 bytes per 32 / 64 weights); the scale bytes are
+        # set to a finite fp16 (0x2C00 = 0.0625) so no block decodes to inf / NaN
+        block = 32 if fmt == "q4_0" else 64
+        b = {"gate_up": pin(E, 2 * I, H // block * 18, dtype=torch.uint8), "down": pin(E, H, I // block * 18, dtype=torch.uint8)}
+        for t in b.values():
+            t.random_(0, 256)
+            rows = t.view(-1, 18)
+            rows[:, 0] = 0x00
+            rows[:, 1] = 0x2C
         return b
     raise NotImplementedError(fmt)
 

@@ -675,6 +675,112 @@ static __device__ __forceinline__ float vec_dot_q4_0_q8_1_mul_mat(
       y_ds[j * (WARP_SIZE_GGUF / QI8_1) + (2 * k / QI8_1) % (WARP_SIZE_GGUF / QI8_1)]);
 }
 
+// ---- Q2_0 tiles for the MMQ / MoE-MMQ kernels (FreeToken addition) ----
+// block_q2_0 has block_q4_0's byte layout (fp16 d + 16 bytes) and QI2_0 == QI4_0 == 4 ints per
+// block, so the tile loads are the q4_0 ones over block_q2_0; only the dot differs: one int is
+// 16 weights (not 8 pairs), spread over the 2-bit planes, and a block spans two q8_1 blocks.
+#define VDR_Q2_0_Q8_1_MMQ 1
+
+template <int mmq_y>
+static __device__ __forceinline__ void allocate_tiles_q2_0(int** x_ql, half2** x_dm, int** x_qh, int** x_sc) {
+  __shared__ int tile_x_qs[mmq_y * (WARP_SIZE_GGUF) + mmq_y];
+  __shared__ float tile_x_d[mmq_y * (WARP_SIZE_GGUF / QI2_0) + mmq_y / QI2_0];
+  *x_ql = tile_x_qs;
+  *x_dm = (half2*)tile_x_d;
+}
+
+// ``nblk``: the blocks of this warp iteration that lie inside the row (moe_q_bounded); the
+// rest of the tile is zero-filled instead of read past the row's end.
+template <int mmq_y, int nwarps, bool need_check>
+static __device__ __forceinline__ void load_tiles_q2_0(
+    const void* __restrict__ vx,
+    int* __restrict__ x_ql,
+    half2* __restrict__ x_dm,
+    int* __restrict__ x_qh,
+    int* __restrict__ x_sc,
+    const int& i_offset,
+    const int& i_max,
+    const int& k,
+    const int& blocks_per_row,
+    const int& nblk) {
+  const int kbx = k / QI2_0;
+  const int kqsx = k % QI2_0;
+
+  const block_q2_0* bx0 = (const block_q2_0*)vx;
+  float* x_dmf = (float*)x_dm;
+
+#pragma unroll
+  for (int i0 = 0; i0 < mmq_y; i0 += nwarps) {
+    int i = i0 + i_offset;
+    if (need_check) {
+      i = min(i, i_max);
+    }
+    const block_q2_0* bxi = bx0 + i * blocks_per_row + kbx;
+    x_ql[i * (WARP_SIZE_GGUF + 1) + k] = kbx < nblk ? get_int_from_uint8(bxi->qs, kqsx) : 0;
+  }
+
+  const int blocks_per_tile_x_row = WARP_SIZE_GGUF / QI2_0;
+  const int kbxd = k % blocks_per_tile_x_row;
+
+#pragma unroll
+  for (int i0 = 0; i0 < mmq_y; i0 += nwarps * QI2_0) {
+    int i = i0 + i_offset * QI2_0 + k / blocks_per_tile_x_row;
+    if (need_check) {
+      i = min(i, i_max);
+    }
+    const block_q2_0* bxi = bx0 + i * blocks_per_row + kbxd;
+    x_dmf[i * (WARP_SIZE_GGUF / QI2_0) + i / QI2_0 + kbxd] = kbxd < nblk ? __half2float(bxi->d) : 0.0f;
+  }
+}
+
+// One x-tile int (16 weights) of row i against token j. The warp iteration covers 8 blocks
+// (512 weights) in qr = 4 rounds of 128; k is the int within the row's 32-int tile, and the y
+// tile holds the round's 128 activations in natural order (int t = elements 4t..4t+3) with its
+// 4 q8_1 (d, sum) pairs. The int's 16 weights sit at element ((k%8)/4)*64 + 16*(k%4) of the
+// round, i.e. at y ints ((k%8)/4)*16 + 4*(k%4) + 0..3, inside q8_1 block (k%8)/2.
+static __device__ __forceinline__ float vec_dot_q2_0_q8_1_mul_mat(
+    const int* __restrict__ x_ql,
+    const half2* __restrict__ x_dm,
+    const int* __restrict__ x_qh,
+    const int* __restrict__ x_sc,
+    const int* __restrict__ y_qs,
+    const half2* __restrict__ y_ds,
+    const int& i,
+    const int& j,
+    const int& k) {
+  (void)x_qh;
+  (void)x_sc;
+#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM || defined USE_MUSA
+  const float* x_dmf = (const float*)x_dm;
+  const int kl = k % 8;
+  const int ybase = j * WARP_SIZE_GGUF + (kl / 4) * 16 + 4 * (kl % 4);
+  const int v = x_ql[i * (WARP_SIZE_GGUF + 1) + k];
+  const int u0 = y_qs[ybase + 0];
+  const int u1 = y_qs[ybase + 1];
+  const int u2 = y_qs[ybase + 2];
+  const int u3 = y_qs[ybase + 3];
+  const int lo01 = __byte_perm(u0, u1, 0x5140);
+  const int lo23 = __byte_perm(u2, u3, 0x5140);
+  const int hi01 = __byte_perm(u0, u1, 0x7362);
+  const int hi23 = __byte_perm(u2, u3, 0x7362);
+  const int t0 = __byte_perm(lo01, lo23, 0x5410);
+  const int t1 = __byte_perm(lo01, lo23, 0x7632);
+  const int t2 = __byte_perm(hi01, hi23, 0x5410);
+  const int t3 = __byte_perm(hi01, hi23, 0x7632);
+  int sumi = 0;
+  sumi = __dp4a((v >> 0) & 0x03030303, t0, sumi);
+  sumi = __dp4a((v >> 2) & 0x03030303, t1, sumi);
+  sumi = __dp4a((v >> 4) & 0x03030303, t2, sumi);
+  sumi = __dp4a((v >> 6) & 0x03030303, t3, sumi);
+  const float d2 = x_dmf[i * (WARP_SIZE_GGUF / QI2_0) + i / QI2_0 + k / QI2_0];
+  const float2 ds8f = __half22float2(y_ds[j * (WARP_SIZE_GGUF / QI8_1) + kl / 2]);
+  // the -1 of every code: this int holds half of its q8_1 block, the other int the other half
+  return d2 * (sumi * ds8f.x - 0.5f * ds8f.y);
+#else
+  return 0.0f;
+#endif
+}
+
 static __device__ __forceinline__ float
 vec_dot_q4_1_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1, const int& iqs) {
   const block_q4_1* bq4_1 = (const block_q4_1*)vbq;
