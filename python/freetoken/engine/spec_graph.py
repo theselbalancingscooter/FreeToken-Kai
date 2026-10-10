@@ -225,7 +225,7 @@ class SpecVerifyGraph:
         def window():
             r = mtp.forward(self.hidden, self.next_ids, batch)
             self.h_in.copy_(r.index_select(0, self.row_idx))
-            self.d_buf.copy_(model.lm_head.logits(mtp.to_head(self.h_in)).argmax(dim=-1))
+            self.d_buf.copy_(eng.draft_logits(mtp.to_head(self.h_in)).argmax(dim=-1))
 
         g_window = torch.cuda.CUDAGraph()
         with ctx.forward_batch(batch):
@@ -268,7 +268,7 @@ class SpecVerifyGraph:
         def chain():
             r = mtp.forward(self.h_in, self.c_ids, mini)
             self.h_in.copy_(r)
-            self.d_buf.copy_(model.lm_head.logits(mtp.to_head(self.h_in)).argmax(dim=-1))
+            self.d_buf.copy_(eng.draft_logits(mtp.to_head(self.h_in)).argmax(dim=-1))
 
         g_chain = torch.cuda.CUDAGraph()
         with ctx.forward_batch(mini):

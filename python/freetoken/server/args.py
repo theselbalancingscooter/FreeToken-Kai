@@ -365,6 +365,19 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--spec-draft-head-quant",
+        type=str,
+        default="none",
+        choices=["none", "q4_0", "q8_0"],
+        help=(
+            "With --spec-mtp: score the drafts through a ggml Q4_0 (or Q8_0) copy of the lm_head "
+            "instead of the model's own. A draft only decides what the target verifies, so a coarser "
+            "head costs at most acceptance, never correctness; 'q4_0' halves the head read per draft "
+            "(a 248k-vocab head: 1.9 -> 1.1 ms on an RTX 3060) for 0.32 GB of VRAM on the head rank."
+        ),
+    )
+
+    parser.add_argument(
         "--pp-layers",
         type=str,
         default=None,

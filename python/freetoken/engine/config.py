@@ -168,6 +168,8 @@ class EngineConfig:
     # single-GPU) as one extra full-attention layer (id = num_layers) with its own KV slab and
     # one extra expert-bank layer. Single request.
     spec_mtp: int = 0
+    # --spec-draft-head-quant: the MTP drafts score through this copy of the lm_head (none/q4_0/q8_0)
+    spec_draft_head_quant: str = "none"
     # --host-embedding: keep the input embedding table in pinned host memory (the GPU gathers
     # rows in place); ~1 GB of VRAM back for KV pages on a 250k-vocabulary model. Applies to
     # the rank that owns the embedding (rank 0 under the pipeline engine).

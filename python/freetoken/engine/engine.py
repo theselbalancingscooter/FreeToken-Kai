@@ -707,6 +707,7 @@ class Engine:
         # --spec-mtp: draft depth; the stacked bf16 MTP experts captured at load, quantized into
         # the offload cache's extra bank layer (see _append_mtp_bank)
         self.spec_k = int(getattr(config, "spec_mtp", 0) or 0)
+        self._draft_head = None  # (packed rows, kind, vocab) under --spec-draft-head-quant
         self._spec_profiler = None
         self._spec_graph = None  # SpecVerifyGraph once captured (end of __init__)
         self._mtp_raw: Dict[str, torch.Tensor] = {}
@@ -953,6 +954,7 @@ class Engine:
                 # back for the capture, then take the remainder again below
                 torch.cuda.synchronize(self.device)
                 torch.cuda.empty_cache()
+            self._build_draft_head(config)
             self._capture_spec_graph()
             self._premap_vram()
         if config.is_pp:
@@ -1116,6 +1118,40 @@ class Engine:
             f"FREETOKEN_PREMAP_VRAM: pre-mapped {mem_GB(size)} into the allocator cache "
             f"({mem_GB(headroom)} of headroom left to the driver)"
         )
+
+    def _build_draft_head(self, config) -> None:
+        """--spec-draft-head-quant: pack a Q4_0 / Q8_0 copy of this rank's lm_head for the drafts."""
+        kind = str(getattr(config, "spec_draft_head_quant", "none") or "none")
+        if kind == "none" or self.spec_k <= 0:
+            return
+        lm = getattr(self.model, "lm_head", None)
+        if lm is None or getattr(lm, "tied_embedding", None) is not None or getattr(lm, "quant_method", None) is None:
+            logger.info("--spec-draft-head-quant: this rank has no untied lm_head; the drafts use the model's head")
+            return
+        from .draft_head import UnsupportedHead, pack_draft_head
+
+        free_before = torch.cuda.mem_get_info(self.device)[0]
+        try:
+            packed = pack_draft_head(lm, kind)
+        except UnsupportedHead as exc:
+            logger.warning(f"--spec-draft-head-quant {kind}: cannot repack {exc}; the drafts use the model's head")
+            return
+        torch.cuda.synchronize(self.device)
+        self._draft_head = (packed, kind, int(lm.out_features))
+        logger.info(
+            f"--spec-draft-head-quant {kind}: the drafts score through a {mem_GB(packed.numel())} copy of the "
+            f"lm_head ({lm.out_features} x {lm.in_features}; free {mem_GB(torch.cuda.mem_get_info(self.device)[0])}, "
+            f"was {mem_GB(free_before)})"
+        )
+
+    def draft_logits(self, h: torch.Tensor) -> torch.Tensor:
+        """The draft-side head: the packed copy when --spec-draft-head-quant built one, else the model's."""
+        if self._draft_head is not None and h.shape[0] <= 8:
+            from .draft_head import draft_logits
+
+            packed, kind, vocab = self._draft_head
+            return draft_logits(packed, kind, h, vocab)
+        return self.model.lm_head.logits(h)
 
     def _capture_spec_graph(self) -> None:
         """Capture the K+1-row verify window as a CUDA graph (see engine/spec_graph), then the
@@ -2058,6 +2094,7 @@ class Engine:
         )
         if self.spec_k > 0:
             # the verify-window graph addressed the old pools / page table: capture it again
+            # (the packed draft head, if any, is kept)
             self._capture_spec_graph()
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
@@ -2459,7 +2496,7 @@ class Engine:
         if not draft:
             return []
         h = h_all[row : row + 1]
-        d = int(self.model.lm_head.logits(mtp.to_head(h)).argmax(dim=-1).item())
+        d = int(self.draft_logits(mtp.to_head(h)).argmax(dim=-1).item())
         drafts = [d]
         if prof is not None:
             prof.mark("mtp_window")
@@ -2471,7 +2508,7 @@ class Engine:
             mini = self._mtp_step_batch(req, p, d, rope_delta=delta)
             with self.ctx.forward_batch(mini):
                 h = mtp.forward(h, mini.input_ids, mini)
-            d = int(self.model.lm_head.logits(mtp.to_head(h)).argmax(dim=-1).item())
+            d = int(self.draft_logits(mtp.to_head(h)).argmax(dim=-1).item())
             drafts.append(d)
         if prof is not None:
             prof.mark("mtp_chain")

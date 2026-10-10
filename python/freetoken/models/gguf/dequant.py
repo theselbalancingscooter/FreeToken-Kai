@@ -111,6 +111,26 @@ def quantize_q8_0(w: torch.Tensor, chunk_rows: int = 8192) -> torch.Tensor:
     return out
 
 
+def quantize_q4_0(w: torch.Tensor) -> torch.Tensor:
+    """bf16/fp32 ``[N, K]`` (``K % 32 == 0``) -> packed Q4_0 rows ``[N, K//32*18]`` (uint8), ggml's
+    reference quantizer: ``d = (the signed value of largest magnitude) / -8``, ``q = clamp(round(w/d)
+    + 8, 0, 15)``; byte j holds element j (low nibble) and j+16 (high). The draft head's copy of
+    the lm_head (engine/draft_head.py)."""
+    assert w.dim() == 2, w.shape
+    N, K = w.shape
+    assert K % 32 == 0, f"Q4_0 needs K % 32 == 0, got {K}"
+    nb = K // 32
+    x = w.to(torch.float32).reshape(N, nb, 32)
+    idx = x.abs().argmax(dim=-1, keepdim=True)
+    mx = x.gather(-1, idx)  # [N,nb,1] signed
+    d = mx / -8.0
+    inv = torch.where(d != 0, 1.0 / d, torch.zeros_like(d))
+    q = (torch.round(x * inv) + 8.0).clamp_(0.0, 15.0).to(torch.uint8)
+    packed = q[..., :16] | (q[..., 16:] << 4)  # [N,nb,16]
+    d16 = d.to(torch.float16).contiguous().view(torch.uint8).reshape(N, nb, 2)
+    return torch.cat([d16, packed], dim=-1).reshape(N, nb * 18)
+
+
 def dequant_q2_0(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
     """Q2_0: per 64-elem block = fp16 scale ``d`` + 16 bytes of 2-bit codes; ``w = d*(q-1)``.
 
@@ -217,6 +237,7 @@ __all__ = [
     "BLOCK_SHAPE",
     "row_bytes",
     "dequant_q4_0",
+    "quantize_q4_0",
     "dequant_q8_0",
     "quantize_q8_0",
     "dequant_q2_0",
