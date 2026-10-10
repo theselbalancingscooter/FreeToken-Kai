@@ -39,6 +39,16 @@ def mmq_min_rows() -> int:
     return int(os.environ.get("FREETOKEN_GGUF_MMQ_MIN_ROWS", "2") or 0)
 
 
+# q2_0's 32-token tile (gguf_kernel.cu pseudo type 1042) for prefill-sized batches: from this
+# many rows the per-expert row count is large enough that the 4-token tile re-reads each expert
+# many times over. 0 keeps the 4-token tile everywhere.
+GGML_Q2_0_WIDE = 1042
+
+
+def mmq_wide_min_rows() -> int:
+    return int(os.environ.get("FREETOKEN_GGUF_MMQ_WIDE_MIN_ROWS", "256") or 0)
+
+
 def _mmq(hidden_states, gate_up_q, down_q, topk_ids, act_fn, qt, num_tokens, top_k, n2, h):
     from freetoken.kernel.gguf import ggml_moe_a8, ggml_moe_get_block_size
     # the Triton aligner, not sgl-kernel's: the expert dimension here is the slot cache (2,857
@@ -49,6 +59,9 @@ def _mmq(hidden_states, gate_up_q, down_q, topk_ids, act_fn, qt, num_tokens, top
     from freetoken.kernel.triton.moe_align import moe_align_block_size
 
     num_slots = int(gate_up_q.shape[0])
+    wide = mmq_wide_min_rows()
+    if qt == GGML_Q2_0 and wide > 0 and num_tokens * top_k >= wide:
+        qt = GGML_Q2_0_WIDE
     block = int(ggml_moe_get_block_size(qt))
     sorted_ids, expert_ids, ntpp = moe_align_block_size(topk_ids, block, num_slots)
     # the aligner labels its all-padding blocks with the sentinel expert ``num_slots``; the
@@ -126,6 +139,7 @@ __all__ = [
     "GGUF_FORMAT_TYPES",
     "GGUF_EXPERT_FORMATS",
     "mmq_min_rows",
+    "mmq_wide_min_rows",
     "fused_experts_gguf",
     "fused_experts_gguf_format",
 ]

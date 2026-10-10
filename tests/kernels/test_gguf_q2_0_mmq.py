@@ -66,6 +66,67 @@ def test_moe_mmq_q2_0_matches_reference(K, N, S, T, top_k):
     assert rel < 2e-2, f"q2_0 mmq K={K} N={N} S={S} rel err {rel.item()}"
 
 
+def _mmq_type(x, packed, ids, top_k, N, qtype):
+    from freetoken.kernel.gguf import ggml_moe_a8, ggml_moe_get_block_size
+    from freetoken.kernel.triton.moe_align import moe_align_block_size
+
+    S = packed.shape[0]
+    block = ggml_moe_get_block_size(qtype)
+    assert block > 0
+    sorted_ids, expert_ids, ntpp = moe_align_block_size(ids, block, S)
+    expert_ids = torch.where(expert_ids >= S, expert_ids.new_full((), -1), expert_ids)
+    return ggml_moe_a8(x, packed, sorted_ids, expert_ids, ntpp, qtype, N, top_k, x.shape[0])
+
+
+@pytest.mark.parametrize("K,N,S,T,top_k", [
+    (2560, 1280, 64, 512, 10),   # a prefill chunk's gate_up (5,120 rows, ~80 per expert)
+    (640, 2560, 64, 2048, 1),    # its down GEMM
+    (2560, 1312, 16, 300, 4),    # N not a multiple of the 64-row tile (need_check)
+])
+def test_moe_mmq_q2_0_wide_tile_matches_the_narrow_one(K, N, S, T, top_k):
+    """The 32-token tile (type 1042) is the same math as the 4-token tile: equal up to bf16
+    rounding of the output (fp32 accumulation order differs)."""
+    from freetoken.models.gguf.dequant import GGML_Q2_0, quantize_q2_0
+
+    torch.manual_seed(K + N + T)
+    dev = torch.device("cuda")
+    packed = quantize_q2_0(torch.randn(S, N, K, dtype=torch.bfloat16) * 0.05).to(dev)
+    x = torch.randn(T, K, device=dev, dtype=torch.bfloat16) * 0.5
+    ids = torch.stack([torch.randperm(S, device=dev)[:top_k] for _ in range(T)]).to(torch.int32)
+    narrow = _mmq_type(x, packed, ids, top_k, N, int(GGML_Q2_0)).float()
+    wide = _mmq_type(x, packed, ids, top_k, N, 1042).float()
+    rel = (wide - narrow).abs().max() / (narrow.abs().max() + 1e-6)
+    assert rel < 2e-3, f"wide vs narrow rel err {rel.item()}"
+    ref = _reference(x[:8], packed, ids[:8], K)
+    rel_ref = (wide[: 8 * top_k] - ref).abs().max() / (ref.abs().max() + 1e-6)
+    assert rel_ref < 2e-2, f"wide vs reference rel err {rel_ref.item()}"
+
+
+def test_moe_mmq_q2_0_wide_tile_timing():
+    """Not an assertion: prints the time of both tiles on a prefill-sized gate_up GEMM."""
+    import time
+
+    from freetoken.models.gguf.dequant import GGML_Q2_0, quantize_q2_0
+
+    torch.manual_seed(1)
+    dev = torch.device("cuda")
+    K, N, S, T, top_k = 2560, 1280, 128, 1024, 10
+    packed = quantize_q2_0(torch.randn(S, N, K, dtype=torch.bfloat16) * 0.05).to(dev)
+    x = torch.randn(T, K, device=dev, dtype=torch.bfloat16) * 0.5
+    ids = torch.stack([torch.randperm(S, device=dev)[:top_k] for _ in range(T)]).to(torch.int32)
+    for name, qtype in (("narrow(4)", int(GGML_Q2_0)), ("wide(32)", 1042)):
+        for _ in range(2):
+            _mmq_type(x, packed, ids, top_k, N, qtype)
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        for _ in range(5):
+            _mmq_type(x, packed, ids, top_k, N, qtype)
+        torch.cuda.synchronize()
+        ms = (time.perf_counter() - t0) / 5 * 1e3
+        tops = T * top_k * N * K * 2 / (ms * 1e-3) / 1e12
+        print(f"{name}: {ms:.1f} ms for {T}x{top_k} rows ({tops:.1f} TOPS)")
+
+
 def test_moe_mmq_q2_0_matches_mmvq_bitwise_close():
     """Both kernels quantize the activations the same way (q8_1), so they agree far more
     tightly than either does with the fp32 reference."""

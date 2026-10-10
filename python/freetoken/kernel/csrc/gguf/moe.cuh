@@ -383,18 +383,22 @@ static __device__ __forceinline__ void moe_q_bounded(
 
       if (threadIdx.x < n_per_r / QK8_1) {
         const auto kby = threadIdx.x % (WARP_SIZE_GGUF / QI8_1);
-        const int col_y_eff = token_offs[threadIdx.y] / top_k;
         const int block_x = ib0 * (qk / QK8_1) + ir * (WARP_SIZE_GGUF / QI8_1) + kby;
+        // every token of the tile, not only the warp's first (the vendored kernel has
+        // mmq_x == nwarps and loaded token_offs[threadIdx.y] alone; the wide tile has 4 per warp)
+#pragma unroll
+        for (int i = 0; i < mmq_x; i += nwarps) {
+          const int col_y_eff = token_offs[i / nwarps] / top_k;
+          if (col_y_eff < ncols_y && block_x < blocks_per_col_y) {
+            const half2* dsi_src = &y[col_y_eff * blocks_per_col_y + block_x].ds;
+            half2* dsi_dst = &tile_y_ds[(threadIdx.y + i) * (WARP_SIZE_GGUF / QI8_1) + kby];
 
-        if (col_y_eff < ncols_y && block_x < blocks_per_col_y) {
-          const half2* dsi_src = &y[col_y_eff * blocks_per_col_y + block_x].ds;
-          half2* dsi_dst = &tile_y_ds[threadIdx.y * (WARP_SIZE_GGUF / QI8_1) + kby];
-
-          if (need_sum) {
-            *dsi_dst = *dsi_src;
-          } else {
-            float* dfi_dst = (float*)dsi_dst;
-            *dfi_dst = __low2float(*dsi_src);
+            if (need_sum) {
+              *dsi_dst = *dsi_src;
+            } else {
+              float* dfi_dst = (float*)dsi_dst;
+              *dfi_dst = __low2float(*dsi_src);
+            }
           }
         }
       }
@@ -528,6 +532,82 @@ static void ggml_moe_q2_0_q8_1_cuda(
   } else {
     constexpr bool need_check = true;
     moe_q2_0<scalar_t, need_check><<<block_nums, block_dims, 0, stream>>>(
+        w, inp, dst, sorted_token_ids, expert_ids, num_tokens_post_padded, exp_stride, ncols_x, nrows_x,
+        ncols_y, nrows_y, nrows_dst, top_k);
+  }
+}
+
+// The wide Q2_0 tile (FreeToken addition, pseudo type 1042): 32 tokens x 64 rows per block, 8
+// warps. A prefill chunk routes ~100 tokens to each expert; the 4-token tile above reads every
+// expert's rows 25 times for it, this one 4 times. Same math, same loader, bigger shared tiles
+// (y: 32 x 32 ints, x: 64 x 33 ints) -- about 15 KB, well inside any sm. Not for the decode
+// windows (a handful of rows pad to 32 per expert).
+#define MOE_X_Q2_0W 32
+#define MOE_Y_Q2_0W 64
+#define NWARPS_Q2_0W 8
+
+template <typename scalar_t, bool need_check>
+static __global__ void __launch_bounds__(WARP_SIZE_GGUF* NWARPS_Q2_0W)
+    moe_q2_0_wide(
+        const void* __restrict__ vx,
+        const void* __restrict__ vy,
+        scalar_t* __restrict__ dst,
+        const int* sorted_token_ids,
+        const int* expert_ids,
+        const int* num_tokens_post_padded,
+        const int exp_stride,
+        const int ncols_x,
+        const int nrows_x,
+        const int ncols_y,
+        const int nrows_y,
+        const int nrows_dst,
+        const int top_k) {
+  moe_q_bounded<
+      scalar_t,
+      QK2_0,
+      QR2_0,
+      QI2_0,
+      true,
+      block_q2_0,
+      MOE_X_Q2_0W,
+      MOE_Y_Q2_0W,
+      NWARPS_Q2_0W,
+      allocate_tiles_q2_0<MOE_Y_Q2_0W>,
+      load_tiles_q2_0<MOE_Y_Q2_0W, NWARPS_Q2_0W, need_check>,
+      VDR_Q2_0_Q8_1_MMQ,
+      vec_dot_q2_0_q8_1_mul_mat>(
+      vx, vy, dst, sorted_token_ids, expert_ids, num_tokens_post_padded, exp_stride, ncols_x, nrows_x, ncols_y,
+      nrows_y, nrows_dst, top_k);
+}
+
+template <typename scalar_t>
+static void ggml_moe_q2_0_q8_1_wide_cuda(
+    const void* inp,
+    const void* w,
+    scalar_t* dst,
+    const int* sorted_token_ids,
+    const int* expert_ids,
+    const int* num_tokens_post_padded,
+    const int exp_stride,
+    const int ncols_x,
+    const int nrows_x,
+    const int ncols_y,
+    const int nrows_y,
+    const int nrows_dst,
+    const int top_k,
+    const int tokens_post_padded,
+    cudaStream_t stream) {
+  const int block_num_x = (nrows_x + MOE_Y_Q2_0W - 1) / MOE_Y_Q2_0W;
+  const int block_num_y = (tokens_post_padded) / MOE_X_Q2_0W;
+  const dim3 block_nums(block_num_x, block_num_y, 1);
+  const dim3 block_dims(WARP_SIZE_GGUF, NWARPS_Q2_0W, 1);
+
+  if (nrows_x % MOE_Y_Q2_0W == 0) {
+    moe_q2_0_wide<scalar_t, false><<<block_nums, block_dims, 0, stream>>>(
+        w, inp, dst, sorted_token_ids, expert_ids, num_tokens_post_padded, exp_stride, ncols_x, nrows_x,
+        ncols_y, nrows_y, nrows_dst, top_k);
+  } else {
+    moe_q2_0_wide<scalar_t, true><<<block_nums, block_dims, 0, stream>>>(
         w, inp, dst, sorted_token_ids, expert_ids, num_tokens_post_padded, exp_stride, ncols_x, nrows_x,
         ncols_y, nrows_y, nrows_dst, top_k);
   }
