@@ -594,12 +594,17 @@ class Scheduler(SchedulerIOMixin):
     def _reasoning_force(self, batch: Batch) -> None:
         """Before a forward: which rows must sample </think> this step."""
         for req in batch.reqs:
-            req.force_token = -1
+            prev, req.force_token = req.force_token, -1
             if isinstance(req, ChunkedReq):
                 continue  # never sampled
             budget = self._reasoning_budget(req)
             if budget and self._reasoning_init(req) and req.reasoning_open and req.reasoning_tokens >= budget:
                 req.force_token = self.think_end_id
+                if prev < 0:  # once per span (overlap prepares the next step before this one drains)
+                    logger.info_rank0(
+                        f"reasoning budget: forcing </think> for request {req.uid} after "
+                        f"{req.reasoning_tokens} reasoning tokens (budget {budget})"
+                    )
 
     def _match_stop_str(self, req: Req) -> str | None:
         """First stop string present in this request's generated tail, else None. Decodes
