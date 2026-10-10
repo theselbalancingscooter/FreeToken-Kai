@@ -45,8 +45,11 @@ greedy for the same reason.
 
 Speed on two RTX 3060s (`--pp-size 2`, hybrid, `--spec-mtp 5`): decode 28 tok/s (NVFP4: 19-20), the
 verify window 108 ms of which the experts are 11 ms and the dense fixed cost 22; prefill of a
-25k-token prompt 829 tok/s with the 4-token tile (NVFP4: 575-700; MMVQ alone: 264), compute-bound
-with the x4 transfer of 16.5 GiB per chunk hidden behind it.
+25k-token prompt 1,010 tok/s (NVFP4: 575-700; the 4-token tile: 829; MMVQ alone: 264). A 3,840-token
+chunk now spends 2.6-3.1 s on the GPU against 2.8 s moving 16.5 GiB of experts over the second
+card's x4 link, so the transfer is the next wall, not the kernel. On the same ten prompts with
+`--reasoning-budget 6000` the Q2_0 tier answered 10 of 10; the budget fired once (a translation
+that had thought for 6,000 tokens answered correctly from there).
 
 Refused: experts whose ggml type varies by layer (every "UD" community build), IQ types (codebooks),
 and anything that is not Q2_0 or Q4_0.
