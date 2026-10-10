@@ -76,10 +76,18 @@ The fork adds nine things upstream does not have:
    routed experts read from ISTA-DASLab's calibrated Q2_0 build while the dense weights, the
    PLE table and the vision tower stay with the safetensors checkpoint. The banks go from
    63.5 GiB to 34 GB, a decode step reads 0.66 GB of experts per token instead of 1.18, and the
-   same GPU cache holds twice the experts; the ggml MMVQ kernel and the CPU executor dequantise
-   the blocks in place (W2A8). It is the fast tier, not the accurate one: on ten prompts the
-   Q2_0 build matched NVFP4 on 9 (all code tasks included) and thought 35% longer. See
-   [gguf.md](gguf.md).
+   same GPU cache holds twice the experts; the ggml MMVQ and MMQ kernels and the CPU executor
+   dequantise the blocks in place (W2A8). On two RTX 3060s with `--spec-mtp 5` it decodes at
+   28 tok/s against NVFP4's 19-20 and prefills a 25k-token prompt at 829 tok/s against 575-700.
+   It is the fast tier, not the accurate one: on ten prompts the Q2_0 build matched NVFP4 on 9
+   (all code tasks included) and thought 35% longer. See [gguf.md](gguf.md).
+
+11. **A reasoning budget** (`--reasoning-budget N`, or `reasoning_budget` in a chat / completion
+   request): the tokens a request may spend between `<think>` and `</think>`. At the cap the
+   sampler returns `</think>` and the model answers from what it has. For the 2-bit tier above,
+   where a greedy request can think in circles until `max_tokens`; works with the MTP verify
+   windows and under `--pp-size`. 0 (the default) leaves reasoning unlimited; it needs
+   single-token `<think>` / `</think>` markers (the Qwen3 family) and is ignored otherwise.
 
 Experimental: `--prefix-disk-cache DIR` keeps the prefix cache of a hybrid GDN model on disk,
 so a long prompt the in-memory cache has let go of -- or one sent before a restart -- is read back
@@ -442,6 +450,7 @@ model that does). Not yet measured on a card.
 | `FREETOKEN_PREFILL_SPLIT` / `FREETOKEN_PREFILL_SPLIT_MAX_TOKENS` / `FREETOKEN_PREFILL_SPLIT_RATIO` | on / `1024` / `4` | Split prefill (offload/hybrid, layers whose banks are pinned, 64 rows and up): the experts a forward routes to least are computed by the CPU executor while only the rest are moved to the GPU, at the same time. The ratio is what moving one expert costs in CPU routes; the cut is where both sides finish together. On two RTX 3060s (Flash-Next) the first token of a fresh 270-token prompt came after 3.0 s instead of 8.4 s (64 tokens: 2.1 s instead of 5.6; 1024: 6.8 instead of 8.0). `0` turns it off |
 | `FREETOKEN_STAGED_COPY` / `FREETOKEN_STAGED_COPY_MB` | on / `32` | Whole-layer prefill copies of non-pinned bank layers go through two pinned staging buffers of this size |
 | `FREETOKEN_GGUF_MMQ_MIN_ROWS` | `2` | GGUF expert banks (`--moe-expert-gguf`, gemma4 GGUF): from this many rows (tokens x top_k) the tiled MMQ kernel serves the experts, reading each expert once per tile of 4 tokens instead of once per row as the MMVQ GEMV does -- the prefill chunks and the `--spec-mtp` verify windows. `0` keeps MMVQ everywhere (a decoded single token always uses it) |
+| `FREETOKEN_GGUF_MMQ_WIDE_MIN_ROWS` | `256` | Q2_0 banks: from this many rows the MMQ tile is 32 tokens x 64 rows (8 warps) instead of 4 x 32 -- a prefill chunk routes about 100 tokens to each expert, which the 4-token tile reads 25 times over. On an RTX 2060, 10,240 rows over 128 experts: 26.6 -> 11.4 ms. `0` keeps the 4-token tile everywhere |
 | `FREETOKEN_CPU_MOE_SPIN` | auto (off under `--pp-size`) | Upstream's CPU MoE pool spin-wait (#619: the workers and the pinned coordinator spin up to 50 ms between layers instead of parking). Upstream turns it on whenever every pool thread owns a CPU and two stay spare; Kai keeps that for one rank and turns it off under `--pp-size`, where every rank pins a pool to the same cores and the spinners starve the other rank's workers and the host-side launches. Measured with Flash-Next on two RTX 3060s (hybrid, 7 threads per rank, `--spec-mtp 5`): a verify window took 224 ms spinning against 158 ms parked (-30% of the tokens); on one RTX 2060 (Ornith, 11 threads, one rank) spinning gained 3-6%. `0` turns it off everywhere, `1` forces it on under `--pp-size` too |
 | `FREETOKEN_BANK_PREAD` | `buffered` | With `--moe-bank-ram`: how a prefill chunk reads the non-resident rows. `buffered` reads them from the file on several threads through the page cache; `direct` with `O_DIRECT` (about 5% more prefill where the page cache is far short of the rows; where it nearly holds them, decode loses the rows a prefill would have cached, -15% measured); `0` faults them in through the mapping as before |
 | `FREETOKEN_BANK_READ_THREADS` / `FREETOKEN_BANK_READ_PIECE_MB` | `8` / `16` | Threads and piece size of those reads (two sets of pinned buffers of this many pieces) |

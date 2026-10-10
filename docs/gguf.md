@@ -21,9 +21,11 @@ the condition the section below explains. Only shard 1 is read (shard 2 holds th
 the fork takes from the safetensors checkpoint in FP8 instead).
 
 How it works: the GGUF's block bytes **are** the banks -- nothing is repacked -- and the kernels
-dequantise inside the K-loop: the borrowed ggml MMVQ kernel on the GPU
-(`vec_dot_q2_0_q8_1`, W2A8) and the CPU executor's `q2_0_dot_i8_*` (AVX-VNNI / AVX2 / scalar,
-W2A8 against Q8_0 activations). The checkpoint's own expert scheme steps aside for these layers;
+dequantise inside the K-loop: on the GPU the borrowed ggml MMVQ kernel for a single decoded token
+(`vec_dot_q2_0_q8_1`, W2A8) and a tiled MMQ kernel for everything wider (the `--spec-mtp` verify
+windows and the prefill chunks: the tokens are sorted by expert and each expert's rows are read
+once per tile of 4 tokens, or of 32 from 256 rows up), and the CPU executor's `q2_0_dot_i8_*`
+(AVX-VNNI / AVX2 / scalar, W2A8 against Q8_0 activations). The checkpoint's own expert scheme steps aside for these layers;
 `--dense-quant fp8` and the MTP draft head still work, the head's bf16 experts being rounded to
 Q2_0 with ggml's reference quantizer (amax delta) at load. The GGUF is parsed by a small reader of
 the fork's own (`models/gguf/rawreader.py`): gguf-py 0.19.0 predates Q2_0 and refuses the file.
@@ -33,8 +35,18 @@ What it costs: quality. Measured on two RTX 3060s against the NVFP4 build on the
 prompts, the Q2_0 build answered 9 of 10 (the miss: a translation that kept English terms),
 every code task included, but thought 35% longer in total; ISTA-DASLab reports LiveCodeBench
 81.1 against 87.4 for bf16, AIME and GPQA unchanged. Treat it as the fast tier and NVFP4 as the
-accurate one. Prefill goes through the MMVQ kernel for now (one GEMV per token and expert), so it
-is slower than the NVFP4 grouped GEMM; a tiled MMQ path is the next step if that matters.
+accurate one. Two things follow from the 2-bit rounding. A greedy (temperature 0) request can
+think in circles until `max_tokens` -- one of the ten prompts did so on one kernel path and not
+the other, the two differing by one bf16 ulp. `--reasoning-budget N` (or a request's
+`reasoning_budget`) caps the tokens between `<think>` and `</think>`: at the cap the sampler
+returns `</think>` and the model answers from what it has; 0 (the default) leaves it unlimited.
+And prefer the checkpoint's recommended sampling (`--sampling-defaults model`, the default) to
+greedy for the same reason.
+
+Speed on two RTX 3060s (`--pp-size 2`, hybrid, `--spec-mtp 5`): decode 28 tok/s (NVFP4: 19-20), the
+verify window 108 ms of which the experts are 11 ms and the dense fixed cost 22; prefill of a
+25k-token prompt 829 tok/s with the 4-token tile (NVFP4: 575-700; MMVQ alone: 264), compute-bound
+with the x4 transfer of 16.5 GiB per chunk hidden behind it.
 
 Refused: experts whose ggml type varies by layer (every "UD" community build), IQ types (codebooks),
 and anything that is not Q2_0 or Q4_0.
