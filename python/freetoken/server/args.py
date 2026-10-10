@@ -66,6 +66,9 @@ class ServerArgs(SchedulerConfig):
     # "model": fill unspecified request sampling params from generation_config.json
     # (temperature/top_k/top_p), like sglang. "none": use framework defaults only.
     sampling_defaults: str = "model"
+    # Reasoning budget (Kai): tokens a request may spend between <think> and </think> before
+    # </think> is forced; 0 = unlimited. A request's reasoning_budget overrides it.
+    reasoning_budget: int = 0
     # Default max output (decode) tokens for a request that omits one. None falls back to the
     # adapter's built-in default (32k).
     max_output_tokens: int | None = None
@@ -642,6 +645,18 @@ def parse_args(
             "temperature/top_k/top_p from the checkpoint's generation_config.json "
             "(recommended for reasoning models to avoid greedy repetition loops); "
             "'none' uses framework defaults only."
+        ),
+    )
+
+    parser.add_argument(
+        "--reasoning-budget",
+        type=int,
+        default=ServerArgs.reasoning_budget,
+        help=(
+            "Tokens a request may spend inside <think> ... </think> before </think> is forced "
+            "and the model answers from what it has (0 = unlimited). A request's own "
+            "reasoning_budget field overrides this. Only for tokenizers with single-token "
+            "<think> / </think> markers (Qwen3 family); ignored otherwise."
         ),
     )
 

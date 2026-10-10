@@ -645,13 +645,19 @@ def _traceback_tail(exc: BaseException, lines: int = 14) -> str:
 
 def _expand_sampling_args(args: BatchSamplingArgs, rows: int) -> BatchSamplingArgs:
     """Per-row sampling params for a verify window (one request, ``rows`` logits rows)."""
-    if args.temperatures is None or args.temperatures.numel() == rows:
+    if args.temperatures is None and args.force_token is None:
+        return args
+    if (args.temperatures is None or args.temperatures.numel() == rows) and (
+        args.force_token is None or args.force_token.numel() == rows
+    ):
         return args
 
     def ex(t):
         return None if t is None else t.expand(rows).contiguous()
 
-    return BatchSamplingArgs(ex(args.temperatures), top_k=ex(args.top_k), top_p=ex(args.top_p))
+    return BatchSamplingArgs(
+        ex(args.temperatures), top_k=ex(args.top_k), top_p=ex(args.top_p), force_token=ex(args.force_token)
+    )
 
 
 def _pinned_empty(shape, dtype: torch.dtype) -> torch.Tensor:

@@ -95,6 +95,23 @@ def load_toolcall_anchor_id(
     return int(ids[0]) if len(ids) == 1 else None
 
 
+def load_think_token_ids(
+    tokenizer: PreTrainedTokenizerBase, start: str = "<think>", end: str = "</think>"
+) -> tuple[int | None, int | None]:
+    """The single token ids of the reasoning markers (None where the tokenizer spells one
+    with more than one token, or not at all): what the scheduler's reasoning budget watches
+    and forces."""
+
+    def one(s: str) -> int | None:
+        try:
+            ids = tokenizer.encode(s, add_special_tokens=False)
+        except Exception:
+            return None
+        return int(ids[0]) if len(ids) == 1 else None
+
+    return one(start), one(end)
+
+
 def load_generation_sampling(model_path: str) -> dict[str, Any]:
     """Recommended sampling defaults from ``generation_config.json`` (sglang's
     ``sampling_defaults='model'``). Returns ``{temperature, top_k, top_p}`` for the keys

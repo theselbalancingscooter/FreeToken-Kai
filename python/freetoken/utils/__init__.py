@@ -13,6 +13,7 @@ from .hf import (
     download_hf_weight,
     load_eos_token_ids,
     load_generation_sampling,
+    load_think_token_ids,
     load_tokenizer,
     load_toolcall_anchor_id,
 )
@@ -34,6 +35,7 @@ __all__ = [
     "download_hf_weight",
     "load_eos_token_ids",
     "load_generation_sampling",
+    "load_think_token_ids",
     "load_tokenizer",
     "load_toolcall_anchor_id",
     "init_logger",

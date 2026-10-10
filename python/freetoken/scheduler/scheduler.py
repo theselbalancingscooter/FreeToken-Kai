@@ -26,6 +26,7 @@ from freetoken.message import (
 from freetoken.utils import (
     init_logger,
     load_eos_token_ids,
+    load_think_token_ids,
     load_tokenizer,
     load_toolcall_anchor_id,
 )
@@ -140,6 +141,14 @@ class Scheduler(SchedulerIOMixin):
             self.toolcall_anchor_id = load_toolcall_anchor_id(
                 self.tokenizer,
                 toolcall_opener_for(getattr(config, "tool_call_parser", "")),
+            )
+        # Reasoning budget (Kai): the <think> / </think> ids the budget watches and forces. The
+        # default comes from --reasoning-budget; a request's sampling_params may override it.
+        self.think_start_id, self.think_end_id = load_think_token_ids(self.tokenizer)
+        self._reasoning_budget_default = int(getattr(config, "reasoning_budget", 0) or 0)
+        if self._reasoning_budget_default > 0 and self.think_end_id is None:
+            logger.warning_rank0(
+                "--reasoning-budget is set but this tokenizer has no single </think> token: ignored"
             )
         self.token_pool = self.table_manager.token_pool
         # Floor the prefill chunk by the cache manager's cap (DSV4: ~half the window pool) so a
@@ -450,6 +459,7 @@ class Scheduler(SchedulerIOMixin):
                 next_token = next_tokens_cpu[i]
                 req.append_host(next_token.unsqueeze(0))
                 next_token = int(next_token.item())
+                _reasoning_track(self, req, (next_token,))
                 # EOS / stop-string -> "stop", output budget exhausted -> "length";
                 # EOS and stop strings win over length.
                 # Overlap can advance device_len one token ahead of this host reply.
@@ -533,6 +543,63 @@ class Scheduler(SchedulerIOMixin):
             spec_accepted=spec_accepted,
         )
         self.send_result(reply)
+
+    # ---- reasoning budget (Kai) -------------------------------------------------------------
+    # A 2-bit model at temperature 0 can think in circles until max_tokens. The budget counts
+    # the tokens generated inside a <think> span; once it is spent the sampler is told to
+    # return </think> (the model then answers from what it has). Host-side bookkeeping only:
+    # the ids are watched here as they are appended, and the forced id rides on req.force_token
+    # into Sampler.prepare. No effect while the budget is 0 or the tokenizer lacks the ids.
+
+    def _reasoning_budget(self, req: Req) -> int:
+        budget = req.sampling_params.reasoning_budget
+        if budget is None:
+            budget = self._reasoning_budget_default
+        return budget if (budget > 0 and self.think_end_id is not None) else 0
+
+    def _reasoning_init(self, req: Req) -> bool:
+        """Derive the open/closed state from the prompt once it is wholly in input_ids: open
+        when its last <think> comes after its last </think> (the chat template's thinking
+        opener), closed otherwise (thinking disabled, or a model that opens <think> itself --
+        that opener is then seen as it is generated)."""
+        if req.reasoning_open is not None:
+            return True
+        prompt_len = req.max_device_len - req.output_len
+        if req.input_ids.numel() < prompt_len:
+            return False
+        prompt = req.input_ids[:prompt_len]
+
+        def last(tok):
+            if tok is None:
+                return -1
+            hits = (prompt == tok).nonzero()
+            return int(hits[-1]) if hits.numel() else -1
+
+        req.reasoning_open = last(self.think_start_id) > last(self.think_end_id)
+        req.reasoning_tokens = 0
+        return True
+
+    def _track_reasoning(self, req: Req, tokens) -> None:
+        """Account the tokens just appended to ``req`` (a decode step's one, a verify window's few)."""
+        if not self._reasoning_budget(req) or not self._reasoning_init(req):
+            return
+        for tok in tokens:
+            if tok == self.think_start_id:
+                req.reasoning_open, req.reasoning_tokens = True, 0
+            elif tok == self.think_end_id:
+                req.reasoning_open = False
+            elif req.reasoning_open:
+                req.reasoning_tokens += 1
+
+    def _reasoning_force(self, batch: Batch) -> None:
+        """Before a forward: which rows must sample </think> this step."""
+        for req in batch.reqs:
+            req.force_token = -1
+            if isinstance(req, ChunkedReq):
+                continue  # never sampled
+            budget = self._reasoning_budget(req)
+            if budget and self._reasoning_init(req) and req.reasoning_open and req.reasoning_tokens >= budget:
+                req.force_token = self.think_end_id
 
     def _match_stop_str(self, req: Req) -> str | None:
         """First stop string present in this request's generated tail, else None. Decodes
@@ -974,6 +1041,7 @@ class Scheduler(SchedulerIOMixin):
             # a captured replay (DSV4) read them in prepare_metadata / prepare_for_replay.
             batch.active_table_idx = input_mapping[0].view(-1)
         self.engine.attn_backend.prepare_metadata(batch)
+        self._reasoning_force(batch)
         return ForwardInput(
             batch=batch,
             sample_args=self.engine.sampler.prepare(batch),
@@ -1076,6 +1144,7 @@ class Scheduler(SchedulerIOMixin):
         next drafts. Returns whether the request finished."""
         tokens = list(spec_res.accepted)
         req.spec_commit(tokens)
+        _reasoning_track(self, req, tokens)
         if req.spec_alloc_len is not None:
             self.cache_manager.truncate_pages(req, req.cached_len, req.spec_alloc_len)
             req.spec_alloc_len = None
@@ -1193,6 +1262,12 @@ _SPEC_MAX_DRAFTS = (
 def _spec_k(scheduler) -> int:
     """--spec-mtp depth of a scheduler (0 when off; unit-test stubs may lack the attribute)."""
     return int(getattr(scheduler, "spec_k", 0) or 0)
+
+
+def _reasoning_track(scheduler, req: Req, tokens) -> None:
+    """Scheduler._track_reasoning, skipped on the unit-test stubs that drain a step without one."""
+    if getattr(scheduler, "think_end_id", None) is not None:
+        scheduler._track_reasoning(req, tokens)
 
 
 def _make_mrope_positions(batch: Batch, device: torch.device) -> torch.Tensor:

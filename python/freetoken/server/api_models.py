@@ -83,6 +83,9 @@ class ChatCompletionRequest(BaseModel):
     # existed) instead of becoming a bare 422 at the route boundary; the handler
     # reads the dict form and 400s only on an unknown "type" value.
     thinking: Any | None = None
+    # Kai: tokens allowed inside <think> ... </think> before </think> is forced
+    # (None = the server's --reasoning-budget, 0 = unlimited).
+    reasoning_budget: int | None = None
     ignore_eos: bool = False
     tools: list[Tool] | None = None
     tool_choice: Literal["none", "auto", "required"] | ToolChoiceObject | None = None
@@ -118,6 +121,7 @@ class CompletionRequest(BaseModel):
     stop: str | list[str] | None = None
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
+    reasoning_budget: int | None = None  # Kai, as in ChatCompletionRequest
     ignore_eos: bool = False
     logprobs: int | None = None
     echo: bool = False

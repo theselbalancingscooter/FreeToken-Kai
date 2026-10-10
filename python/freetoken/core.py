@@ -24,6 +24,9 @@ class SamplingParams:
     # Stop strings (OpenAI `stop` / Anthropic `stop_sequences`). Generation finishes when one
     # appears in the decoded output; the matched substring (and anything after) is trimmed.
     stop_strs: list[str] = field(default_factory=list)
+    # Reasoning budget (Kai): tokens the model may spend between <think> and </think> before
+    # </think> is forced. None = the server's --reasoning-budget, 0 = unlimited.
+    reasoning_budget: int | None = None
 
     @property
     def is_greedy(self) -> bool:
@@ -77,6 +80,12 @@ class Req:
     # handler must not free resources under an in-flight forward; it sets this flag and
     # _process_last_data frees the request when the batch drains (after copy_done.synchronize).
     aborted: bool = False
+    # --- reasoning budget (scheduler-owned): inside a <think> span?, tokens spent in it, and
+    # the token id the next sample must return (-1 = sample freely). None = not derived yet.
+    reasoning_open: bool | None = None
+    reasoning_tokens: int = 0
+    force_token: int = -1
+
     # --- MTP speculative decoding: the draft window under verification ---
     spec_base_len: int | None = None       # device_len before the drafts were appended
     spec_drafts: List[int] = field(default_factory=list)  # drafts awaiting verification

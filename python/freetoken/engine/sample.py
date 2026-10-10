@@ -16,6 +16,9 @@ class BatchSamplingArgs:
     top_k: torch.Tensor | None = None
     top_p: torch.Tensor | None = None
     greedy_mask: torch.Tensor | None = None
+    # per row: the token the sample must return (the scheduler's reasoning budget forcing
+    # </think>), -1 where the row samples freely; None when no row is forced
+    force_token: torch.Tensor | None = None
 
 
 def make_device_tensor(data: List, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
@@ -59,8 +62,12 @@ class Sampler:
     def prepare(self, batch: Batch) -> BatchSamplingArgs:
         params = [r.sampling_params for r in batch.reqs]
         is_greedy = [p.is_greedy for p in params]
+        forces = [int(getattr(r, "force_token", -1)) for r in batch.reqs]
+        force = (
+            make_device_tensor(forces, torch.int32, self.device) if any(f >= 0 for f in forces) else None
+        )
         if all(is_greedy):
-            return BatchSamplingArgs(temperatures=None)
+            return BatchSamplingArgs(temperatures=None, force_token=force)
 
         MIN_P = MIN_T = 1e-6
         # Greedy outputs are selected explicitly in sample(); use neutral sampling
@@ -83,17 +90,25 @@ class Sampler:
         greedy_mask = (
             make_device_tensor(is_greedy, torch.bool, self.device) if any(is_greedy) else None
         )
-        return BatchSamplingArgs(temperatures, top_k=top_k, top_p=top_p, greedy_mask=greedy_mask)
+        return BatchSamplingArgs(
+            temperatures, top_k=top_k, top_p=top_p, greedy_mask=greedy_mask, force_token=force
+        )
 
     @nvtx_annotate("Sampler")
     def sample(self, logits: torch.Tensor, args: BatchSamplingArgs) -> torch.Tensor:
         with torch.cuda.nvtx.range("Sampler"):
             if args.temperatures is None:  # greedy sampling
-                return torch.argmax(logits, dim=-1)
-            tokens = sample_impl(logits.float(), args.temperatures, args.top_k, args.top_p)
-            if args.greedy_mask is not None:
-                # Mixed batches still run probability sampling for all rows, but
-                # greedy rows must follow argmax's deterministic tie-breaking.
-                greedy_tokens = torch.argmax(logits, dim=-1).to(tokens.dtype)
-                tokens = torch.where(args.greedy_mask, greedy_tokens, tokens)
+                tokens = torch.argmax(logits, dim=-1)
+            else:
+                tokens = sample_impl(logits.float(), args.temperatures, args.top_k, args.top_p)
+                if args.greedy_mask is not None:
+                    # Mixed batches still run probability sampling for all rows, but
+                    # greedy rows must follow argmax's deterministic tie-breaking.
+                    greedy_tokens = torch.argmax(logits, dim=-1).to(tokens.dtype)
+                    tokens = torch.where(args.greedy_mask, greedy_tokens, tokens)
+            if args.force_token is not None:
+                # a forced row returns its token whatever the logits say (a verify window's
+                # drafts then survive only where they drafted that very token)
+                force = args.force_token
+                tokens = torch.where(force >= 0, force.to(tokens.dtype), tokens)
             return tokens
