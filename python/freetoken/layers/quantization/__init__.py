@@ -9,6 +9,7 @@ from .linear import (
     LinearMethod,
     Mxfp8LinearMethod,
     Nvfp4LinearMethod,
+    Q8_0LinearMethod,
     UnquantizedLinearMethod,
 )
 from .moe import (
@@ -23,7 +24,7 @@ from .moe import (
     Nvfp4MoEMethod,
     UnquantizedMoEMethod,
 )
-from .at_load import AT_LOAD_FP8, LoadTimeFp8Config
+from .at_load import AT_LOAD_FP8, AT_LOAD_Q8_0, LoadTimeFp8Config, LoadTimeQ8Config, LoadTimeQuantConfig
 from .quant_backend import QuantBackend, get_quant_backend, set_quant_backend
 from .names import NameMap
 from .configs import (
@@ -45,10 +46,11 @@ __all__ = [
     "KernelSelectionError", "select_kernel", "QuantMethod",
     "LinearConfig", "LinearKernel", "LinearMethod",
     "UnquantizedLinearMethod", "Fp8TensorLinearMethod", "Fp8BlockLinearMethod", "Mxfp8LinearMethod", "Nvfp4LinearMethod",
+    "Q8_0LinearMethod",
     "BankSpec", "ExpertView", "MoEConfig", "MoEKernel", "MoEMethod",
     "UnquantizedMoEMethod", "Fp8BlockMoEMethod", "Nvfp4MoEMethod", "Mxfp4MoEMethod", "Mxfp8MoEMethod",
     "QuantBackend", "set_quant_backend", "get_quant_backend", "NameMap",
     "QuantConfig", "NoQuantConfig", "ModelOptConfig", "CompressedTensorsConfig", "Fp8BlockConfig", "Mxfp4Config",
     "quant_method_for", "quantization_config_of", "set_quant_config", "get_quant_config", "finalize_quant",
-    "LoadTimeFp8Config", "AT_LOAD_FP8",
+    "LoadTimeFp8Config", "AT_LOAD_FP8", "LoadTimeQ8Config", "AT_LOAD_Q8_0", "LoadTimeQuantConfig",
 ]

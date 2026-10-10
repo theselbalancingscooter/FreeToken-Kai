@@ -338,11 +338,14 @@ def parse_args(
         "--dense-quant",
         type=str,
         default="none",
-        choices=["none", "fp8"],
+        choices=["none", "fp8", "q8_0"],
         help=(
             "Quantize the checkpoint's bf16 dense (non-expert) weights at load: 'fp8' = per-row "
             "fp8-e4m3 W8A16 for attention, GDN, shared expert, lm_head and the embedding "
-            "(roughly halves their VRAM and per-token read traffic). A projection the checkpoint "
+            "(roughly halves their VRAM and per-token read traffic); 'q8_0' = the same bytes as "
+            "ggml Q8_0 blocks (int8, fp16 scale per 32) through int8 dp4a kernels, which on cards "
+            "without fp8 tensor cores (Ampere, Turing) keep the few-row GEMMs of a --spec-mtp verify "
+            "window at memory bandwidth where fp8 drops to half (the embedding stays fp8). A projection the checkpoint "
             "already quantized keeps its own format, and the router, hyper-connection, QSA indexer, "
             "PLE and GDN b/a gates stay bf16. Measured on qwen4_exp (Qwen3.8-Flash-Next)."
         ),

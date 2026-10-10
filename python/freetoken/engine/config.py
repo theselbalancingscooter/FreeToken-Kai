@@ -234,15 +234,15 @@ class EngineConfig:
         spec = self.model_spec
         quant = checkpoint_quant_config(self.model_path, hf_config, spec)
         embed_quant = None
-        if self.dense_quant == "fp8":
-            from freetoken.layers.quantization import LoadTimeFp8Config
+        if self.dense_quant in ("fp8", "q8_0"):
+            from freetoken.layers.quantization import LoadTimeFp8Config, LoadTimeQ8Config
 
             # the layers follow the wrapped config; the embedding table is not a quantized
-            # layer kind, so it keeps its own switch
-            quant = LoadTimeFp8Config(quant)
+            # layer kind, so it keeps its own switch (fp8 rows under both: it is a gather)
+            quant = (LoadTimeFp8Config if self.dense_quant == "fp8" else LoadTimeQ8Config)(quant)
             embed_quant = "fp8_pertensor"
         elif self.dense_quant != "none":
-            raise ValueError(f"--dense-quant {self.dense_quant!r}: supported values are none, fp8")
+            raise ValueError(f"--dense-quant {self.dense_quant!r}: supported values are none, fp8, q8_0")
         # The weight readers are handed the model path alone and read their schemes from here,
         # so install what the layers are built from -- the --dense-quant wrapper included, or a
         # reader would quantize against the checkpoint's own schemes and disagree with them.

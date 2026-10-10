@@ -84,6 +84,33 @@ def dequant_q4_0(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
     return ((q - 8.0) * d).reshape(-1).to(out_dtype)
 
 
+def dequant_q8_0(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
+    """Q8_0: per 32-elem block = fp16 scale ``d`` + 32 int8 codes; ``w = d*q``. 34 bytes per block."""
+    raw = raw.reshape(-1, 34)
+    d = _f16_scales(raw, 0, 2)  # [N,1]
+    q = raw[:, 2:34].contiguous().view(torch.int8).to(torch.float32)  # [N,32]
+    return (q * d).reshape(-1).to(out_dtype)
+
+
+def quantize_q8_0(w: torch.Tensor, chunk_rows: int = 8192) -> torch.Tensor:
+    """bf16/fp32 ``[N, K]`` (``K % 32 == 0``) -> packed Q8_0 rows ``[N, K//32*34]`` (uint8), ggml's
+    reference quantizer (``quantize_row_q8_0_ref``: d = amax/127, q = round(w/d)). Row-chunked so
+    a full-vocab head never needs a whole fp32 copy at once. Used by ``--dense-quant q8_0``."""
+    assert w.dim() == 2, w.shape
+    N, K = w.shape
+    assert K % 32 == 0, f"Q8_0 needs K % 32 == 0, got {K}"
+    nb = K // 32
+    out = torch.empty(N, nb * 34, dtype=torch.uint8, device=w.device)
+    for r0 in range(0, N, chunk_rows):
+        x = w[r0:r0 + chunk_rows].to(torch.float32).reshape(-1, nb, 32)
+        d = x.abs().amax(dim=-1, keepdim=True) / 127.0  # [n,nb,1]
+        inv = torch.where(d > 0, 1.0 / d, torch.zeros_like(d))
+        q = torch.round(x * inv).clamp_(-127.0, 127.0).to(torch.int8).view(torch.uint8)  # [n,nb,32]
+        d16 = d.to(torch.float16).contiguous().view(torch.uint8).reshape(-1, nb, 2)
+        out[r0:r0 + chunk_rows] = torch.cat([d16, q], dim=-1).reshape(-1, nb * 34)
+    return out
+
+
 def dequant_q2_0(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
     """Q2_0: per 64-elem block = fp16 scale ``d`` + 16 bytes of 2-bit codes; ``w = d*(q-1)``.
 
@@ -156,6 +183,7 @@ def dequant_q6_k(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
 
 _DEQUANT = {
     GGML_Q4_0: dequant_q4_0,
+    GGML_Q8_0: dequant_q8_0,
     GGML_Q6_K: dequant_q6_k,
     GGML_Q2_0: dequant_q2_0,
 }
@@ -189,6 +217,8 @@ __all__ = [
     "BLOCK_SHAPE",
     "row_bytes",
     "dequant_q4_0",
+    "dequant_q8_0",
+    "quantize_q8_0",
     "dequant_q2_0",
     "quantize_q2_0",
     "dequant_q6_k",

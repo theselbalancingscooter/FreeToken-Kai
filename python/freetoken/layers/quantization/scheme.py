@@ -20,6 +20,7 @@ class QuantKind(Enum):
     MXFP8 = "mxfp8"
     NVFP4 = "nvfp4"
     MXFP4 = "mxfp4"
+    Q8_0 = "q8_0"  # ggml Q8_0 (--dense-quant q8_0): int8 blocks of 32 with an fp16 scale
 
     def __str__(self) -> str:
         return self.value
@@ -105,3 +106,8 @@ def nvfp4_scheme(*, input_scale: bool) -> QuantScheme:
 
 def mxfp4_scheme() -> QuantScheme:
     return QuantScheme(QuantKind.MXFP4, WeightDesc("e2m1", (1, MX_GROUP), "e8m0"), {"weight", "weight_scale"})
+
+
+def q8_0_scheme() -> QuantScheme:
+    """ggml Q8_0 packed rows (the scale lives inside each 34-byte block, so ``weight`` is the only role)."""
+    return QuantScheme(QuantKind.Q8_0, WeightDesc("q8_0", (1, 32), "f16"), {"weight"})

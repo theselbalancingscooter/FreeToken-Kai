@@ -1,25 +1,28 @@
-"""--dense-quant: serve the projections a checkpoint left bf16 as fp8, quantized at load.
+"""--dense-quant: serve the projections a checkpoint left bf16 as fp8 or ggml Q8_0, quantized at load.
 
-Every other QuantConfig answers what the checkpoint *stores*. This one answers what the
+Every other QuantConfig answers what the checkpoint *stores*. These answer what the
 deployment wants: on a card too small for the bf16 dense weights, a projection the checkpoint
 never quantized is still worth halving. The weights themselves are converted in the loader
-(``engine._quantize_at_load``), which sees an fp8 buffer where a bf16 tensor arrived.
+(``engine._quantize_at_load``), which sees an fp8 (or packed uint8) buffer where a bf16 tensor
+arrived. ``q8_0`` keeps the same bytes as fp8 but feeds int8 dp4a kernels, so the few-row
+GEMMs of a verify window read the weights at bandwidth on cards without fp8 tensor cores.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-from .configs.base import NoQuantConfig, QuantConfig
+from .configs.base import NoQuantConfig, QuantConfig, Stored
 from .linear import LinearConfig
 from .names import is_routed_expert, name_set
 from .quant_backend import get_quant_backend
 from .registry import LayerKind, method_class
-from .scheme import QuantKind, QuantScheme, fp8_tensor_scheme
+from .scheme import QuantKind, QuantScheme, fp8_tensor_scheme, q8_0_scheme
 
 # one fp32 scale per output row: a whole-tensor scale loses too much on a fused projection,
 # and the W8A16 kernels read a per-row scale either way
 AT_LOAD_FP8 = fp8_tensor_scheme("float", per_row=True)
+AT_LOAD_Q8_0 = q8_0_scheme()
 
 # Projections that stay bf16: the MoE router, the hyper-connection mixer's skinny GEMMs, the QSA
 # indexer, the PLE table's key/value projections and the GatedDeltaNet b/a gates decide which
@@ -34,10 +37,12 @@ KEEP_BF16 = name_set((
 ))
 
 
-class LoadTimeFp8Config(QuantConfig):
-    """The checkpoint's config, with every unquantized dense projection reported as per-row fp8."""
+class LoadTimeQuantConfig(QuantConfig):
+    """The checkpoint's config, with every unquantized dense projection reported as ``AT_LOAD``."""
 
-    dialect = "dense-quant-fp8"
+    dialect = "dense-quant"
+    AT_LOAD: QuantScheme = AT_LOAD_FP8
+    STORAGE = {}  # see stored_tensors: the inner dialect's table, plus the at-load kind
 
     def __init__(self, inner: QuantConfig | None):
         inner = inner if inner is not None else NoQuantConfig()
@@ -50,6 +55,17 @@ class LoadTimeFp8Config(QuantConfig):
 
     def scheme_for_name(self, name: str) -> QuantScheme | None:
         return self.inner.scheme_for_name(name)
+
+    def stored_tensors(self, kind: QuantKind) -> dict[str, Stored]:
+        # the loaders ask how the checkpoint stores a projection it DID quantize (a ModelOpt
+        # export's NVFP4 attention under --dense-quant): that is the inner dialect's answer;
+        # the at-load kind is stored as the bf16 ``weight`` the engine converts after the read
+        if kind is self.AT_LOAD.kind:
+            return {role: Stored(role) for role in sorted(self.AT_LOAD.roles)}
+        return self.inner.stored_tensors(kind)
+
+    def layer_config(self, layer: Any, layer_kind: LayerKind, scheme: QuantScheme | None):
+        return self.inner.layer_config(layer, layer_kind, scheme)
 
     def _quantize_at_load(self, prefix: str) -> bool:
         if self.inner.scheme_for(prefix) is not None:
@@ -64,11 +80,26 @@ class LoadTimeFp8Config(QuantConfig):
         inner = self.inner.scheme_for(prefix)
         if inner is not None:
             return inner
-        return AT_LOAD_FP8 if self._quantize_at_load(prefix) else None
+        return self.AT_LOAD if self._quantize_at_load(prefix) else None
 
     def get_quant_method(self, layer: Any, prefix: str):
         if layer.quant_layer_kind is not LayerKind.LINEAR or not self._quantize_at_load(prefix):
             return self.inner.get_quant_method(layer, prefix)
-        cls = method_class(QuantKind.FP8_TENSOR, LayerKind.LINEAR)
-        cfg = LinearConfig.from_layer(layer, AT_LOAD_FP8)
-        return cls(cfg, get_quant_backend().select(LayerKind.LINEAR, QuantKind.FP8_TENSOR))
+        kind = self.AT_LOAD.kind
+        cls = method_class(kind, LayerKind.LINEAR)
+        cfg = LinearConfig.from_layer(layer, self.AT_LOAD)
+        return cls(cfg, get_quant_backend().select(LayerKind.LINEAR, kind))
+
+
+class LoadTimeFp8Config(LoadTimeQuantConfig):
+    """``--dense-quant fp8``: per-row fp8-e4m3, W8A16."""
+
+    dialect = "dense-quant-fp8"
+    AT_LOAD = AT_LOAD_FP8
+
+
+class LoadTimeQ8Config(LoadTimeQuantConfig):
+    """``--dense-quant q8_0``: ggml Q8_0 rows through the vendored int8 kernels."""
+
+    dialect = "dense-quant-q8_0"
+    AT_LOAD = AT_LOAD_Q8_0

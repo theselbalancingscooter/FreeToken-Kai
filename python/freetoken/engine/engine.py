@@ -485,8 +485,9 @@ def _quantize_at_load(
     ``X.weight_scale`` buffer is quantized per output row on the fly (the checkpoint ships
     it unquantized). Anything else, including tensors already fp8, passes through."""
     from freetoken.kernel.triton.fp8_pertensor_linear import FP8, quantize_fp8_per_row
+    from freetoken.models.gguf.dequant import GGML_Q8_0, quantize_q8_0, row_bytes
 
-    quantized = 0
+    quantized = q8 = 0
     for key, weight in weights:
         expected = model_state.get(key)
         scale_key = key[: -len(".weight")] + ".weight_scale" if key.endswith(".weight") else None
@@ -501,9 +502,25 @@ def _quantize_at_load(
             quantized += 1
             yield key, q
             yield scale_key, s
+        elif (
+            # --dense-quant q8_0: the model buffer is the packed Q8_0 row and a bf16 [N, K] arrived
+            expected is not None
+            and expected.dtype == torch.uint8
+            and weight.dim() == 2
+            and weight.is_floating_point()
+            and weight.shape[1] % 32 == 0
+            and tuple(expected.shape) == (weight.shape[0], row_bytes(weight.shape[1], GGML_Q8_0))
+        ):
+            q8 += 1
+            yield key, quantize_q8_0(weight)
         else:
             yield key, weight
-    logger.info_rank0(f"--dense-quant: quantized {quantized} dense projections to per-row fp8 at load")
+    if q8:
+        logger.info_rank0(f"--dense-quant: quantized {q8} dense projections to ggml Q8_0 at load")
+    elif quantized:
+        logger.info_rank0(f"--dense-quant: quantized {quantized} dense projections to per-row fp8 at load")
+    else:
+        logger.info_rank0("--dense-quant: nothing to quantize (the checkpoint quantized every dense projection itself)")
 
 
 class WeightLoadError(RuntimeError):

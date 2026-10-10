@@ -51,7 +51,7 @@ The fork adds nine things upstream does not have:
    [kv-cache-quant.md](kv-cache-quant.md), and [vram-and-speed.md](vram-and-speed.md) for why
    the VRAM it frees did not make this machine faster -- and how to tell whether it would
    make yours faster.
-8. **The checkpoint's bf16 dense weights served as fp8** (`--dense-quant fp8`): the attention
+8. **The checkpoint's bf16 dense weights served as fp8 or Q8_0** (`--dense-quant fp8` / `q8_0`): the attention
    and GatedDeltaNet projections, the shared expert, the lm_head and the embedding table are
    quantized to per-row fp8-e4m3 at load and read W8A16, halving both their VRAM and the bytes
    each decode step reads. A projection the checkpoint already quantized keeps its own format,
@@ -60,6 +60,16 @@ The fork adds nine things upstream does not have:
    they decide where tokens go rather than carry the traffic. On Qwen3.8-Flash-Next it takes the
    resident dense weights from 4.9 GB per card to 2.9 GB, which is what leaves room for 128k of
    context beside the expert cache. See [pipeline.md](pipeline.md).
+   `q8_0` stores the same projections as ggml Q8_0 blocks instead (int8 with an fp16 scale per
+   32, 8.5 bits per weight, the embedding stays fp8) and runs them through the vendored ggml
+   kernels: the MMVQ GEMV for one row, the int8 dp4a MMQ for the few rows of a `--spec-mtp`
+   verify window, a dequantized cuBLAS GEMM for prefill. On a card without fp8 tensor cores
+   (Ampere, Turing) the fp8 path has to expand e4m3 inside the kernel and its M>1 GEMMs run at
+   half the memory bandwidth or worse; Q8_0's codes go to dp4a as they are, so the window's
+   dense cost falls to what one read of the weights takes, and int8 with a block scale carries
+   more mantissa than e4m3 with a row scale. On an RTX 2060, gpt-oss-20b (bf16 attention) goes
+   from 17 to 21-24 tok/s under `q8_0`: half the dense bytes per token, and the VRAM they free
+   doubles the expert cache (62 to 136 slots).
 9. **A prefill chunk sized to the VRAM that is actually free** (`--prefill-chunk-budget`).
    The chunk is what the linear-attention kernels size their per-forward buffers from, and
    upstream's fixed 8192 needs 0.97 GiB on a 35B MoE -- more than a 6 GB card has spare, so
@@ -450,6 +460,7 @@ model that does). Not yet measured on a card.
 | `FREETOKEN_PREFILL_SPLIT` / `FREETOKEN_PREFILL_SPLIT_MAX_TOKENS` / `FREETOKEN_PREFILL_SPLIT_RATIO` | on / `1024` / `4` | Split prefill (offload/hybrid, layers whose banks are pinned, 64 rows and up): the experts a forward routes to least are computed by the CPU executor while only the rest are moved to the GPU, at the same time. The ratio is what moving one expert costs in CPU routes; the cut is where both sides finish together. On two RTX 3060s (Flash-Next) the first token of a fresh 270-token prompt came after 3.0 s instead of 8.4 s (64 tokens: 2.1 s instead of 5.6; 1024: 6.8 instead of 8.0). `0` turns it off |
 | `FREETOKEN_STAGED_COPY` / `FREETOKEN_STAGED_COPY_MB` | on / `32` | Whole-layer prefill copies of non-pinned bank layers go through two pinned staging buffers of this size |
 | `FREETOKEN_GGUF_MMQ_MIN_ROWS` | `2` | GGUF expert banks (`--moe-expert-gguf`, gemma4 GGUF): from this many rows (tokens x top_k) the tiled MMQ kernel serves the experts, reading each expert once per tile of 4 tokens instead of once per row as the MMVQ GEMV does -- the prefill chunks and the `--spec-mtp` verify windows. `0` keeps MMVQ everywhere (a decoded single token always uses it) |
+| `FREETOKEN_Q8_0_MMVQ_MAX_ROWS` / `FREETOKEN_Q8_0_MMQ_MAX_ROWS` | `1` / `64` | `--dense-quant q8_0`: rows (tokens) up to which a dense projection runs the per-row MMVQ GEMV, and up to which the tiled int8 MMQ; above the second the weight is dequantized once per call and cuBLAS runs the GEMM on tensor cores (prefill). The verify window of `--spec-mtp K` is K+1 rows |
 | `FREETOKEN_GGUF_MMQ_WIDE_MIN_ROWS` | `256` | Q2_0 banks: from this many rows the MMQ tile is 32 tokens x 64 rows (8 warps) instead of 4 x 32 -- a prefill chunk routes about 100 tokens to each expert, which the 4-token tile reads 25 times over. On an RTX 2060, 10,240 rows over 128 experts: 26.6 -> 11.4 ms; on two RTX 3060s a 25k-token prompt 829 -> 1,010 tok/s, the chunk's GPU time now within 10% of its x4 expert transfer. `0` keeps the 4-token tile everywhere |
 | `FREETOKEN_CPU_MOE_SPIN` | auto (off under `--pp-size`) | Upstream's CPU MoE pool spin-wait (#619: the workers and the pinned coordinator spin up to 50 ms between layers instead of parking). Upstream turns it on whenever every pool thread owns a CPU and two stay spare; Kai keeps that for one rank and turns it off under `--pp-size`, where every rank pins a pool to the same cores and the spinners starve the other rank's workers and the host-side launches. Measured with Flash-Next on two RTX 3060s (hybrid, 7 threads per rank, `--spec-mtp 5`): a verify window took 224 ms spinning against 158 ms parked (-30% of the tokens); on one RTX 2060 (Ornith, 11 threads, one rank) spinning gained 3-6%. `0` turns it off everywhere, `1` forces it on under `--pp-size` too |
 | `FREETOKEN_BANK_PREAD` | `buffered` | With `--moe-bank-ram`: how a prefill chunk reads the non-resident rows. `buffered` reads them from the file on several threads through the page cache; `direct` with `O_DIRECT` (about 5% more prefill where the page cache is far short of the rows; where it nearly holds them, decode loses the rows a prefill would have cached, -15% measured); `0` faults them in through the mapping as before |
