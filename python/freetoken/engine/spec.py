@@ -42,12 +42,17 @@ def accept_drafts(sampled: Sequence[int], drafts: Sequence[int]) -> list[int]:
 def cut_drafts(drafts: Sequence[int], probs: Sequence[float], min_p: float) -> list[int]:
     """--spec-min-p: keep the drafts up to (not including) the first one the head scored below
     ``min_p``; everything after a doubtful draft would be verified against a token that is
-    probably wrong anyway. ``min_p <= 0`` keeps them all."""
+    probably wrong anyway. The first draft is kept even when doubtful: a step with no drafts
+    is a plain one-row decode, which runs eagerly on the drafting rank (the draft head reads
+    a hidden state a graph replay would not leave in place) -- on two RTX 3060s 60 ms against
+    the 27 ms of a two-row window. ``min_p <= 0`` keeps them all."""
     out = []
     for d, p in zip(drafts, probs):
-        if min_p > 0 and p < min_p:
+        if min_p > 0 and p < min_p and out:
             break
         out.append(int(d))
+        if min_p > 0 and p < min_p:
+            break  # the doubtful first draft: verified, but nothing chained after it
     return out
 
 

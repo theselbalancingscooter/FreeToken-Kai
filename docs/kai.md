@@ -429,7 +429,9 @@ the 512 bf16 experts become one NVFP4 bank layer, 1.35 GB pinned).
 `--spec-min-p P` ends a window at the first draft the head scores below `P` (Strata's rule; its
 calibration picks 0.70): a confident stretch gets all K drafts, a doubtful one is verified no
 further than it should be. The window then varies from 2 to K+1 rows and a CUDA graph is captured
-for every width, sharing one memory pool. Without it the chain runs on the device end to end and
+for every width, sharing one memory pool. A doubtful first draft is still verified, alone: a step
+with no drafts is a plain one-row decode, which runs eagerly on the drafting rank (60 ms on two RTX
+3060s against the 27 ms of a two-row window -- the reason min-p first measured slower there). Without it the chain runs on the device end to end and
 the K drafts come back in one read.
 
 `--spec-draft-head-quant q4_0` (or `q8_0`) scores the drafts through a packed copy of the lm_head

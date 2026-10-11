@@ -12,7 +12,7 @@ def test_cut_drafts_keeps_the_confident_prefix():
 
     assert cut_drafts([1, 2, 3], [0.9, 0.8, 0.7], 0.0) == [1, 2, 3]
     assert cut_drafts([1, 2, 3], [0.9, 0.5, 0.95], 0.6) == [1]
-    assert cut_drafts([1, 2, 3], [0.2, 0.9, 0.9], 0.6) == []
+    assert cut_drafts([1, 2, 3], [0.2, 0.9, 0.9], 0.6) == [1]  # the doubtful first draft stays, alone
     assert cut_drafts([1, 2, 3], [0.9, 0.8, 0.7], 0.7) == [1, 2, 3]
     assert cut_drafts([], [], 0.7) == []
 

@@ -2525,11 +2525,11 @@ class Engine:
             return d, p
 
         d, p = score(h)
-        if min_p > 0 and p < min_p:
-            return []
         drafts = [d]
         if prof is not None:
             prof.mark("mtp_window")
+        if min_p > 0 and p < min_p:
+            return drafts  # doubtful, but kept: a draftless step is an eager one-row decode (spec.cut_drafts)
         pos_row = int(batch.positions[row].item())
         for j in range(1, self.spec_k):
             p = pos_row + j

@@ -362,9 +362,9 @@ class SpecVerifyGraph:
             # --spec-min-p: read each draft's probability and stop at the first doubtful one
             # (the chain steps it would have run are the cost the rule saves)
             d, p = int(self.d_buf.item()), float(self.p_buf.item())
-            if p < min_p:
-                return []
             drafts = [d]
+            if p < min_p:
+                return drafts  # doubtful, but kept: a draftless step is an eager one-row decode (spec.cut_drafts)
             for j in range(1, eng.spec_k):
                 pos = pos_row + j
                 if pos + 1 > (req.spec_alloc_len or 0):
