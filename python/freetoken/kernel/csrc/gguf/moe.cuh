@@ -407,6 +407,12 @@ static __device__ __forceinline__ void moe_q_bounded(
       for (int k = ir * WARP_SIZE_GGUF / qr; k < (ir + 1) * WARP_SIZE_GGUF / qr; k += vdr) {
 #pragma unroll
         for (int j = 0; j < mmq_x; j += nwarps) {
+          // FreeToken: a padded column (moe_align_block_size fills a tile up to mmq_x with
+          // the one-past-the-end token) gets no dot product. In a decode window most experts
+          // serve one token, so three of the tile's four columns were arithmetic on nothing;
+          // the Q2_0 dot is instruction-bound, not bandwidth-bound, so that time was real.
+          // Warp-uniform (each warp owns its columns), so no divergence.
+          if (token_offs[j / nwarps] >= ncols_dst) continue;
 #pragma unroll
           for (int i = 0; i < mmq_y; i += WARP_SIZE_GGUF) {
             sum[i / WARP_SIZE_GGUF][j / nwarps] += vec_dot(

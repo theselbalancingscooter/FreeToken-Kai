@@ -19,7 +19,12 @@
 // clang-format off
 
 // Q8 gemv
-template <typename scalar_t>
+// FreeToken: with transpose4 the 16 bytes of every 16-weight group are stored 4x4-transposed
+// (element g goes to byte (g%4)*4 + g/4), which is the order the Q2_0 dot products want: byte b
+// of a Q2_0 int holds weights b, b+4, b+8, b+12 in its four bit pairs, so against this order
+// `(v >> 2m) & 0x03030303` meets int m directly and the dot needs no __byte_perm shuffle. d and
+// the block sum are unchanged; the layout is private to the Q2_0 kernels (type 42 / 1042).
+template <typename scalar_t, bool transpose4 = false>
 static __global__ void
 quantize_q8_1(const scalar_t* __restrict__ x, void* __restrict__ vy, const int kx, const int kx_padded) {
   const auto ix = blockDim.x * blockIdx.x + threadIdx.x;
@@ -47,7 +52,11 @@ quantize_q8_1(const scalar_t* __restrict__ x, void* __restrict__ vy, const int k
   const float d = amax / 127;
   const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
 
-  y[ib].qs[iqs] = q;
+  if (transpose4) {
+    y[ib].qs[(iqs & ~15) | ((iqs & 3) << 2) | ((iqs >> 2) & 3)] = q;
+  } else {
+    y[ib].qs[iqs] = q;
+  }
 
   if (iqs > 0) {
     return;
@@ -58,7 +67,7 @@ quantize_q8_1(const scalar_t* __restrict__ x, void* __restrict__ vy, const int k
 }
 
 template <typename scalar_t>
-static void quantize_row_q8_1_cuda(const scalar_t* x, void* vy, const int kx, const int ky, cudaStream_t stream) {
+static void quantize_row_q8_1_cuda(const scalar_t* x, void* vy, const int kx, const int ky, cudaStream_t stream, bool transpose4 = false) {
   const int64_t kx_padded = (kx + 512 - 1) / 512 * 512;
   const int block_num_x = (kx_padded + CUDA_QUANTIZE_BLOCK_SIZE - 1) / CUDA_QUANTIZE_BLOCK_SIZE;
   constexpr int MAX_BLOCK_SIZE = 65535;
@@ -66,10 +75,18 @@ static void quantize_row_q8_1_cuda(const scalar_t* x, void* vy, const int kx, co
     const int num_blocks_y = std::min(ky, off + MAX_BLOCK_SIZE) - off;
     const dim3 num_blocks(block_num_x, num_blocks_y, 1);
     const dim3 block_size(CUDA_DEQUANTIZE_BLOCK_SIZE, 1, 1);
-    quantize_q8_1<<<num_blocks, block_size, 0, stream>>>(
-        &x[off * kx], (int32_t*)vy + off * (kx_padded / 32 * 9), kx, kx_padded);
+    if (transpose4) {
+      quantize_q8_1<scalar_t, true><<<num_blocks, block_size, 0, stream>>>(
+          &x[off * kx], (int32_t*)vy + off * (kx_padded / 32 * 9), kx, kx_padded);
+    } else {
+      quantize_q8_1<scalar_t, false><<<num_blocks, block_size, 0, stream>>>(
+          &x[off * kx], (int32_t*)vy + off * (kx_padded / 32 * 9), kx, kx_padded);
+    }
   }
 }
+
+// the Q2_0 kernels (type 42 and the wide tile 1042) read the transposed activation order
+static inline bool q8_1_transposed_for(int64_t type) { return type == 42 || type == 1042; }
 
 torch::Tensor ggml_dequantize(
     torch::Tensor W,  // quant weight
@@ -351,7 +368,7 @@ torch::Tensor ggml_moe_a8(
   options = torch::TensorOptions().dtype(torch::kInt32).device(W.device());
   at::Tensor quant_X = torch::empty({tokens, padded / 32 * 9}, options);
   DISPATCH_FLOAT_TYPES(X.scalar_type(), "ggml_moe_a8", [&] {
-    quantize_row_q8_1_cuda((scalar_t*)X.data_ptr(), (void*)quant_X.data_ptr(), col, tokens, stream);
+    quantize_row_q8_1_cuda((scalar_t*)X.data_ptr(), (void*)quant_X.data_ptr(), col, tokens, stream, q8_1_transposed_for(type));
     switch (type) {
       case 2:
         ggml_moe_q4_0_q8_1_cuda(
@@ -591,7 +608,7 @@ torch::Tensor ggml_moe_a8_vec(
   options = torch::TensorOptions().dtype(torch::kInt32).device(W.device());
   at::Tensor quant_X = torch::empty({tokens, padded / 32 * 9}, options);
   DISPATCH_FLOAT_TYPES(X.scalar_type(), "ggml_moe_vec_a8", [&] {
-    quantize_row_q8_1_cuda<scalar_t>((scalar_t*)X.data_ptr(), (void*)quant_X.data_ptr(), col, tokens, stream);
+    quantize_row_q8_1_cuda<scalar_t>((scalar_t*)X.data_ptr(), (void*)quant_X.data_ptr(), col, tokens, stream, q8_1_transposed_for(type));
     switch (type) {
       case 2:
         moe_vec_q4_0_q8_1_cuda<scalar_t>(

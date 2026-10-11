@@ -564,30 +564,27 @@ vec_dot_q4_0_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ b
 static __device__ __forceinline__ float
 vec_dot_q2_0_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1, const int& iqs) {
 #if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM || defined USE_MUSA
+  // VDR 1: one 16-weight int per thread per step. (A whole 64-weight block per thread -- one
+  // d, two ds -- was tried: the MMQ tile gains from it, the GEMV loses a third, because a
+  // 2,560-wide row is 40 blocks and 32 lanes x 1 block leaves the second pass 3/4 idle.)
   const block_q2_0* bq2_0 = (const block_q2_0*)vbq;
   const int k = iqs;                       // 0..3: which 16-weight group of the 64
   const block_q8_1* y = bq8_1 + (k >> 1);  // the 32-weight q8_1 block holding the group
   const int base = (k & 1) * 4;            // the group's first int within that block
   const int v = get_int_from_uint8(bq2_0->qs, k);
-  const int u0 = get_int_from_int8_aligned(y->qs, base + 0);
-  const int u1 = get_int_from_int8_aligned(y->qs, base + 1);
-  const int u2 = get_int_from_int8_aligned(y->qs, base + 2);
-  const int u3 = get_int_from_int8_aligned(y->qs, base + 3);
-  // bytewise 4x4 transpose: t_j = [u0.b_j, u1.b_j, u2.b_j, u3.b_j]
-  const int lo01 = __byte_perm(u0, u1, 0x5140);  // [u0.b0, u1.b0, u0.b1, u1.b1]
-  const int lo23 = __byte_perm(u2, u3, 0x5140);
-  const int hi01 = __byte_perm(u0, u1, 0x7362);  // [u0.b2, u1.b2, u0.b3, u1.b3]
-  const int hi23 = __byte_perm(u2, u3, 0x7362);
-  const int t0 = __byte_perm(lo01, lo23, 0x5410);
-  const int t1 = __byte_perm(lo01, lo23, 0x7632);
-  const int t2 = __byte_perm(hi01, hi23, 0x5410);
-  const int t3 = __byte_perm(hi01, hi23, 0x7632);
+  // the activations were quantized with quantize_q8_1<transpose4>: int m of a 16-weight group
+  // already holds [y_m, y_{m+4}, y_{m+8}, y_{m+12}], the weights of bit pair m of every byte
+  const int t0 = get_int_from_int8_aligned(y->qs, base + 0);
+  const int t1 = get_int_from_int8_aligned(y->qs, base + 1);
+  const int t2 = get_int_from_int8_aligned(y->qs, base + 2);
+  const int t3 = get_int_from_int8_aligned(y->qs, base + 3);
   int sumi = 0;
   sumi = __dp4a((v >> 0) & 0x03030303, t0, sumi);
   sumi = __dp4a((v >> 2) & 0x03030303, t1, sumi);
   sumi = __dp4a((v >> 4) & 0x03030303, t2, sumi);
   sumi = __dp4a((v >> 6) & 0x03030303, t3, sumi);
   const float2 ds8f = __half22float2(y->ds);
+  // the -1 of every code: this int holds half of its q8_1 block, the other int the other half
   return __half2float(bq2_0->d) * (sumi * ds8f.x - 0.5f * ds8f.y);
 #else
   return 0.0f;
@@ -679,7 +676,7 @@ static __device__ __forceinline__ float vec_dot_q4_0_q8_1_mul_mat(
 // block_q2_0 has block_q4_0's byte layout (fp16 d + 16 bytes) and QI2_0 == QI4_0 == 4 ints per
 // block, so the tile loads are the q4_0 ones over block_q2_0; only the dot differs: one int is
 // 16 weights (not 8 pairs), spread over the 2-bit planes, and a block spans two q8_1 blocks.
-#define VDR_Q2_0_Q8_1_MMQ 1
+#define VDR_Q2_0_Q8_1_MMQ 4
 
 template <int mmq_y>
 static __device__ __forceinline__ void allocate_tiles_q2_0(int** x_ql, half2** x_dm, int** x_qh, int** x_sc) {
@@ -751,31 +748,31 @@ static __device__ __forceinline__ float vec_dot_q2_0_q8_1_mul_mat(
   (void)x_qh;
   (void)x_sc;
 #if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM || defined USE_MUSA
+  // VDR 4: k is a multiple of 4 and this call covers one Q2_0 block (4 ints = 64 weights =
+  // two q8_1 blocks of the activations): one x scale, two y scales. Pre-transposed
+  // activations (quantize_q8_1<transpose4>), see vec_dot_q2_0_q8_1.
   const float* x_dmf = (const float*)x_dm;
-  const int kl = k % 8;
-  const int ybase = j * WARP_SIZE_GGUF + (kl / 4) * 16 + 4 * (kl % 4);
-  const int v = x_ql[i * (WARP_SIZE_GGUF + 1) + k];
-  const int u0 = y_qs[ybase + 0];
-  const int u1 = y_qs[ybase + 1];
-  const int u2 = y_qs[ybase + 2];
-  const int u3 = y_qs[ybase + 3];
-  const int lo01 = __byte_perm(u0, u1, 0x5140);
-  const int lo23 = __byte_perm(u2, u3, 0x5140);
-  const int hi01 = __byte_perm(u0, u1, 0x7362);
-  const int hi23 = __byte_perm(u2, u3, 0x7362);
-  const int t0 = __byte_perm(lo01, lo23, 0x5410);
-  const int t1 = __byte_perm(lo01, lo23, 0x7632);
-  const int t2 = __byte_perm(hi01, hi23, 0x5410);
-  const int t3 = __byte_perm(hi01, hi23, 0x7632);
-  int sumi = 0;
-  sumi = __dp4a((v >> 0) & 0x03030303, t0, sumi);
-  sumi = __dp4a((v >> 2) & 0x03030303, t1, sumi);
-  sumi = __dp4a((v >> 4) & 0x03030303, t2, sumi);
-  sumi = __dp4a((v >> 6) & 0x03030303, t3, sumi);
+  const int kl = k % 8;  // 0 or 4
+  const int ybase = j * WARP_SIZE_GGUF + (kl / 4) * 16;
+  const int* xq = x_ql + i * (WARP_SIZE_GGUF + 1) + k;
+  float acc = 0.0f;
+#pragma unroll
+  for (int h = 0; h < 2; ++h) {
+    int sumi = 0;
+#pragma unroll
+    for (int g = 0; g < 2; ++g) {
+      const int v = xq[2 * h + g];
+      const int* t = y_qs + ybase + 8 * h + 4 * g;
+      sumi = __dp4a((v >> 0) & 0x03030303, t[0], sumi);
+      sumi = __dp4a((v >> 2) & 0x03030303, t[1], sumi);
+      sumi = __dp4a((v >> 4) & 0x03030303, t[2], sumi);
+      sumi = __dp4a((v >> 6) & 0x03030303, t[3], sumi);
+    }
+    const float2 ds8f = __half22float2(y_ds[j * (WARP_SIZE_GGUF / QI8_1) + kl / 2 + h]);
+    acc += sumi * ds8f.x - ds8f.y;  // the -1 of every code: the whole q8_1 block's sum
+  }
   const float d2 = x_dmf[i * (WARP_SIZE_GGUF / QI2_0) + i / QI2_0 + k / QI2_0];
-  const float2 ds8f = __half22float2(y_ds[j * (WARP_SIZE_GGUF / QI8_1) + kl / 2]);
-  // the -1 of every code: this int holds half of its q8_1 block, the other int the other half
-  return d2 * (sumi * ds8f.x - 0.5f * ds8f.y);
+  return d2 * acc;
 #else
   return 0.0f;
 #endif

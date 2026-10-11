@@ -129,7 +129,9 @@ def test_moe_mmq_q2_0_wide_tile_timing():
 
 def test_moe_mmq_q2_0_matches_mmvq_bitwise_close():
     """Both kernels quantize the activations the same way (q8_1), so they agree far more
-    tightly than either does with the fp32 reference."""
+    tightly than either does with the fp32 reference. Compared in fp32: the two dots add the
+    same exact int32 partials in a different order (the MMQ takes a 64-weight block per call,
+    the GEMV 16 weights), which in a bf16 output is a one-ulp coin toss per element."""
     from freetoken.kernel.gguf import ggml_moe_a8_vec
     from freetoken.models.gguf.dequant import GGML_Q2_0, quantize_q2_0
 
@@ -137,12 +139,17 @@ def test_moe_mmq_q2_0_matches_mmvq_bitwise_close():
     dev = torch.device("cuda")
     K, N, S, T, top_k = 2560, 1280, 32, 6, 10
     packed = quantize_q2_0(torch.randn(S, N, K, dtype=torch.bfloat16) * 0.05).to(dev)
-    x = torch.randn(T, K, device=dev, dtype=torch.bfloat16) * 0.5
+    x = (torch.randn(T, K, device=dev, dtype=torch.bfloat16) * 0.5).float()
     ids = torch.stack([torch.randperm(S, device=dev)[:top_k] for _ in range(T)]).to(torch.int32)
-    a = _mmq(x, packed, ids, top_k, N).float()
-    b = ggml_moe_a8_vec(x, packed, ids, top_k, int(GGML_Q2_0), N, T).float()
+    a = _mmq(x, packed, ids, top_k, N)
+    b = ggml_moe_a8_vec(x, packed, ids, top_k, int(GGML_Q2_0), N, T)
+    assert a.dtype == torch.float32 and b.dtype == torch.float32
     rel = (a - b).abs().max() / (b.abs().max() + 1e-6)
-    assert rel < 2e-3, f"mmq vs mmvq rel err {rel.item()}"
+    assert rel < 1e-5, f"mmq vs mmvq rel err {rel.item()}"
+    # and the bf16 path differs from the fp32 one only by bf16 output rounding
+    a16 = _mmq(x.to(torch.bfloat16), packed, ids, top_k, N).float()
+    rel16 = (a16 - a).abs().max() / (a.abs().max() + 1e-6)
+    assert rel16 < 8e-3, f"bf16 vs fp32 output rel err {rel16.item()}"
 
 
 def test_fused_experts_gguf_mmq_and_mmvq_agree():
