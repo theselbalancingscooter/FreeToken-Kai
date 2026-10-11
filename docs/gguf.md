@@ -25,7 +25,14 @@ dequantise inside the K-loop: on the GPU the borrowed ggml MMVQ kernel for a sin
 (`vec_dot_q2_0_q8_1`, W2A8) and a tiled MMQ kernel for everything wider (the `--spec-mtp` verify
 windows and the prefill chunks: the tokens are sorted by expert and each expert's rows are read
 once per tile of 4 tokens, or of 32 from 256 rows up), and the CPU executor's `q2_0_dot_i8_*`
-(AVX-VNNI / AVX2 / scalar, W2A8 against Q8_0 activations). The checkpoint's own expert scheme steps aside for these layers;
+(AVX-VNNI / AVX2 / scalar, W2A8 against Q8_0 activations). The GPU kernels are instruction-bound,
+not bandwidth-bound (the same MoE tile over Q8_0 reaches 200-320 GB/s on an RTX 2060, over Q2_0
+it reached 85), so they avoid work: the activations are quantised 4x4-transposed inside every
+16-weight group (byte b of a Q2_0 int holds weights b, b+4, b+8, b+12, so `(v >> 2m) & 0x03030303`
+meets activation int m directly and the dot needs no byte shuffles), the MMQ tile skips the dot
+for its padded token columns (in a verify window most experts serve one token), and the MMQ dot
+takes a 64-weight block per call (one weight scale, two activation scales). 4 tokens over 40
+experts: 0.435 -> 0.253 ms on an RTX 2060; one token 2.3x. The checkpoint's own expert scheme steps aside for these layers;
 `--dense-quant fp8` and the MTP draft head still work, the head's bf16 experts being rounded to
 Q2_0 with ggml's reference quantizer (amax delta) at load. The GGUF is parsed by a small reader of
 the fork's own (`models/gguf/rawreader.py`): gguf-py 0.19.0 predates Q2_0 and refuses the file.

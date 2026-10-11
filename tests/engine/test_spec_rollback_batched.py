@@ -62,6 +62,39 @@ def test_batched_restore_equals_per_layer_restore(accepted, device):
     assert torch.equal(new_pool.conv_states[:, mask], before.conv_states[:, mask])
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA graphs")
+@pytest.mark.parametrize("accepted", [1, 2, 4])
+def test_graphed_restore_equals_per_layer_restore(monkeypatch, accepted):
+    """The graph mode: eager the first time a buffer set is seen, captured the second time,
+    replayed after; every call must leave the pool as the per-layer restore does, including
+    when the window buffers' contents (states, slot) change between replays."""
+    monkeypatch.setattr(spec_mod, "_ROLLBACK_MODE", "graph")
+    spec_mod._ROLLBACK_GRAPHS.clear()
+    spec_mod._ROLLBACK_SEEN.clear()
+    T = 4
+    new_pool = _pools(device="cuda")
+    new_stashes = _stashes(new_pool, T, device="cuda")
+    for step in range(4):
+        # new window contents in the same buffers, as a replayed verify graph leaves them
+        for s in new_stashes:
+            s.ht.normal_()
+            s.conv_in.normal_()
+            s.prev_conv.normal_()
+            s.slot.fill_(step % 4)
+        ref_pool = _pools(device="cuda")
+        ref_pool.conv_states.copy_(new_pool.conv_states)
+        ref_pool.recurrent_states.copy_(new_pool.recurrent_states)
+        ref_stashes = copy.copy(new_stashes)
+        ref_stashes = [SpecGdnStash(pool=ref_pool, li=s.li, slot=s.slot, prev_conv=s.prev_conv, conv_in=s.conv_in, ht=s.ht) for s in new_stashes]
+        for s in ref_stashes:
+            s.restore(accepted)
+        restore_gdn_stashes(new_stashes, accepted)
+        torch.cuda.synchronize()
+        assert torch.equal(ref_pool.conv_states, new_pool.conv_states), step
+        assert torch.equal(ref_pool.recurrent_states, new_pool.recurrent_states), step
+    assert len(spec_mod._ROLLBACK_GRAPHS) == 1  # captured once, replayed for steps 2 and 3
+
+
 def test_mixed_slots_fall_back_to_the_per_layer_restore():
     pool = _pools()
     stashes = _stashes(pool, 4)

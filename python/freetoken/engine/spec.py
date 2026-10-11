@@ -91,11 +91,55 @@ def rebuild_conv_state(prev_state: torch.Tensor, conv_in: torch.Tensor, accepted
     return cat[..., -width:].contiguous()
 
 
-# FREETOKEN_SPEC_ROLLBACK=batched: the stacked restore below. The default stays the per-layer
-# loop: on an RTX 2060 (Ornith, 30 GDN layers) the stacked version measured 3.1-3.4 ms against
-# the loop's 2.5-3.2 -- the stacks copy every layer's state slice once more, and that cost
-# more than the launches it saved. Kept for an A/B on a card with more bandwidth.
-_ROLLBACK_MODE = os.environ.get("FREETOKEN_SPEC_ROLLBACK", "loop")
+# FREETOKEN_SPEC_ROLLBACK: how the GDN states are rolled back after a verify window.
+#   graph (default): the per-layer restore, captured once per (window buffers, accepted count)
+#     into a CUDA graph and replayed. The restore is ~110 tiny launches per rank (18 layers x 6)
+#     and all of its 1.5 ms per window was host issue time (the GPU work is 0.2 ms); the verify
+#     window's stash tensors are the graph's static buffers, so the same restore recurs every
+#     step and a replay is one launch. A window whose buffers are new (the eager, uncaptured
+#     path) is restored eagerly; a graph is captured the second time a buffer set is seen.
+#   loop: the per-layer restore, eagerly.
+#   batched: one stacked restore (fewer launches, but its slot-equality checks are device
+#     syncs, and on an RTX 2060 it measured no faster than the loop).
+_ROLLBACK_MODE = os.environ.get("FREETOKEN_SPEC_ROLLBACK", "graph")
+_ROLLBACK_GRAPHS: dict = {}
+_ROLLBACK_SEEN: dict = {}
+
+
+def _rollback_key(stashes, accepted: int):
+    return (accepted, tuple(
+        (s.li, id(s.pool), s.slot.data_ptr(), s.prev_conv.data_ptr(), s.conv_in.data_ptr(), s.ht.data_ptr(), tuple(s.ht.shape))
+        for s in stashes))
+
+
+def _restore_graphed(stashes, accepted: int) -> None:
+    key = _rollback_key(stashes, accepted)
+    g = _ROLLBACK_GRAPHS.get(key)
+    if g is not None:
+        g.replay()
+        return
+    seen = _ROLLBACK_SEEN.get(key, 0) + 1
+    if len(_ROLLBACK_SEEN) > 256:  # eager windows bring fresh buffers every step; do not grow forever
+        _ROLLBACK_SEEN.clear()
+    _ROLLBACK_SEEN[key] = seen
+    if seen < 2 or not stashes[0].ht.is_cuda:
+        for s in stashes:
+            s.restore(accepted)
+        return
+    # the second time with these buffers: do the restore on a side stream (this step's effect),
+    # then capture the same ops into a graph for the steps after
+    cur = torch.cuda.current_stream()
+    side = torch.cuda.Stream()
+    side.wait_stream(cur)
+    with torch.cuda.stream(side):
+        for s in stashes:
+            s.restore(accepted)
+    cur.wait_stream(side)
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        for s in stashes:
+            s.restore(accepted)
+    _ROLLBACK_GRAPHS[key] = g
 
 
 def restore_gdn_stashes(stashes, accepted: int) -> None:
@@ -108,7 +152,10 @@ def restore_gdn_stashes(stashes, accepted: int) -> None:
     small launches plus Python)."""
     if not stashes:
         return
-    if _ROLLBACK_MODE != "batched":  # the per-layer restore (default; see _ROLLBACK_MODE)
+    if _ROLLBACK_MODE == "graph":
+        _restore_graphed(stashes, accepted)
+        return
+    if _ROLLBACK_MODE != "batched":  # the per-layer restore, eagerly
         for s in stashes:
             s.restore(accepted)
         return
