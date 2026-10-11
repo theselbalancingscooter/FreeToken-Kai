@@ -491,8 +491,9 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
         """Roll this rank's per-request state back to the first ``accepted`` rows of the verify
         window: GDN recurrent + conv states (from the layers' stashes) and the PLE n-gram
         context (from the host-side ids)."""
-        for stash in ctx.spec_stash:
-            stash.restore(accepted)
+        from freetoken.engine.spec import restore_gdn_stashes
+
+        restore_gdn_stashes(ctx.spec_stash, accepted)
         ctx.spec_stash = []
         if self.model._ple:
             from freetoken.engine.spec import ngram_context_after
@@ -501,10 +502,11 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
 
             req = batch.reqs[0]
             args = self._config.qwen4_args
-            ids = ngram_context_after(
-                req.input_ids.tolist(), req.spec_drafts, accepted,
-                args.ngram_size - 1, args.ngram_boundary_token_id,
-            )
+            ctx_len = args.ngram_size - 1
+            # only the tail can enter the context: converting the whole id list (a 25k-token
+            # prompt) to Python every window was a visible slice of the rollback
+            tail = req.input_ids[-(ctx_len + 1):].tolist()
+            ids = ngram_context_after(tail, req.spec_drafts, accepted, ctx_len, args.ngram_boundary_token_id)
             rewrite_ngram_context(_state_slot(req), ids)
 
     def forward(self) -> torch.Tensor:

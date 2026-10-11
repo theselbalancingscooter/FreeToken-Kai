@@ -314,8 +314,9 @@ class Qwen3_5ForCausalLM(BaseLLMModel):
     def spec_rollback(self, batch: Batch, accepted: int, ctx) -> None:
         """Roll the per-request state back to the first ``accepted`` rows of the verify window:
         the GDN recurrent + conv states, from the stashes the GDN ops recorded."""
-        for stash in ctx.spec_stash:
-            stash.restore(accepted)
+        from freetoken.engine.spec import restore_gdn_stashes
+
+        restore_gdn_stashes(ctx.spec_stash, accepted)
         ctx.spec_stash = []
 
     def forward(self) -> torch.Tensor:

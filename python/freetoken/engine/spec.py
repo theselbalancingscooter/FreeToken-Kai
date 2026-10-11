@@ -9,6 +9,7 @@ the GDN layer and the model.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import Sequence
 
@@ -78,6 +79,51 @@ def rebuild_conv_state(prev_state: torch.Tensor, conv_in: torch.Tensor, accepted
     return cat[..., -width:].contiguous()
 
 
+# FREETOKEN_SPEC_ROLLBACK=batched: the stacked restore below. The default stays the per-layer
+# loop: on an RTX 2060 (Ornith, 30 GDN layers) the stacked version measured 3.1-3.4 ms against
+# the loop's 2.5-3.2 -- the stacks copy every layer's state slice once more, and that cost
+# more than the launches it saved. Kept for an A/B on a card with more bandwidth.
+_ROLLBACK_MODE = os.environ.get("FREETOKEN_SPEC_ROLLBACK", "loop")
+
+
+def restore_gdn_stashes(stashes, accepted: int) -> None:
+    """Roll every GDN layer's state back to ``accepted`` rows of the verify window in a handful of
+    kernels instead of three per layer. All stashes of one window share the pool and the slot
+    (one request), so the conv states are rebuilt as one ``[L, dim, K-1]`` tensor and written
+    with one indexed store, and the recurrent states likewise; a window whose stashes do not
+    line up (several slots, several pools) falls back to the per-layer restore. On two RTX
+    3060s the per-layer loop was 1.7-1.8 ms of host time per rank per window (18 layers, 54
+    small launches plus Python)."""
+    if not stashes:
+        return
+    if _ROLLBACK_MODE != "batched":  # the per-layer restore (default; see _ROLLBACK_MODE)
+        for s in stashes:
+            s.restore(accepted)
+        return
+    first = stashes[0]
+    pool = first.pool
+    same = all(
+        s.pool is pool and s.slot.shape == first.slot.shape and bool((s.slot == first.slot).all())
+        and s.prev_conv.shape == first.prev_conv.shape and s.ht.shape == first.ht.shape
+        for s in stashes[1:]
+    )
+    if not same:
+        for s in stashes:
+            s.restore(accepted)
+        return
+    slot = first.slot.long()  # [1]
+    layers = torch.tensor([s.li for s in stashes], dtype=torch.long, device=slot.device)
+    width = first.prev_conv.shape[-1]
+    conv_dtype = pool.conv_states.dtype
+    prev = torch.stack([s.prev_conv[0] for s in stashes])  # [L, dim, K-1]
+    taken = torch.stack([s.conv_in[:accepted] for s in stashes]).to(conv_dtype).transpose(1, 2)  # [L, dim, accepted]
+    conv = torch.cat([prev.to(conv_dtype), taken], dim=-1)[..., -width:]
+    pool.conv_states[layers, slot] = conv
+    rec_dtype = pool.recurrent_states.dtype
+    ht = torch.stack([s.ht[accepted - 1] for s in stashes]).to(rec_dtype)  # [L, HV, V, K]
+    pool.recurrent_states[layers, slot] = ht.reshape(len(stashes), *pool.recurrent_states.shape[2:])
+
+
 def ngram_context_after(host_ids: Sequence[int], drafts: Sequence[int], accepted: int, ctx_len: int, boundary: int) -> list[int]:
     """PLE n-gram context (the last ``ctx_len`` processed ids) after ``accepted`` rows of the
     window ``[host_ids[-1], drafts...]`` were kept. ``host_ids`` is the request's committed
@@ -96,5 +142,6 @@ __all__ = [
     "spec_message_len",
     "pages_to_free",
     "rebuild_conv_state",
+    "restore_gdn_stashes",
     "ngram_context_after",
 ]
