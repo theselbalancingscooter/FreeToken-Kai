@@ -286,13 +286,13 @@ def recommend(model: str, *, extra_dirs: list[str] | None = None) -> dict:
         if one_card and q2_gguf:
             n = 3 * int(facts.get("num_experts") or 0)
             add("--moe-cache-size", str(n),
-                f"GPU に載せるエキスパートの枠を 3 層分（{n}）に固定します。Q2_0 の枠は NVFP4 の半分の大きさで、この数が 12 GB に入り、"
-                "プロンプト処理の 2 層分の二重バッファも取れます（3060 12GB 1 枚で生成 26.8 tok/s、2026-10-10）。",
-                f"Keep three layers of experts on the GPU ({n} slots): Q2_0 slots are half the size of NVFP4's, this many fit a 12 GB card, "
-                "and prompt processing gets its two-layer double buffer (26.8 tok/s generation on one 3060 12 GB, 2026-10-10).")
-            add("--moe-prefill-overlap", None,
-                "プロンプト処理のエキスパート転送を計算と重ね合わせます（枠が 2 層分あるときだけ）。",
-                "Overlap prompt processing's expert copies with its GEMMs (possible with two layers of slots).")
+                f"GPU に載せるエキスパートの枠を 3 層分（{n}）に固定します。Q2_0 の枠は NVFP4 の半分の大きさで、この数が 12 GB に入ります"
+                "（3060 12GB 1 枚で生成 26.8 tok/s、2026-10-10）。",
+                f"Keep three layers of experts on the GPU ({n} slots): Q2_0 slots are half the size of NVFP4's and this many fit a 12 GB card "
+                "(26.8 tok/s generation on one 3060 12 GB, 2026-10-10).")
+            add("--disable-moe-prefill-overlap", None,
+                "実測した構成のまま重ね合わせは切ります。枠 3 層分なら `--moe-prefill-overlap` で戻せますが、1 枚での効きは未計測です。",
+                "The overlap stays off, as measured; with three layers of slots `--moe-prefill-overlap` can turn it on, unmeasured on one card.")
         elif one_card:
             n = int(facts.get("num_experts") or 0)
             add("--moe-cache-size", str(n),
@@ -358,7 +358,9 @@ def recommend(model: str, *, extra_dirs: list[str] | None = None) -> dict:
             "プロンプト処理で GDN と attention だけをチャンクの中で 2 つに分け、チャンクを広げます（2060・Ornith で 490 → 649 tok/s、3060×2・Flash-Next で 437 → 546 tok/s の実測）。",
             "Runs GDN and attention over two pieces of each prefill chunk so the chunk can be wider (490 -> 649 tok/s on a 2060 with Ornith, 437 -> 546 on two 3060s with Flash-Next).")
     if facts.get("model_type") == "qwen4_exp":
-        if fp8_cores:
+        if fp8_cores or one_card:
+            # one card: fp8 is what started and measured (26.8 tok/s with the Q2_0 experts); Q8_0 is
+            # 6% more bytes and the one-card start that carried it ran out of VRAM while loading
             add("--dense-quant", "fp8",
                 "エキスパート以外の bf16 の重みを読み込み時に fp8 にします。常駐分が 1 枚あたり 4.9 → 2.9 GB になり、空いた VRAM がエキスパートの枠に回ります。",
                 "Quantizes the bf16 non-expert weights to fp8 at load: resident weights go from 4.9 to 2.9 GB per card, and the freed VRAM goes to the expert cache.")
@@ -377,13 +379,14 @@ def recommend(model: str, *, extra_dirs: list[str] | None = None) -> dict:
         add("--reasoning-budget", "6000",
             "2 bit の段は温度 0 で堂々巡りすることがあるので、思考を 6,000 トークンで打ち切って答えさせます。",
             "The 2-bit tier can think in circles at temperature 0; the thinking is cut at 6,000 tokens and the model answers from there.")
-        add("--spec-mtp", "5", "この段では MTP の窓の固定費を削ってあり、本物の答えで 23 → 37〜58 tok/s になります。",
-            "On this tier the verify window's fixed costs are cut: 23 -> 37-58 tok/s on real answers.")
-        add("--spec-min-p", "0.6", "ヘッドの確信度が 0.6 を下回った最初のドラフトで窓を切ります（文章で 37 → 62 tok/s）。",
-            "End a window at the first draft the head scores below 0.6 (prose: 37 -> 62 tok/s).")
-        if not fp8_cores:
-            add("--spec-draft-head-quant", "q4_0", "ドラフトの採点を 4 bit に詰めた lm_head の複製で行います（Q8_0 の dense と組で使います）。",
-                "Score the drafts through a 4-bit copy of the lm_head (paired with the Q8_0 dense weights).")
+        if not one_card:  # one card: MTP 3 measured no gain (27.4 against 26.8), MTP 5 fell to eager, and the head copy did not fit
+            add("--spec-mtp", "5", "この段では MTP の窓の固定費を削ってあり、本物の答えで 23 → 37〜58 tok/s になります。",
+                "On this tier the verify window's fixed costs are cut: 23 -> 37-58 tok/s on real answers.")
+            add("--spec-min-p", "0.6", "ヘッドの確信度が 0.6 を下回った最初のドラフトで窓を切ります（文章で 37 → 62 tok/s）。",
+                "End a window at the first draft the head scores below 0.6 (prose: 37 -> 62 tok/s).")
+            if not fp8_cores:
+                add("--spec-draft-head-quant", "q4_0", "ドラフトの採点を 4 bit に詰めた lm_head の複製で行います（Q8_0 の dense と組で使います）。",
+                    "Score the drafts through a 4-bit copy of the lm_head (paired with the Q8_0 dense weights).")
     if one_card:
         add("--prefill-chunk-budget", "0.75",
             "プロンプト処理の 1 チャンクが空き VRAM の 75% まで使えるようにします（2 枚構成で 510 → 700 tok/s の実測と同じ設定）。",

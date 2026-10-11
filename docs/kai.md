@@ -349,25 +349,27 @@ tower on the CPU that stopped, on 2026-09-23, stopped at its first generated tok
 timeline deadlock fixed in `82a8990`, not the context length.
 
 **One card with the 2.25-bit experts** (`--moe-expert-gguf`, [gguf.md](gguf.md)). The command
-above with the GGUF, `--moe-cache-size 1536` (Q2_0 slots are half the size, and 1,536 of them hold
-three layers where NVFP4's 512 held one) and `--moe-prefill-overlap`:
+above with the GGUF and `--moe-cache-size 1536` (Q2_0 slots are half the size of NVFP4's, so 1,536
+of them -- three layers -- take the VRAM that 512 NVFP4 slots took):
 
 ```bash
-ft serve   --model models/Qwen3.8-Flash-Next-NVFP4 --gpu 0 --host 0.0.0.0 --port 1919   --moe-expert-gguf models/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf   --moe-strategy hybrid --moe-cpu-layers auto --moe-cpu-threads 7 --ple-backend disk --dense-quant q8_0   --moe-cache-size 1536 --moe-prefill-overlap --kv-cache-dtype q4_0 --num-tokens 135168 --max-seq-len-override 131072   --host-embedding --max-running-req 1 --memory-ratio 0.95 --prefill-mixer-pieces 2 --max-prefill-length 8192 --prefill-chunk-budget 0.75   --spec-mtp 3 --spec-draft-head-quant q4_0 --reasoning-budget 6000
+ft serve   --model models/Qwen3.8-Flash-Next-NVFP4 --gpu 0 --host 0.0.0.0 --port 1919   --moe-expert-gguf models/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf   --moe-strategy hybrid --moe-cpu-layers auto --moe-cpu-threads 7 --ple-backend disk --dense-quant fp8   --moe-cache-size 1536 --disable-moe-prefill-overlap   --kv-cache-dtype q4_0 --num-tokens 135168 --max-seq-len-override 131072   --host-embedding --max-running-req 1 --memory-ratio 0.95   --prefill-mixer-pieces 2 --max-prefill-length 8192 --prefill-chunk-budget 0.75 --reasoning-budget 6000
 ```
 
-Measured so far (2026-10-10, before the window work and with the overlap still off): plain decode
-**26.8 tok/s** (NVFP4 one card: 19.2; two cards with Q2_0: 22.8), the 34 GB of banks inside the pin
-budget so no layer decodes on the CPU, prompt processing 202 tok/s, and a 25k-token prompt that
-died in its second 7,168-token chunk at `--prefill-chunk-budget 0.75`. The two causes are fixed
-(2026-10-12): the startup probe that sizes the chunk measured a short forward's split path, not
-the whole-layer path a chunk takes, so it under-sized the transient on a card with 1.8 GiB free
-(`FREETOKEN_PREFILL_PROBE_PATH=auto` is the old measurement; on an RTX 2060 with Ornith the probe already took the whole-layer path, so nothing changed there); and the overlap flag
-above did not exist -- the one-card profile fixes `--disable-moe-prefill-overlap` for NVFP4's
-one-layer cache, and with it the 33 GB of expert rows a chunk streams (48 layers x 0.69 GB) wait on
-the GEMMs instead of hiding under them. What that is worth on the card has not been measured:
-the two-card rank reads 16.5 GiB per chunk in 2.8 s under its GEMMs, so the one-card chunk should
-land near the sum of its GEMMs (about twice a two-card rank's 3 s) once the copies overlap.
+Measured (2026-10-10): plain decode **26.8 tok/s** (NVFP4 one card: 19.2; two cards with Q2_0:
+22.8), the 34 GB of banks inside the pin budget so no layer decodes on the CPU, `--spec-mtp 3` at the
+same 27.4 (`--spec-mtp 5` did not get its graphs' VRAM and fell to 13.4), prompt processing 202
+tok/s, and a 25k-token prompt that died in its second 7,168-token chunk at
+`--prefill-chunk-budget 0.75`. The chunk failure's cause is fixed (2026-10-12): the startup probe
+that sizes the chunk measured a short forward's split path, not the whole-layer path a chunk
+takes, and under-sized the transient on a card with 1.8 GiB free
+(`FREETOKEN_PREFILL_PROBE_PATH=auto` is the old measurement). The 202 tok/s is the one-layer
+profile's `--disable-moe-prefill-overlap`: with 1,536 slots the two-layer double buffer fits, and
+`--moe-prefill-overlap` (new, the later flag wins) turns it back on, which should let the 33 GB of
+expert rows a chunk streams (48 layers x 0.69 GB) hide under the GEMMs as they do on two cards.
+**Neither fix has been measured on the card.** The one attempt stacked Q8_0 dense weights, the
+4-bit draft head and `--spec-mtp 3` on this command at once and ran out of VRAM while loading the
+weights, so those three stay off it: the measured one-card command is the one above.
 
 The console's **Recommended** proposes these flags when the model is Qwen3.8-Flash-Next and there
 is one card whose VRAM the non-expert weights nearly fill; with `--num-tokens` set, the benchmark

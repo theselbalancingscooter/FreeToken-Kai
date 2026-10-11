@@ -183,7 +183,7 @@ def test_flash_next_on_one_12gb_card(tmp_path, monkeypatch):
     assert f["--max-seq-len-override"] == str(ctx) and f["--num-tokens"] == str(ctx + 8192)
     assert "--kv-reserve-tokens" not in f
     assert "--host-embedding" in f and f["--memory-ratio"] == "0.95"
-    assert f["--dense-quant"] == "q8_0" and f["--prefill-mixer-pieces"] == "2"
+    assert f["--dense-quant"] == "fp8" and f["--prefill-mixer-pieces"] == "2"  # one card: the measured configuration
 
 
 def test_the_q2_gguf_next_to_the_checkpoint_proposes_the_fast_tier(tmp_path, monkeypatch):
@@ -197,10 +197,11 @@ def test_the_q2_gguf_next_to_the_checkpoint_proposes_the_fast_tier(tmp_path, mon
     assert f["--moe-expert-gguf"].endswith("Q2_0-00001-of-00002.gguf")
     assert f["--reasoning-budget"] == "6000" and f["--spec-mtp"] == "5" and f["--spec-min-p"] == "0.6"
     assert f["--spec-draft-head-quant"] == "q4_0" and f["--dense-quant"] == "q8_0"
-    # one card: three layers of Q2_0 slots and the overlap back on
+    # one card: three layers of Q2_0 slots, otherwise the configuration that measured (fp8 dense, no MTP, overlap off)
     _host(monkeypatch, [("NVIDIA GeForce RTX 3060", 12, 8.6)], ram_gib=128, cores=8)
     f = _flags(rec.recommend(model))
-    assert f["--moe-cache-size"] == str(3 * 512) and "--moe-prefill-overlap" in f and "--disable-moe-prefill-overlap" not in f
+    assert f["--moe-cache-size"] == str(3 * 512) and "--disable-moe-prefill-overlap" in f and "--moe-prefill-overlap" not in f
+    assert f["--dense-quant"] == "fp8" and "--spec-mtp" not in f and "--spec-draft-head-quant" not in f and "--moe-expert-gguf" in f
     # the fast tier is not forced on a card with fp8 tensor cores' draft head
     _host(monkeypatch, [("NVIDIA GeForce RTX 4090", 24, 8.9)] * 2, ram_gib=128, cores=8)
     f = _flags(rec.recommend(model))
