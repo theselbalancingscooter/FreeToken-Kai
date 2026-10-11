@@ -387,7 +387,11 @@ def recommend(model: str, *, extra_dirs: list[str] | None = None) -> dict:
             if not fp8_cores:
                 add("--spec-draft-head-quant", "q4_0", "ドラフトの採点を 4 bit に詰めた lm_head の複製で行います（Q8_0 の dense と組で使います）。",
                     "Score the drafts through a 4-bit copy of the lm_head (paired with the Q8_0 dense weights).")
-    if one_card:
+    if one_card and q2_gguf:
+        add("--prefill-chunk-budget", "0.5",
+            "1 枚に Q2_0 のエキスパートのとき、チャンクに空き VRAM の 50% まで。75% では 25k トークンのプロンプトが途中のチャンクで VRAM 切れになりました（3 回）。50% は 4,608 トークンのチャンクで最後まで読めます（202 tok/s）。",
+            "With the Q2_0 experts on one card, let a prefill chunk take 50% of the free VRAM: at 75% a 25k-token prompt ran out of VRAM in a later chunk (three runs); at 50% it read to the end in 4,608-token chunks (202 tok/s).")
+    elif one_card:
         add("--prefill-chunk-budget", "0.75",
             "プロンプト処理の 1 チャンクが空き VRAM の 75% まで使えるようにします（2 枚構成で 510 → 700 tok/s の実測と同じ設定）。",
             "Let one prefill chunk use 75% of the free VRAM (the setting measured at 510 -> 700 tok/s on two cards).")

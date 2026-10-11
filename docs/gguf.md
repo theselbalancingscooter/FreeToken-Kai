@@ -68,12 +68,14 @@ wall, not the kernel. On the ten prompts with `--reasoning-budget 6000` the Q2_0
 budget). `FREETOKEN_DENSE_QUANT_HC=1` kept 10 of 10 but did not shorten the window: leave it off.
 
 One card: the 34 GB of Q2_0 banks fit a 12 GB card's host pin budget where the NVFP4 banks did not,
-so every layer decodes on the GPU and plain decode measured 26.8 tok/s against the NVFP4 tier's 19.2
-(2026-10-10, 1,536 cache slots, fp8 dense, no MTP); prompt processing was 202 tok/s under the
-one-card profile's `--disable-moe-prefill-overlap`, and `--moe-prefill-overlap` (which 1,536 slots
-allow) has not been measured there. The two-card configuration above does not fit one card: with
-Q8_0 dense weights, the 4-bit draft head and MTP added, the one-card start ran out of VRAM while
-loading. [kai.md](kai.md#running-qwen38-flash-next-on-one-rtx-3060-12-gb) has the one-card command.
+so every layer decodes on the GPU and plain decode measured 26.8-27.8 tok/s against the NVFP4 tier's
+19.2 (1,536 cache slots, fp8 dense, no MTP). Prompt processing stays at 200-233 tok/s there, and it
+is not the expert transfer: with `--moe-prefill-overlap` the 31.6 GiB a 7,168-token chunk streams
+crossed in 1.5 s and the chunk still took 31 s. Use `--prefill-chunk-budget 0.5` on one card (at
+0.75 a 25k-token prompt runs out of VRAM in a later chunk). The two-card configuration above does
+not fit one card: with Q8_0 dense weights, the 4-bit draft head and MTP added, the one-card start
+ran out of VRAM while loading. [kai.md](kai.md#running-qwen38-flash-next-on-one-rtx-3060-12-gb) has
+the one-card command.
 
 A caution for benchmarks: a 1,500-token greedy generation with EOS ignored runs past the answer
 into repetition, whose draft acceptance (2.2-3.7 tokens a step) depends on which repetition the

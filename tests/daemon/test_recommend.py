@@ -202,6 +202,7 @@ def test_the_q2_gguf_next_to_the_checkpoint_proposes_the_fast_tier(tmp_path, mon
     f = _flags(rec.recommend(model))
     assert f["--moe-cache-size"] == str(3 * 512) and "--disable-moe-prefill-overlap" in f and "--moe-prefill-overlap" not in f
     assert f["--dense-quant"] == "fp8" and "--spec-mtp" not in f and "--spec-draft-head-quant" not in f and "--moe-expert-gguf" in f
+    assert f["--prefill-chunk-budget"] == "0.5"  # 0.75 ran out of VRAM in a later chunk of a 25k-token prompt
     # the fast tier is not forced on a card with fp8 tensor cores' draft head
     _host(monkeypatch, [("NVIDIA GeForce RTX 4090", 24, 8.9)] * 2, ram_gib=128, cores=8)
     f = _flags(rec.recommend(model))

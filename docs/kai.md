@@ -353,23 +353,25 @@ above with the GGUF and `--moe-cache-size 1536` (Q2_0 slots are half the size of
 of them -- three layers -- take the VRAM that 512 NVFP4 slots took):
 
 ```bash
-ft serve   --model models/Qwen3.8-Flash-Next-NVFP4 --gpu 0 --host 0.0.0.0 --port 1919   --moe-expert-gguf models/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf   --moe-strategy hybrid --moe-cpu-layers auto --moe-cpu-threads 7 --ple-backend disk --dense-quant fp8   --moe-cache-size 1536 --disable-moe-prefill-overlap   --kv-cache-dtype q4_0 --num-tokens 135168 --max-seq-len-override 131072   --host-embedding --max-running-req 1 --memory-ratio 0.95   --prefill-mixer-pieces 2 --max-prefill-length 8192 --prefill-chunk-budget 0.75 --reasoning-budget 6000
+ft serve   --model models/Qwen3.8-Flash-Next-NVFP4 --gpu 0 --host 0.0.0.0 --port 1919   --moe-expert-gguf models/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf   --moe-strategy hybrid --moe-cpu-layers auto --moe-cpu-threads 7 --ple-backend disk --dense-quant fp8   --moe-cache-size 1536 --disable-moe-prefill-overlap   --kv-cache-dtype q4_0 --num-tokens 135168 --max-seq-len-override 131072   --host-embedding --max-running-req 1 --memory-ratio 0.95   --prefill-mixer-pieces 2 --max-prefill-length 8192 --prefill-chunk-budget 0.5 --reasoning-budget 6000
 ```
 
-Measured (2026-10-10): plain decode **26.8 tok/s** (NVFP4 one card: 19.2; two cards with Q2_0:
-22.8), the 34 GB of banks inside the pin budget so no layer decodes on the CPU, `--spec-mtp 3` at the
-same 27.4 (`--spec-mtp 5` did not get its graphs' VRAM and fell to 13.4), prompt processing 202
-tok/s, and a 25k-token prompt that died in its second 7,168-token chunk at
-`--prefill-chunk-budget 0.75`. The chunk failure's cause is fixed (2026-10-12): the startup probe
-that sizes the chunk measured a short forward's split path, not the whole-layer path a chunk
-takes, and under-sized the transient on a card with 1.8 GiB free
-(`FREETOKEN_PREFILL_PROBE_PATH=auto` is the old measurement). The 202 tok/s is the one-layer
-profile's `--disable-moe-prefill-overlap`: with 1,536 slots the two-layer double buffer fits, and
-`--moe-prefill-overlap` (new, the later flag wins) turns it back on, which should let the 33 GB of
-expert rows a chunk streams (48 layers x 0.69 GB) hide under the GEMMs as they do on two cards.
-**Neither fix has been measured on the card.** The one attempt stacked Q8_0 dense weights, the
-4-bit draft head and `--spec-mtp 3` on this command at once and ran out of VRAM while loading the
-weights, so those three stay off it: the measured one-card command is the one above.
+Measured: plain decode **26.8-27.8 tok/s** (2026-10-10 and 2026-10-12; NVFP4 one card: 19.2; two
+cards with Q2_0: 22.8), the 34 GB of banks inside the pin budget so no layer decodes on the CPU,
+the expert cache hitting 60% with 1,536 slots; `--spec-mtp 3` at the same 27.4 (`--spec-mtp 5` did
+not get its graphs' VRAM and fell to 13.4), and the one-card start does not have room for the
+two-card tier's Q8_0 dense weights and 4-bit draft head on top (it ran out of VRAM while loading).
+
+Prompt processing is the one-card weak point and it is not the expert transfer: with
+`--moe-prefill-overlap` (new; the one-layer profile above turns the double buffer off, 1,536 slots
+allow it) the 31.6 GiB of expert rows a 7,168-token chunk streams crossed in 1.52 s at 20.8 GiB/s,
+and the chunk still took 30.8 s -- **233 tok/s**, the same as without the overlap (202-203). The
+time is in the chunk's GPU work and host, not identified. And at `--prefill-chunk-budget 0.75` a
+25k-token prompt dies in a later chunk out of VRAM (three runs; the startup probe now measures the
+whole-layer path, which did not change the 7,168-token chunk it solves here). **Use
+`--prefill-chunk-budget 0.5` on one card**: 4,608-token chunks, a 25k-token prompt read to the end at
+202 tok/s (2026-10-10). So one card with the 2.25-bit experts is a 27 tok/s generator that reads a
+long prompt at a fifth of the two-card rate; the two cards are the configuration for long prompts.
 
 The console's **Recommended** proposes these flags when the model is Qwen3.8-Flash-Next and there
 is one card whose VRAM the non-expert weights nearly fill; with `--num-tokens` set, the benchmark
