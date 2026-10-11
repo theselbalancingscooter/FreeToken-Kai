@@ -50,13 +50,27 @@ returns `</think>` and the model answers from what it has; 0 (the default) leave
 And prefer the checkpoint's recommended sampling (`--sampling-defaults model`, the default) to
 greedy for the same reason.
 
-Speed on two RTX 3060s (`--pp-size 2`, hybrid, `--spec-mtp 5`): decode 28 tok/s (NVFP4: 19-20), the
-verify window 108 ms of which the experts are 11 ms and the dense fixed cost 22; prefill of a
-25k-token prompt 1,010 tok/s (NVFP4: 575-700; the 4-token tile: 829; MMVQ alone: 264). A 3,840-token
-chunk now spends 2.6-3.1 s on the GPU against 2.8 s moving 16.5 GiB of experts over the second
-card's x4 link, so the transfer is the next wall, not the kernel. On the same ten prompts with
-`--reasoning-budget 6000` the Q2_0 tier answered 10 of 10; the budget fired once (a translation
-that had thought for 6,000 tokens answered correctly from there).
+Speed on two RTX 3060s (`--pp-size 2`, hybrid). The configuration that measured best, and the one
+to start from:
+
+```
+--moe-expert-gguf <shard 1> --dense-quant q8_0 --spec-draft-head-quant q4_0 --spec-mtp 5 --spec-min-p 0.6 --reasoning-budget 6000
+```
+
+With it (2026-10-12) the ten reference prompts answer at 37-58 tok/s (the NVFP4 tier: 23-28), the
+K=3 verify window takes 70 ms against 80-83 with fp8 dense and the chunked window conv (the
+window's experts 5 ms, the dense 5, the rest small kernels and the host), and `--spec-min-p 0.6`
+over K=5 wrote prose at 62 tok/s where fixed K=3 wrote 37. Prefill of a 25k-token prompt
+1,070-1,135 tok/s (NVFP4: 575-700). A 3,840-token chunk spends 2.6-3.1 s on the GPU against
+2.8 s moving 16.5 GiB of experts over the second card's x4 link, so the transfer is the next
+wall, not the kernel. On the ten prompts with `--reasoning-budget 6000` the Q2_0 tier answered
+9 or 10 of 10 across runs (the miss, when it happens, is a translation that thinks past the
+budget). `FREETOKEN_DENSE_QUANT_HC=1` kept 10 of 10 but did not shorten the window: leave it off.
+
+A caution for benchmarks: a 1,500-token greedy generation with EOS ignored runs past the answer
+into repetition, whose draft acceptance (2.2-3.7 tokens a step) depends on which repetition the
+text drifts into, and a change in the last bits of the arithmetic (a kernel's summation order)
+changes that drift. Compare window times, or answers that stop at EOS, not such tok/s figures.
 
 Refused: experts whose ggml type varies by layer (every "UD" community build), IQ types (codebooks),
 and anything that is not Q2_0 or Q4_0.
