@@ -710,6 +710,8 @@ class Engine:
         self._draft_head = None  # (packed rows, kind, vocab) under --spec-draft-head-quant
         self._spec_profiler = None
         self._spec_graph = None  # SpecVerifyGraph once captured (end of __init__)
+        self._spec_graphs: dict = {}  # width -> SpecVerifyGraph (--spec-min-p: every width 2..K+1)
+        self.spec_min_p = float(getattr(config, "spec_min_p", 0.0) or 0.0)
         self._mtp_raw: Dict[str, torch.Tensor] = {}
         self._mtp_bank_host: Dict[str, torch.Tensor] | None = None
         self._mtp_bank_bytes = 0
@@ -1162,6 +1164,7 @@ class Engine:
         from .spec_graph import SpecVerifyGraph
 
         self._spec_graph = None
+        self._spec_graphs = {}
         if os.environ.get("FT_SPEC_NO_GRAPH") == "1":
             logger.info("--spec-mtp: FT_SPEC_NO_GRAPH=1, the verify window stays eager")
             return
@@ -1196,6 +1199,22 @@ class Engine:
                 sg.g_window = sg.g_chain = None
                 if self.moe_offload_cache is not None:
                     self.moe_offload_cache.reset()
+        self._spec_graphs = {rows: sg}
+        if self.spec_min_p > 0:
+            # a draft list the head cut short gives a window of 2..K rows: one graph per width,
+            # sharing the K+1 graph's pool and draft buffers (they never replay together)
+            for r in range(rows - 1, 1, -1):
+                try:
+                    self.attn_backend.init_spec_capture(r)
+                    g = SpecVerifyGraph(self, r, primary=sg)
+                    g.capture()
+                    if sg.mtp_ready:
+                        g.capture_mtp()
+                    self._spec_graphs[r] = g
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(f"--spec-mtp: the {r}-row window graph failed, that width stays eager: {exc!r}")
+                    if self.moe_offload_cache is not None:
+                        self.moe_offload_cache.reset()
         # The window graph keeps the K+1 per-token GDN states of every layer resident (~250 MB
         # for a 30-layer GDN stack at K=3). On a card that is left with almost no free VRAM after
         # that, the eager parts of every step (sampling, staging, the offload cache's fetches)
@@ -1212,6 +1231,7 @@ class Engine:
                 "(FT_SPEC_GRAPH_MIN_FREE_MB=0 keeps them)"
             )
             self._spec_graph = None
+            self._spec_graphs = {}
             del sg
             gc.collect()
             torch.cuda.empty_cache()
@@ -2149,7 +2169,7 @@ class Engine:
         # one per real request in decode (padding rows never leave the GPU)
         rows = batch.input_ids.numel() if batch.is_prefill else batch.size
         # the captured K+1-row verify window (engine/spec_graph); shorter windows stay eager
-        sg = self._spec_graph
+        sg = self._spec_graphs.get(rows) if (batch.spec_verify and self._spec_graphs) else self._spec_graph
         if sg is not None and not (batch.spec_verify and spec_graph_applicable(batch, rows, sg.rows)):
             sg = None
         # diagnostics: cross-check a one-row verify window against the plain decode path
@@ -2496,7 +2516,17 @@ class Engine:
         if not draft:
             return []
         h = h_all[row : row + 1]
-        d = int(self.draft_logits(mtp.to_head(h)).argmax(dim=-1).item())
+        min_p = self.spec_min_p
+
+        def score(hh):
+            logits = self.draft_logits(mtp.to_head(hh))
+            d = int(logits.argmax(dim=-1).item())
+            p = float(torch.softmax(logits.float(), dim=-1).amax().item()) if min_p > 0 else 1.0
+            return d, p
+
+        d, p = score(h)
+        if min_p > 0 and p < min_p:
+            return []
         drafts = [d]
         if prof is not None:
             prof.mark("mtp_window")
@@ -2508,7 +2538,9 @@ class Engine:
             mini = self._mtp_step_batch(req, p, d, rope_delta=delta)
             with self.ctx.forward_batch(mini):
                 h = mtp.forward(h, mini.input_ids, mini)
-            d = int(self.draft_logits(mtp.to_head(h)).argmax(dim=-1).item())
+            d, p = score(h)
+            if min_p > 0 and p < min_p:
+                break
             drafts.append(d)
         if prof is not None:
             prof.mark("mtp_chain")

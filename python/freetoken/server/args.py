@@ -378,6 +378,18 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--spec-min-p",
+        type=float,
+        default=0.0,
+        help=(
+            "With --spec-mtp: stop drafting at the first draft whose head probability is below "
+            "this, so a window is as long as the head is confident (Strata's rule; its calibration "
+            "picks 0.70). The verify window then varies from 2 to K+1 rows and a CUDA graph is "
+            "captured for every width, sharing one memory pool. 0 keeps the fixed K drafts."
+        ),
+    )
+
+    parser.add_argument(
         "--pp-layers",
         type=str,
         default=None,

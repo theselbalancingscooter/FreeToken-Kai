@@ -532,7 +532,10 @@ class QSASparseAttnBackend(BaseAttnBackend):
         width = get_global_ctx().page_table.shape[1]
         pages = -(-width // self.page_size)
         dev = self.device
-        self._spec = {
+        specs = getattr(self, "_specs", None)
+        if specs is None:
+            specs = self._specs = {}  # one set per window width (--spec-min-p: 2..K+1 rows)
+        specs[rows] = self._spec = {
             "block_table": torch.zeros((1, pages), dtype=torch.int32, device=dev),
             "kvlen": torch.zeros(1, dtype=torch.int32, device=dev),
             "table_idx": torch.zeros(1, dtype=torch.int32, device=dev),
@@ -541,11 +544,11 @@ class QSASparseAttnBackend(BaseAttnBackend):
             "last": torch.tensor([rows - 1], dtype=torch.int32, device=dev),
         }
 
-    def stage_spec(self, md, *, table_idx: int, kv_len: int) -> None:
+    def stage_spec(self, md, *, table_idx: int, kv_len: int, rows: int | None = None) -> None:
         """Copy this step's window addressing into the static spec buffers and point ``md``
         at them (the captured kernels read the buffers; an eager forward on the same batch,
         e.g. the draft head, reads them through ``md`` too)."""
-        s = getattr(self, "_spec", None)
+        s = getattr(self, "_specs", {}).get(rows) if rows is not None else getattr(self, "_spec", None)
         assert s is not None, "init_spec_capture() first"
         assert isinstance(md, QSASparseMetadata)
         idx = torch.tensor([table_idx], dtype=torch.int64, device=self.device)

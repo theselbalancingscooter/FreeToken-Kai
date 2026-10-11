@@ -39,6 +39,18 @@ def accept_drafts(sampled: Sequence[int], drafts: Sequence[int]) -> list[int]:
     return [int(t) for t in sampled[: m + 1]]
 
 
+def cut_drafts(drafts: Sequence[int], probs: Sequence[float], min_p: float) -> list[int]:
+    """--spec-min-p: keep the drafts up to (not including) the first one the head scored below
+    ``min_p``; everything after a doubtful draft would be verified against a token that is
+    probably wrong anyway. ``min_p <= 0`` keeps them all."""
+    out = []
+    for d, p in zip(drafts, probs):
+        if min_p > 0 and p < min_p:
+            break
+        out.append(int(d))
+    return out
+
+
 def pack_spec_message(result: SpecResult, k: int) -> torch.Tensor:
     """Fixed-length int32 vector ``[a, tok_0..tok_k (pad -1), d_1..d_k (pad -1)]`` for the
     pipeline ranks (same size every step, so the receiver needs no header)."""
@@ -143,5 +155,6 @@ __all__ = [
     "pages_to_free",
     "rebuild_conv_state",
     "restore_gdn_stashes",
+    "cut_drafts",
     "ngram_context_after",
 ]

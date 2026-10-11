@@ -170,6 +170,8 @@ class EngineConfig:
     spec_mtp: int = 0
     # --spec-draft-head-quant: the MTP drafts score through this copy of the lm_head (none/q4_0/q8_0)
     spec_draft_head_quant: str = "none"
+    # --spec-min-p: a draft whose head probability is below this ends the window (0 = fixed K)
+    spec_min_p: float = 0.0
     # --host-embedding: keep the input embedding table in pinned host memory (the GPU gathers
     # rows in place); ~1 GB of VRAM back for KV pages on a 250k-vocabulary model. Applies to
     # the rank that owns the embedding (rank 0 under the pipeline engine).

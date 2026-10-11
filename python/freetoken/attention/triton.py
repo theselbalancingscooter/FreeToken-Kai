@@ -380,7 +380,10 @@ class TritonAttentionBackend(BaseAttnBackend):
         token->request map, and the prefix length. Restaged per replay by ``stage_spec``."""
         width = get_global_ctx().page_table.shape[1]
         dev = self.device
-        self._spec = {
+        specs = getattr(self, "_specs", None)
+        if specs is None:
+            specs = self._specs = {}  # one set per window width (--spec-min-p: 2..K+1 rows)
+        specs[rows] = self._spec = {
             "rows": rows,
             "indices": torch.zeros(width, dtype=torch.int32, device=dev),
             "indptr": torch.zeros(2, dtype=torch.int32, device=dev),
@@ -389,11 +392,11 @@ class TritonAttentionBackend(BaseAttnBackend):
             "q_to_req": torch.zeros(rows, dtype=torch.int32, device=dev),
         }
 
-    def stage_spec(self, md, *, table_idx: int, kv_len: int) -> None:
+    def stage_spec(self, md, *, table_idx: int, kv_len: int, rows: int | None = None) -> None:
         """Copy this step's window addressing into the static spec buffers and point ``md``
         at them (the captured kernels read the buffers; an eager forward on the same batch,
         e.g. the draft head, reads them through ``md`` too)."""
-        s = getattr(self, "_spec", None)
+        s = getattr(self, "_specs", {}).get(rows) if rows is not None else getattr(self, "_spec", None)
         assert s is not None, "init_spec_capture() first"
         assert isinstance(md, TritonMetadata) and not md.is_decode
         rows = s["rows"]

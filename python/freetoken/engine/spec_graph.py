@@ -59,9 +59,12 @@ def spec_graph_applicable(batch: Batch, rows: int, graph_rows: int) -> bool:
 
 
 class SpecVerifyGraph:
-    def __init__(self, engine: "Engine", rows: int) -> None:
+    def __init__(self, engine: "Engine", rows: int, primary: "SpecVerifyGraph | None" = None) -> None:
         self.engine = engine
         self.rows = rows
+        # --spec-min-p: the shorter windows are captured after the K+1 one and share its memory
+        # pool (they never replay together) and its draft-head buffers / chain graph
+        self.primary = primary
         dev = engine.device
         i32 = torch.int32
         self.input_ids = torch.zeros(rows, dtype=i32, device=dev)
@@ -113,7 +116,7 @@ class SpecVerifyGraph:
         attn = self.engine.attn_backend
         if getattr(batch, "attn_metadata", None) is None:
             attn.prepare_metadata(batch)
-        attn.stage_spec(batch.attn_metadata, table_idx=table_idx, kv_len=kv_len)
+        attn.stage_spec(batch.attn_metadata, table_idx=table_idx, kv_len=kv_len, rows=self.rows)
 
     # ----- capture ----------------------------------------------------------------------------
     def capture(self) -> None:
@@ -159,7 +162,8 @@ class SpecVerifyGraph:
                 # capture_mtp): a plan left by the warm run is skipped and then read from
                 # tensors the warm run owned
                 eng.attn_backend.reset_forward_plan(batch)
-                with torch.cuda.graph(graph, stream=eng.stream):
+                pool = self.primary.graph.pool() if self.primary is not None and self.primary.graph is not None else None
+                with torch.cuda.graph(graph, pool=pool, stream=eng.stream):
                     self.out.copy_(model.forward())
                 self.stash = list(ctx.spec_stash)
                 ctx.spec_stash = []
@@ -212,12 +216,29 @@ class SpecVerifyGraph:
         assert mtp is not None and self._capture_batch is not None and self.hidden is not None
         dev, rows = eng.device, self.rows
         width = self.hidden.shape[-1]  # the head's input width (hidden, or hc * hidden)
+        K = eng.spec_k
         self.next_ids = torch.zeros(rows, dtype=torch.int32, device=dev)
-        self.row_idx = torch.zeros(1, dtype=torch.int64, device=dev)
-        self.h_in = torch.zeros(1, width, dtype=self.hidden.dtype, device=dev)
-        self.d_buf = torch.zeros(1, dtype=torch.int64, device=dev)
+        prim = self.primary
+        if prim is not None and prim.mtp_ready:
+            # the shorter windows draft through the primary's buffers and chain graph
+            self.row_idx, self.h_in, self.d_buf, self.p_buf = prim.row_idx, prim.h_in, prim.d_buf, prim.p_buf
+            self.d_hist, self.p_hist = prim.d_hist, prim.p_hist
+        else:
+            self.row_idx = torch.zeros(1, dtype=torch.int64, device=dev)
+            self.h_in = torch.zeros(1, width, dtype=self.hidden.dtype, device=dev)
+            self.d_buf = torch.zeros(1, dtype=torch.int64, device=dev)
+            self.p_buf = torch.zeros(1, dtype=torch.float32, device=dev)  # the head's probability of d_buf
+            self.d_hist = torch.zeros(max(K, 1), dtype=torch.int64, device=dev)  # the window's drafts, read back once
+            self.p_hist = torch.zeros(max(K, 1), dtype=torch.float32, device=dev)
         torch.cuda.synchronize(dev)
         free_before = torch.cuda.mem_get_info(dev)[0]
+        want_p = eng.spec_min_p > 0
+
+        def score(h: torch.Tensor) -> None:
+            logits = eng.draft_logits(mtp.to_head(h))
+            self.d_buf.copy_(logits.argmax(dim=-1))
+            if want_p:
+                self.p_buf.copy_(torch.softmax(logits.float(), dim=-1).amax(dim=-1))
 
         # -- window: the verify batch's static metadata (the window graph's capture batch) --
         batch = self._capture_batch
@@ -225,7 +246,7 @@ class SpecVerifyGraph:
         def window():
             r = mtp.forward(self.hidden, self.next_ids, batch)
             self.h_in.copy_(r.index_select(0, self.row_idx))
-            self.d_buf.copy_(eng.draft_logits(mtp.to_head(self.h_in)).argmax(dim=-1))
+            score(self.h_in)
 
         g_window = torch.cuda.CUDAGraph()
         with ctx.forward_batch(batch):
@@ -235,8 +256,22 @@ class SpecVerifyGraph:
             # for it: without this the capture would skip the plan and bake in the warm run's
             # tensors (freed as soon as the metadata moves on -- an illegal access, later).
             attn.reset_forward_plan(batch)
-            with torch.cuda.graph(g_window, stream=eng.stream):
+            wpool = prim.g_window.pool() if prim is not None and prim.g_window is not None else None
+            with torch.cuda.graph(g_window, pool=wpool, stream=eng.stream):
                 window()
+        if prim is not None and prim.mtp_ready:
+            # one chain step serves every width: it starts from h_in / d_buf, which are shared
+            for name in ("g_chain", "chain_batch", "c_pos", "c_rope", "c_out_loc", "c_ids", "c_table"):
+                setattr(self, name, getattr(prim, name))
+            self.g_window = g_window
+            if eng.moe_offload_cache is not None:
+                eng.moe_offload_cache.reset()
+            torch.cuda.synchronize(dev)
+            logger.info(
+                f"--spec-mtp: captured the {rows}-row window's draft pass "
+                f"({mem_GB(free_before - torch.cuda.mem_get_info(dev)[0])} of graph memory, sharing the chain step)"
+            )
+            return
 
         # -- chain step: a one-token decode of the head at a staged position --
         cached = 64
@@ -268,7 +303,7 @@ class SpecVerifyGraph:
         def chain():
             r = mtp.forward(self.h_in, self.c_ids, mini)
             self.h_in.copy_(r)
-            self.d_buf.copy_(eng.draft_logits(mtp.to_head(self.h_in)).argmax(dim=-1))
+            score(self.h_in)
 
         g_chain = torch.cuda.CUDAGraph()
         with ctx.forward_batch(mini):
@@ -286,8 +321,10 @@ class SpecVerifyGraph:
             f"({mem_GB(free_before - free_after)} of graph memory, free {mem_GB(free_after)})"
         )
 
-    def _stage_chain(self, req: Req, position: int, token: int, rope_delta: int) -> None:
-        """Point the chain graph at ``position`` of ``req`` with the previous draft as input."""
+    def _stage_chain(self, req: Req, position: int, token: int | None = None, rope_delta: int = 0) -> None:
+        """Point the chain graph at ``position`` of ``req``. Its input token is the previous draft:
+        ``token`` when the caller has it on the host, else straight from ``d_buf`` on the device
+        (no host round trip per step)."""
         eng = self.engine
         mini = self.chain_batch
         assert mini is not None
@@ -300,7 +337,10 @@ class SpecVerifyGraph:
             self.c_rope.fill_(position + rope_delta)
         self.c_out_loc.copy_(eng.page_table[req.table_idx, position : position + 1])
         self.c_table.fill_(req.table_idx)
-        self.c_ids.fill_(token)
+        if token is not None:
+            self.c_ids.fill_(token)
+        else:
+            self.c_ids.copy_(self.d_buf)
         # the backend moves the captured decode metadata to this position and copies the
         # addressing into its capture buffers (in place for qsa_sparse: the chain graph reads
         # that metadata object's tensors; a rebuilt object would leave the graph on freed ones)
@@ -312,21 +352,44 @@ class SpecVerifyGraph:
         position; returns the greedy drafts."""
         eng = self.engine
         assert self.mtp_ready
+        min_p = eng.spec_min_p
         self.next_ids.copy_(torch.tensor(next_ids, dtype=torch.int32))
         self.row_idx.fill_(row)
         self.g_window.replay()
-        d = int(self.d_buf.item())
-        drafts = [d]
         if prof is not None:
             prof.mark("mtp_window")
+        if min_p > 0:
+            # --spec-min-p: read each draft's probability and stop at the first doubtful one
+            # (the chain steps it would have run are the cost the rule saves)
+            d, p = int(self.d_buf.item()), float(self.p_buf.item())
+            if p < min_p:
+                return []
+            drafts = [d]
+            for j in range(1, eng.spec_k):
+                pos = pos_row + j
+                if pos + 1 > (req.spec_alloc_len or 0):
+                    break  # no reserved KV page for this draft position
+                self._stage_chain(req, pos, rope_delta=rope_delta)
+                self.g_chain.replay()
+                d, p = int(self.d_buf.item()), float(self.p_buf.item())
+                if p < min_p:
+                    break
+                drafts.append(d)
+            if prof is not None:
+                prof.mark("mtp_chain")
+            return drafts
+        # fixed K: the chain runs on the device end to end, the drafts come back in one read
+        self.d_hist[0:1].copy_(self.d_buf)
+        n = 1
         for j in range(1, eng.spec_k):
-            p = pos_row + j
-            if p + 1 > (req.spec_alloc_len or 0):
+            pos = pos_row + j
+            if pos + 1 > (req.spec_alloc_len or 0):
                 break  # no reserved KV page for this draft position
-            self._stage_chain(req, p, d, rope_delta)
+            self._stage_chain(req, pos, rope_delta=rope_delta)
             self.g_chain.replay()
-            d = int(self.d_buf.item())
-            drafts.append(d)
+            self.d_hist[j:j + 1].copy_(self.d_buf)
+            n += 1
+        drafts = [int(d) for d in self.d_hist[:n].tolist()]
         if prof is not None:
             prof.mark("mtp_chain")
         return drafts
