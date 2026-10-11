@@ -891,8 +891,33 @@ int64_t ggml_moe_get_block_size(int64_t type) {
 // ---- FreeToken pybind bindings (donor registers these via TORCH_LIBRARY; we
 // expose them through torch.utils.cpp_extension.load's pybind module instead) ----
 #include <torch/extension.h>
+// FreeToken: the dense Q8_0 MMQ split nsplit ways over K (fp32 partials, one reduce); the few-row
+// GEMMs of a verify window are too few blocks for the card otherwise.
+torch::Tensor ggml_mul_mat_a8_splitk(torch::Tensor W, torch::Tensor X, int64_t type, int64_t row, int64_t nsplit) {
+  TORCH_CHECK(type == 8, "ggml_mul_mat_a8_splitk: only Q8_0 (type 8)");
+  TORCH_CHECK(nsplit >= 1 && nsplit <= 16, "nsplit out of range");
+  int col = X.sizes()[1];
+  int padded = (col + 512 - 1) / 512 * 512;
+  int batch = X.sizes()[0];
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(X));
+  auto options = torch::TensorOptions().dtype(X.dtype()).device(W.device());
+  at::Tensor Y = torch::empty({batch, row}, options);
+  at::Tensor partial = torch::empty({nsplit, batch, row}, torch::TensorOptions().dtype(torch::kFloat32).device(W.device()));
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+  options = torch::TensorOptions().dtype(torch::kInt32).device(W.device());
+  at::Tensor quant_X = torch::empty({batch, padded / 32 * 9}, options);
+  DISPATCH_FLOAT_TYPES(X.scalar_type(), "ggml_mul_mat_a8_splitk", [&] {
+    quantize_row_q8_1_cuda((scalar_t*)X.data_ptr(), (void*)quant_X.data_ptr(), col, batch, stream);
+    ggml_mul_mat_q8_0_q8_1_splitk_cuda<scalar_t>(
+        (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (float*)partial.data_ptr(), (scalar_t*)Y.data_ptr(),
+        col, row, batch, padded, row, (int)nsplit, stream);
+  });
+  return Y;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("ggml_dequantize", &ggml_dequantize, "");
+  m.def("ggml_mul_mat_a8_splitk", &ggml_mul_mat_a8_splitk, "");
   m.def("ggml_mul_mat_vec_a8", &ggml_mul_mat_vec_a8, "");
   m.def("ggml_mul_mat_a8", &ggml_mul_mat_a8, "");
   m.def("ggml_moe_a8", &ggml_moe_a8, "");

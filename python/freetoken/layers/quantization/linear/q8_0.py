@@ -32,6 +32,31 @@ def mmvq_max_rows() -> int:
     return int(os.environ.get("FREETOKEN_Q8_0_MMVQ_MAX_ROWS", "1") or 1)
 
 
+def splitk_for(rows: int, n: int, k: int) -> int:
+    """How many ways to split K for the tiled MMQ: enough blocks for about six per SM
+    (FREETOKEN_Q8_0_SPLITK fixes it; 1 = never). A 2,560-row projection over 5..8 rows is
+    40 blocks of the 8-row tile -- one short wave on a 28..30-SM card; split four ways it
+    ran 10..25% faster on an RTX 2060. At 4 rows the 4-row tile is launch-bound and the
+    split neither helps nor hurts; past 180 blocks it is not applied."""
+    forced = os.environ.get("FREETOKEN_Q8_0_SPLITK")
+    if forced:
+        return max(1, int(forced))
+    tile_rows = 64 if rows > 4 else 32
+    blocks = -(-n // tile_rows) * -(-rows // (8 if rows > 4 else 4))
+    want = -(-6 * _sm_count() // max(blocks, 1))
+    kblocks = k // 128  # warp steps of 4 Q8_0 blocks; a split takes at least one
+    return int(max(1, min(want, 8, kblocks)))
+
+
+_SMS = [0]
+
+
+def _sm_count() -> int:
+    if not _SMS[0]:
+        _SMS[0] = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    return _SMS[0]
+
+
 def mmq_max_rows() -> int:
     """Rows up to which the tiled int8 MMQ serves; above it the weight is dequantized once and
     cuBLAS runs the GEMM on tensor cores (FREETOKEN_Q8_0_MMQ_MAX_ROWS, default 64)."""
@@ -49,7 +74,7 @@ class GgmlQ8_0LinearKernel(LinearKernel):
         return None
 
     def apply(self, layer: Any, x: torch.Tensor) -> torch.Tensor:
-        from freetoken.kernel.gguf import ggml_dequantize, ggml_mul_mat_a8, ggml_mul_mat_vec_a8
+        from freetoken.kernel.gguf import ggml_dequantize, ggml_mul_mat_a8, ggml_mul_mat_a8_splitk, ggml_mul_mat_vec_a8
         from freetoken.models.gguf.dequant import GGML_Q8_0
 
         *lead, K = x.shape
@@ -61,7 +86,11 @@ class GgmlQ8_0LinearKernel(LinearKernel):
         if kernels_ok and rows <= mmvq_max_rows():
             out = ggml_mul_mat_vec_a8(layer.weight, x2, GGML_Q8_0, N)
         elif kernels_ok and rows <= mmq_max_rows():
-            out = ggml_mul_mat_a8(layer.weight, x2, GGML_Q8_0, N)
+            nsplit = splitk_for(rows, N, K)
+            if nsplit > 1:
+                out = ggml_mul_mat_a8_splitk(layer.weight, x2, GGML_Q8_0, N, nsplit)
+            else:
+                out = ggml_mul_mat_a8(layer.weight, x2, GGML_Q8_0, N)
         else:
             w = ggml_dequantize(layer.weight, GGML_Q8_0, N, K, x2.dtype)
             out = x2 @ w.t()

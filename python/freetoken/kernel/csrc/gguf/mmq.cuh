@@ -129,6 +129,141 @@ static __device__ __forceinline__ void mul_mat_q(
   }
 }
 
+// FreeToken: the same tile kernel over a slice of K (blockIdx.z), writing fp32 partials that a
+// reduce sums. A few-row GEMM over 2,560 output rows is 80 blocks on a 28-SM card and runs at
+// half the bandwidth; split four ways it is 320.
+template <
+    typename scalar_t,
+    int qk,
+    int qr,
+    int qi,
+    bool need_sum,
+    typename block_q_t,
+    int mmq_x,
+    int mmq_y,
+    int nwarps,
+    allocate_tiles_cuda_t allocate_tiles,
+    load_tiles_cuda_t load_tiles,
+    int vdr,
+    vec_dot_q_mul_mat_cuda_t vec_dot>
+static __device__ __forceinline__ void mul_mat_q_splitk(
+    const void* __restrict__ vx,
+    const void* __restrict__ vy,
+    float* __restrict__ partial,  // [gridDim.z, ncols_dst, nrows_dst]
+    const int ncols_x,
+    const int nrows_x,
+    const int ncols_y,
+    const int nrows_y,
+    const int nrows_dst) {
+  const block_q_t* x = (const block_q_t*)vx;
+  const block_q8_1* y = (const block_q8_1*)vy;
+
+  const int blocks_per_row_x = ncols_x / qk;
+  const int blocks_per_col_y = nrows_y / QK8_1;
+  const int blocks_per_warp = WARP_SIZE_GGUF / qi;
+
+  const int& ncols_dst = ncols_y;
+
+  const auto row_dst_0 = blockIdx.x * mmq_y;
+  const int& row_x_0 = row_dst_0;
+
+  const auto col_dst_0 = blockIdx.y * mmq_x;
+  const int& col_y_0 = col_dst_0;
+
+  int* tile_x_ql = nullptr;
+  half2* tile_x_dm = nullptr;
+  int* tile_x_qh = nullptr;
+  int* tile_x_sc = nullptr;
+
+  allocate_tiles(&tile_x_ql, &tile_x_dm, &tile_x_qh, &tile_x_sc);
+
+  __shared__ int tile_y_qs[mmq_x * WARP_SIZE_GGUF];
+  __shared__ half2 tile_y_ds[mmq_x * WARP_SIZE_GGUF / QI8_1];
+
+  float sum[mmq_y / WARP_SIZE_GGUF][mmq_x / nwarps] = {{0.0f}};
+
+  // this block's share of the K blocks: contiguous, a multiple of blocks_per_warp
+  const int per_split = ((blocks_per_row_x + gridDim.z - 1) / gridDim.z + blocks_per_warp - 1) / blocks_per_warp * blocks_per_warp;
+  const int ib_begin = blockIdx.z * per_split;
+  const int ib_end = min(blocks_per_row_x, ib_begin + per_split);
+  for (int ib0 = ib_begin; ib0 < ib_end; ib0 += blocks_per_warp) {
+    load_tiles(
+        x + row_x_0 * blocks_per_row_x + ib0,
+        tile_x_ql,
+        tile_x_dm,
+        tile_x_qh,
+        tile_x_sc,
+        threadIdx.y,
+        nrows_x - row_x_0 - 1,
+        threadIdx.x,
+        blocks_per_row_x);
+
+#pragma unroll
+    for (int ir = 0; ir < qr && ib0 + ir * blocks_per_warp / qr < blocks_per_row_x; ++ir) {
+      const auto kqs = ir * WARP_SIZE_GGUF + threadIdx.x;
+      const int kbxd = kqs / QI8_1;
+
+#pragma unroll
+      for (int i = 0; i < mmq_x; i += nwarps) {
+        const int col_y_eff = min(col_y_0 + threadIdx.y + i, ncols_y - 1);  // to prevent out-of-bounds memory accesses
+        const block_q8_1* by0 = &y[col_y_eff * blocks_per_col_y + ib0 * (qk / QK8_1) + kbxd];
+        const int index_y = (threadIdx.y + i) * WARP_SIZE_GGUF + kqs % WARP_SIZE_GGUF;
+        tile_y_qs[index_y] = get_int_from_int8_aligned(by0->qs, threadIdx.x % QI8_1);
+      }
+
+#pragma unroll
+      for (int ids0 = 0; ids0 < mmq_x; ids0 += nwarps * QI8_1) {
+        const int ids = (ids0 + threadIdx.y * QI8_1 + threadIdx.x / (WARP_SIZE_GGUF / QI8_1)) % mmq_x;
+        const auto kby = threadIdx.x % (WARP_SIZE_GGUF / QI8_1);
+        const int col_y_eff = min(col_y_0 + ids, ncols_y - 1);
+
+        // if the sum is not needed it's faster to transform the scale to f32 ahead of time
+        const half2* dsi_src =
+            &y[col_y_eff * blocks_per_col_y + ib0 * (qk / QK8_1) + ir * (WARP_SIZE_GGUF / QI8_1) + kby].ds;
+        half2* dsi_dst = &tile_y_ds[ids * (WARP_SIZE_GGUF / QI8_1) + kby];
+        if (need_sum) {
+          *dsi_dst = *dsi_src;
+        } else {
+          float* dfi_dst = (float*)dsi_dst;
+          *dfi_dst = __low2float(*dsi_src);
+        }
+      }
+
+      __syncthreads();
+
+      // #pragma unroll // unrolling this loop causes too much register pressure
+      for (int k = ir * WARP_SIZE_GGUF / qr; k < (ir + 1) * WARP_SIZE_GGUF / qr; k += vdr) {
+#pragma unroll
+        for (int j = 0; j < mmq_x; j += nwarps) {
+#pragma unroll
+          for (int i = 0; i < mmq_y; i += WARP_SIZE_GGUF) {
+            sum[i / WARP_SIZE_GGUF][j / nwarps] += vec_dot(
+                tile_x_ql, tile_x_dm, tile_x_qh, tile_x_sc, tile_y_qs, tile_y_ds, threadIdx.x + i, threadIdx.y + j, k);
+          }
+        }
+      }
+      __syncthreads();
+    }
+  }
+
+#pragma unroll
+  for (int j = 0; j < mmq_x; j += nwarps) {
+    const auto col_dst = col_dst_0 + j + threadIdx.y;
+    if (col_dst >= ncols_dst) {
+      return;
+    }
+
+#pragma unroll
+    for (int i = 0; i < mmq_y; i += WARP_SIZE_GGUF) {
+      const auto row_dst = row_dst_0 + threadIdx.x + i;
+      if (row_dst >= nrows_dst) {
+        continue;
+      }
+      partial[((size_t)blockIdx.z * ncols_dst + col_dst) * nrows_dst + row_dst] = sum[i / WARP_SIZE_GGUF][j / nwarps];
+    }
+  }
+}
+
 #if defined(USE_ROCM)
 #define MMQ_X_Q4_0 64
 #define MMQ_Y_Q4_0 128
@@ -558,6 +693,57 @@ static void ggml_mul_mat_q8_0_q8_1_cuda(
     mul_mat_q8_0<scalar_t, need_check>
         <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
   }
+}
+
+
+template <typename scalar_t, bool need_check>
+static __global__ void mul_mat_q8_0_splitk(
+    const void* __restrict__ vx, const void* __restrict__ vy, float* __restrict__ partial,
+    const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
+  mul_mat_q_splitk<scalar_t, QK8_0, QR8_0, QI8_0, false, block_q8_0, MMQ_X_Q8_0, MMQ_Y_Q8_0, NWARPS_Q8_0,
+                   allocate_tiles_q8_0<MMQ_Y_Q8_0>, load_tiles_q8_0<MMQ_Y_Q8_0, NWARPS_Q8_0, need_check>,
+                   VDR_Q8_0_Q8_1_MMQ, vec_dot_q8_0_q8_1_mul_mat>(vx, vy, partial, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+}
+
+template <typename scalar_t, bool need_check>
+static __global__ void mul_mat_q8_0_w8_splitk(
+    const void* __restrict__ vx, const void* __restrict__ vy, float* __restrict__ partial,
+    const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
+  mul_mat_q_splitk<scalar_t, QK8_0, QR8_0, QI8_0, false, block_q8_0, MMQ_X_Q8_0_W8, MMQ_Y_Q8_0_W8, NWARPS_Q8_0_W8,
+                   allocate_tiles_q8_0<MMQ_Y_Q8_0_W8>, load_tiles_q8_0<MMQ_Y_Q8_0_W8, NWARPS_Q8_0_W8, need_check>,
+                   VDR_Q8_0_Q8_1_MMQ, vec_dot_q8_0_q8_1_mul_mat>(vx, vy, partial, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+}
+
+template <typename scalar_t>
+static __global__ void splitk_sum_kernel(const float* __restrict__ partial, scalar_t* __restrict__ dst, const int nsplit, const int numel) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= numel) return;
+  float acc = 0.0f;
+  for (int z = 0; z < nsplit; ++z) acc += partial[(size_t)z * numel + i];
+  dst[i] = (scalar_t)acc;
+}
+
+template <typename scalar_t>
+static void ggml_mul_mat_q8_0_q8_1_splitk_cuda(
+    const void* vx, const void* vy, float* partial, scalar_t* dst,
+    const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst,
+    const int nsplit, cudaStream_t stream) {
+  const bool wide = ncols_y > MMQ_X_Q8_0;
+  const int mmq_x = wide ? MMQ_X_Q8_0_W8 : MMQ_X_Q8_0;
+  const int mmq_y = wide ? MMQ_Y_Q8_0_W8 : MMQ_Y_Q8_0;
+  const int nwarps = wide ? NWARPS_Q8_0_W8 : NWARPS_Q8_0;
+  const dim3 block_nums((nrows_x + mmq_y - 1) / mmq_y, (ncols_y + mmq_x - 1) / mmq_x, nsplit);
+  const dim3 block_dims(WARP_SIZE_GGUF, nwarps, 1);
+  const bool check = nrows_x % mmq_y != 0;
+  if (wide) {
+    if (check) mul_mat_q8_0_w8_splitk<scalar_t, true><<<block_nums, block_dims, 0, stream>>>(vx, vy, partial, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+    else mul_mat_q8_0_w8_splitk<scalar_t, false><<<block_nums, block_dims, 0, stream>>>(vx, vy, partial, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+  } else {
+    if (check) mul_mat_q8_0_splitk<scalar_t, true><<<block_nums, block_dims, 0, stream>>>(vx, vy, partial, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+    else mul_mat_q8_0_splitk<scalar_t, false><<<block_nums, block_dims, 0, stream>>>(vx, vy, partial, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+  }
+  const int numel = ncols_y * nrows_dst;
+  splitk_sum_kernel<scalar_t><<<(numel + 255) / 256, 256, 0, stream>>>(partial, dst, nsplit, numel);
 }
 
 #if defined(USE_ROCM)

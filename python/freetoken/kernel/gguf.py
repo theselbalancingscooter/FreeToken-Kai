@@ -97,6 +97,14 @@ def ggml_mul_mat_a8(
     return _module().ggml_mul_mat_a8(weight, x, quant_type, row)
 
 
+def ggml_mul_mat_a8_splitk(
+    weight: torch.Tensor, x: torch.Tensor, quant_type: int, row: int, nsplit: int
+) -> torch.Tensor:
+    """The dense Q8_0 MMQ split ``nsplit`` ways over K (fp32 partials + one reduce): more blocks
+    for the few-row GEMMs of a verify window. ``quant_type`` must be Q8_0."""
+    return _module().ggml_mul_mat_a8_splitk(weight, x, quant_type, row, nsplit)
+
+
 def ggml_moe_a8(
     x: torch.Tensor,
     weight: torch.Tensor,

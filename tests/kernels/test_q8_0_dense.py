@@ -110,6 +110,24 @@ def test_a_row_length_off_the_kernel_step_takes_the_dequant_path_and_stays_finit
         assert (out - ref).abs().max() / ref.abs().max() < 2e-2
 
 
+@pytest.mark.parametrize("rows", [2, 4, 6, 8, 40])
+@pytest.mark.parametrize("nsplit", [2, 3, 4, 8])
+def test_splitk_mmq_equals_the_plain_one(rows, nsplit):
+    from freetoken.kernel.gguf import ggml_mul_mat_a8, ggml_mul_mat_a8_splitk
+    from freetoken.models.gguf.dequant import GGML_Q8_0, quantize_q8_0
+
+    torch.manual_seed(rows * 10 + nsplit)
+    N, K = 1280, 2560
+    w = torch.randn(N, K, device="cuda", dtype=torch.bfloat16) * 0.02
+    q = quantize_q8_0(w)
+    x = torch.randn(rows, K, device="cuda", dtype=torch.bfloat16)
+    plain = ggml_mul_mat_a8(q, x, GGML_Q8_0, N).float()
+    split = ggml_mul_mat_a8_splitk(q, x, GGML_Q8_0, N, nsplit).float()
+    ref = x.float() @ w.float().t()
+    assert (split - plain).abs().max() / ref.abs().max() < 2e-3
+    assert (split - ref).abs().max() / ref.abs().max() < 2e-2
+
+
 def test_leading_dims_and_non_contiguous_input():
     torch.manual_seed(5)
     N, K = 256, 512
