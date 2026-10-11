@@ -13,7 +13,7 @@ import math
 import os
 import subprocess
 
-from .models import resolve_model
+from .models import q2_gguf_for, resolve_model
 
 GiB = 1 << 30
 # Qwen3.8-Flash-Next on one card whose VRAM the non-expert weights nearly fill (a 3060 12 GB):
@@ -161,32 +161,6 @@ def expert_bytes(facts: dict) -> int:
 
 
 # ------------------------------------------------------------------ the recommendation
-def q2_gguf_for(path: str) -> str | None:
-    """The Q2_0 GGUF of this checkpoint's experts, when one sits next to it: a sibling directory
-    whose name starts with the checkpoint's own (its quantization suffix dropped) and contains
-    "GGUF", holding ``*Q2_0*.gguf`` (shard 1 of a split). None when there is none."""
-    path = os.path.normpath(path)
-    base = os.path.basename(path)
-    stem = base
-    for suffix in ("-NVFP4", "-FP8", "-MXFP4", "-AWQ", "-GPTQ", "-bf16", "-BF16"):
-        if stem.endswith(suffix):
-            stem = stem[: -len(suffix)]
-    parent = os.path.dirname(path)
-    try:
-        siblings = sorted(os.listdir(parent))
-    except OSError:
-        return None
-    for d in siblings:
-        full = os.path.join(parent, d)
-        if d == base or not d.startswith(stem) or "GGUF" not in d.upper() or not os.path.isdir(full):
-            continue
-        for root, _, files in os.walk(full):
-            hits = sorted(f for f in files if f.endswith(".gguf") and "Q2_0" in f.upper() and ("-00001-of-" in f or "-of-" not in f))
-            if hits:
-                return os.path.join(root, hits[0])
-    return None
-
-
 def recommend(model: str, *, extra_dirs: list[str] | None = None) -> dict:
     """{flags: [...], notes: [{flag, why}], host: {...}} — the flags a person would otherwise
     have to read the guides for. Each note says why, so nothing has to be taken on faith."""

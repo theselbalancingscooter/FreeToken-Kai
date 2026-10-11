@@ -37,6 +37,21 @@ def models(tmp_path, monkeypatch):
     return root
 
 
+def test_the_q2_gguf_next_to_a_flash_next_checkpoint_is_its_expert_tier_not_a_model(models):
+    from freetoken.webui.models import list_models
+
+    flash = _model_dir(models, "Qwen3.8-Flash-Next-NVFP4")
+    (flash / "config.json").write_text(json.dumps({"architectures": ["X"], "model_type": "qwen4_exp"}))
+    g = models / "Qwen3.8-Flash-Next-GSQ-RCO-GGUF" / "Q2_0"
+    g.mkdir(parents=True)
+    (g / "Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00002-of-00002.gguf").write_bytes(b"0")
+    (g / "Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf").write_bytes(b"0")
+    listed = {m["name"]: m for m in list_models()}
+    assert "Qwen3.8-Flash-Next-GSQ-RCO-GGUF" not in listed  # the GGUF folder is not a model
+    assert listed["Qwen3.8-Flash-Next-NVFP4"]["expert_gguf"].endswith("Q2_0-00001-of-00002.gguf")
+    assert "expert_gguf" not in listed["Ornith-1.5-35B-A3B-NVFP4"]
+
+
 def test_bare_name_resolves_to_the_local_folder(models):
     assert resolve_model("Ornith-1.5-35B-A3B-NVFP4") == str(models / "Ornith-1.5-35B-A3B-NVFP4")
 

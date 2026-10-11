@@ -18,7 +18,7 @@
   ],
   "flags": {
     "--dtype": {"cat": "model", "ja": "重みと計算のデータ型。", "more": "auto なら FP32/FP16 のモデルは FP16、BF16 のモデルは BF16 で動きます。BF16 のモデルに float16 を指定すると、読み込み時に変換用のコピーが増えて、小さいカードでは入らないことがあります。"},
-    "--dense-quant": {"cat": "model", "ja": "エキスパート以外の重み（attention・GDN・共有エキスパート・出力層）を読み込み時に FP8 に量子化する。", "more": "fp8 にすると、その部分の VRAM と 1 トークンあたりの読み出し量がおよそ半分になります。すでに量子化されている層はそのままです。"},
+    "--dense-quant": {"cat": "model", "ja": "エキスパート以外の重み（attention・GDN・共有エキスパート・出力層）を読み込み時に fp8 か ggml Q8_0 に量子化する。", "more": "どちらもその部分の VRAM と 1 トークンあたりの読み出し量がおよそ半分になります。fp8 のテンソルコアが無いカード（RTX 30・20）では q8_0 の int8 カーネルが fp8 より速く、Q2_0 のエキスパートと組む推奨構成も q8_0 です。すでに量子化されている層はそのままです。"},
     "--quant-backend": {"cat": "model", "ja": "量子化された層の計算に使うカーネルを層の種類ごとに指定する。", "more": "例: linear=marlin,moe=b12x。書かなかった種類は自動で選ばれます。普段は指定しません。"},
     "--host-embedding": {"cat": "model", "ja": "入力の埋め込み表を GPU ではなく RAM に置く。", "more": "表のぶんの VRAM（語彙 25 万なら約 1 GB）が空き、KV に回せます。小さいカード向け。Qwen3.5-MoE 系（Flash-Next、Ornith など）だけで使えます。"},
     "--model-source": {"cat": "model", "ja": "モデルをダウンロードする場所（Hugging Face か ModelScope）。", "more": "ローカルのフォルダを指定するときは関係ありません。"},
@@ -59,7 +59,9 @@
     "--moe-cpu-layers": {"cat": "moe", "ja": "offload・hybrid のとき、GPU を使わず CPU で計算する MoE 層。", "more": "層番号のリスト（3,7,11）、個数（8）、auto が指定できます。WSL のように RAM の固定に上限がある環境で使います。"},
     "--moe-hybrid-max-fetch": {"cat": "moe", "ja": "hybrid のとき、1 層・1 ステップで GPU に転送するエキスパートの上限。", "more": "残りは CPU で計算します。-1 は帯域のベンチ結果から自動。"},
     "--disable-moe-prefill-overlap": {"cat": "prefill", "ja": "プロンプト処理でエキスパートのコピーを 2 バッファで重ねる処理を切る。", "more": "重ねると速くなりますが VRAM が余計に要ります。6 GB のカードでは入らないので付けています。"},
+    "--moe-prefill-overlap": {"cat": "prefill", "ja": "起動スクリプトやプロファイルが --disable-moe-prefill-overlap を付けた後で、重ね合わせを戻す（後に書いた方が勝つ）。", "more": "枠（--moe-cache-size）がエキスパート数の 2 倍以上あるときだけ使えます。Q2_0 のエキスパートなら 12 GB の 1 枚でも 1,536 枠で足ります（1 枚のプロンプト処理の壁は転送ではなかったので、速さは変わりませんでした）。"},
     "--moe-prefill-hit-d2d": {"cat": "prefill", "ja": "プロンプト処理のとき、GPU にすでにあるエキスパートは GPU 内でコピーし、足りないものだけ転送する。", "more": "CUDA 13.0 以上が必要。--moe-cache-size がエキスパート数の 2 倍より大きいときに効きます。"},
+    "--moe-expert-gguf": {"cat": "moe", "ja": "ルーティングされるエキスパートだけを llama.cpp 形式（GGUF、ggml Q2_0 = 2.25 bit）のファイルから読む「速さの段」。dense 重み・PLE・視覚塔は --model のチェックポイントのまま。", "more": "ISTA-DASLab の Qwen3.8-Flash-Next GSQ-RCO の Q2_0（シャード 1 を指定）。バンクが 63.5 GiB → 34 GB、1 トークンあたりの読みが半分、同じ VRAM に 2 倍のエキスパートが入ります。答えは変わります（参照 10 問で 9/10、思考は 35% 長い）。正確さが要るときは外して NVFP4 のまま。モデル一覧には出ません（モデルではなく、Flash-Next に足す段です）。隣に GGUF があれば「エキスパート」の選択で切り替えられます。"},
 
     "--moe-bank-ram": {"cat": "bank", "ja": "エキスパートを置く RAM の上限（例: 48G）。超えたぶんは SSD 上のファイルから読む。", "more": "よく使うエキスパートが RAM 側に来るように並べます（--moe-bank-stats があれば実測の頻度で）。NVMe が前提。pp のときは 2 ランクで分け合います。"},
     "--moe-bank-stats": {"cat": "bank", "ja": "--moe-bank-ram で RAM に置くエキスパートを選ぶための、使用回数の記録ファイル。", "more": "--moe-stats-out で作ったものを渡します。無いと使用頻度を考えずに並べます。"},
@@ -72,7 +74,10 @@
     "--prefill-chunk-budget": {"cat": "prefill", "ja": "プロンプト処理 1 チャンクの作業領域に使ってよい、空き VRAM の割合。チャンク幅を自動で決める。", "more": "既定 0.55。0 にすると自動決定を切って --max-prefill-length をそのまま使います。"},
     "--prefill-mixer-pieces": {"cat": "prefill", "ja": "プロンプト処理の各チャンクで、GDN と attention をいくつかに分けて計算する。", "more": "小さいカードでチャンク幅を広げられ、プロンプト処理が速くなります。2060 で +47% の実測。既定 1（分けない）。"},
 
-    "--spec-mtp": {"cat": "generate", "ja": "モデル自身の MTP ヘッドで下書きを K 個作り、まとめて検証して生成を速くする（投機的デコード）。", "more": "0 で無効。1 リクエストずつ処理する前提なので --max-running-requests 1 と一緒に使います。"},
+    "--spec-mtp": {"cat": "generate", "ja": "モデル自身の MTP ヘッドで下書きを K 個作り、まとめて検証して生成を速くする（投機的デコード）。", "more": "0 で無効。1 リクエストずつ処理する前提なので --max-running-requests 1 と一緒に使います。Q2_0 のエキスパートと Q8_0 の dense では窓の固定費を削ってあり、3060×2 で本物の答えが 23 → 37〜58 tok/s になります。"},
+    "--spec-min-p": {"cat": "generate", "ja": "MTP の下書きのうち、ヘッドの確信度がこの値を下回った最初のもので窓を切る（可変の窓）。", "more": "0.6 を 5 トークンの窓に掛けると、文章で 37 → 62 tok/s（3060×2・Q2_0）。確信のある区間は K 個全部、怪しい区間は短く検証します。0 で固定の窓。"},
+    "--spec-draft-head-quant": {"cat": "generate", "ja": "MTP の下書きの採点を、4 bit（q4_0）か 8 bit（q8_0）に詰めた出力層の複製で行う。", "more": "下書きは本体が何を検証するかを決めるだけなので、粗くしても答えは変わらず、受理率が落ちるだけです。bf16 か Q8_0 の出力層から詰めること（fp8 の出力層から詰めると文章の受理が 2 割落ちました）。"},
+    "--reasoning-budget": {"cat": "generate", "ja": "思考（<think> と </think> の間）に使えるトークン数の上限。上限で </think> を強制し、そこまでの内容で答えさせる。", "more": "2 bit のエキスパート（Q2_0）で温度 0 のとき、まれに堂々巡りして max_tokens まで考え続けるのを切るためのもの。0 で無制限。リクエスト側の reasoning_budget でも指定できます。Qwen3 系（単一トークンの <think>）だけに効きます。"},
     "--max-running-requests": {"cat": "generate", "ja": "同時に処理するリクエストの最大数。", "more": "既定 4。VRAM が小さいとき、--spec-mtp を使うときは 1。"},
     "--max-output-tokens": {"cat": "generate", "ja": "リクエストが出力の上限を指定しなかったときの、出力トークン数の上限。", "more": "指定しなければ 32k。"},
     "--sampling-defaults": {"cat": "generate", "ja": "リクエストが温度などを指定しなかったときに使う値の出どころ。", "more": "model はモデル付属の generation_config.json の値（推論モデルの繰り返しを防ぐので推奨）。none はフレームワークの既定値。"},

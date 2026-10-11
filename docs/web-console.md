@@ -71,7 +71,11 @@ A profile is a model, a port and the flags for `ft serve`, kept in `~/.freetoken
 
 - **Model**: picked from `~/models`, the directories in `$FREETOKEN_MODELS_DIRS` and the Hugging
   Face cache. A bare folder name is resolved against the local directories on save, so it is never
-  sent to the hub as a repository id.
+  sent to the hub as a repository id. A Q2_0 GGUF of the model's experts is not listed as a model
+  -- `ft serve --model` stays the checkpoint -- but when one sits next to the checkpoint
+  (`<name>…GGUF/…/<name>…Q2_0….gguf`), an **Experts** choice appears under the model: the
+  checkpoint's own (the accurate tier) or the Q2_0 GGUF (the fast tier, [gguf.md](gguf.md)), which
+  adds `--moe-expert-gguf` and `--reasoning-budget 6000` to the flags.
 - **Flags**: picked from `ft serve`'s own argument parser, grouped by what they touch, with the
   description of the selected flag in the right pane. A `ft serve` line from a launch script can be
   pasted in.

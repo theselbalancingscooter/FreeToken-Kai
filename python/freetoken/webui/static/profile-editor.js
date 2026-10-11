@@ -92,6 +92,13 @@ const FTProfileEditor = (() => {
         <select id="pe-model" style="width:100%;margin-top:2px"><option value="">${esc(t("pe_model_loading"))}</option></select>
         <input type="text" id="pe-model-path" style="width:100%;margin-top:6px" hidden placeholder="${esc(t("pe_model_ph"))}">
         <div id="pe-model-info" class="muted" style="margin-top:4px"></div>
+        <div id="pe-tier-row" class="small" style="margin-top:6px" hidden>${esc(t("pe_tier"))}
+          <select id="pe-tier" style="width:100%;margin-top:2px">
+            <option value="ckpt">${esc(t("pe_tier_ckpt"))}</option>
+            <option value="q2">${esc(t("pe_tier_q2"))}</option>
+          </select>
+          <div id="pe-tier-info" class="muted" style="margin-top:4px"></div>
+        </div>
       </div>
       <div>
         <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
@@ -136,8 +143,38 @@ const FTProfileEditor = (() => {
       $("#pe-model-info", d).textContent = m
         ? [fmt.gib(m.size_bytes), m.quant, m.model_type, m.max_context ? fmt.tok(m.max_context) : null].filter(Boolean).join(" · ")
         : modelSel.value === "__other" ? t("pe_model_other_hint") : "";
+      renderTier(m);
       preview();
     }
+
+    // The expert tier: a Q2_0 GGUF next to the checkpoint is not a model (ft serve --model stays
+    // the checkpoint); it is --moe-expert-gguf on top of it. Shown only when the server found one.
+    const tierRow = $("#pe-tier-row", d), tierSel = $("#pe-tier", d);
+    function ggufRow() { return rows.find((r) => r.spelling === "--moe-expert-gguf"); }
+    function renderTier(m) {
+      const gguf = m?.expert_gguf;
+      tierRow.hidden = !gguf;
+      if (!gguf) return;
+      const cur = ggufRow();
+      tierSel.value = cur ? "q2" : "ckpt";
+      $("#pe-tier-info", d).textContent = cur
+        ? (cur.value && cur.value !== gguf ? t("pe_tier_other_file", { path: homePath(cur.value) }) : t("pe_tier_q2_info", { path: homePath(gguf) }))
+        : t("pe_tier_ckpt_info");
+    }
+    tierSel.addEventListener("change", () => {
+      const m = meta?.models.find((x) => x.value === modelSel.value);
+      if (!m?.expert_gguf) return;
+      if (tierSel.value === "q2") {
+        setFlag("--moe-expert-gguf", m.expert_gguf);
+        if (!rows.find((r) => r.spelling === "--reasoning-budget")) setFlag("--reasoning-budget", "6000");
+      } else {
+        setFlag("--moe-expert-gguf", null);
+        const budget = rows.find((r) => r.spelling === "--reasoning-budget");
+        if (budget && budget.value === "6000") setFlag("--reasoning-budget", null);  // the one the tier added
+      }
+      renderTier(m);
+      preview();
+    });
 
     // ---------------------------------------------------------------- flag rows (left) and detail (right)
     function control(r, i) {
