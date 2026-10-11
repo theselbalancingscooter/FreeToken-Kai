@@ -40,6 +40,7 @@ from typing import TYPE_CHECKING
 import torch
 from freetoken.attention.linear import FLAMetadata
 from freetoken.core import Batch, Req
+from freetoken.engine.spec import StaticStashes
 from freetoken.utils import init_logger, mem_GB
 from freetoken.utils import decode_sample
 
@@ -165,7 +166,7 @@ class SpecVerifyGraph:
                 pool = self.primary.graph.pool() if self.primary is not None and self.primary.graph is not None else None
                 with torch.cuda.graph(graph, pool=pool, stream=eng.stream):
                     self.out.copy_(model.forward())
-                self.stash = list(ctx.spec_stash)
+                self.stash = StaticStashes(ctx.spec_stash)
                 ctx.spec_stash = []
                 pp = eng.pp_comm
                 self.hidden = model.last_hidden if pp is None or pp.is_last else None
@@ -179,7 +180,7 @@ class SpecVerifyGraph:
                         self.out.copy_(decode_sample.run_forward(model.forward))
                         if self.hidden is not None:
                             self.hidden.copy_(model.last_hidden)
-                    self.stash_timed = list(ctx.spec_stash)
+                    self.stash_timed = StaticStashes(ctx.spec_stash)
                     ctx.spec_stash = []
                     self.graph_timed = timed
         finally:

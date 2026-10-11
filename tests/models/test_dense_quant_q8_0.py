@@ -52,6 +52,24 @@ def test_the_wrapper_answers_storage_for_the_inner_dialect_and_for_itself():
     assert fp8.stored_tensors(QuantKind.NVFP4) == nv
 
 
+def test_the_wrapper_keeps_the_inner_table_when_the_checkpoint_uses_the_at_load_kind_too():
+    """A ModelOpt export stores its attention in fp8 WITH an input_scale; under --dense-quant fp8
+    the wrapper must still answer those layers with the inner table (the loader filters by each
+    scheme's roles), not with the at-load roles alone -- Ornith failed to load with
+    KeyError: 'in_proj_qkvz.input_scale' when it did."""
+    from freetoken.layers.quantization import LoadTimeFp8Config, LoadTimeQ8Config, QuantKind
+    from freetoken.layers.quantization.configs.base import NoQuantConfig, Stored
+
+    class Inner(NoQuantConfig):
+        STORAGE = {QuantKind.FP8_TENSOR: {"weight": "weight", "weight_scale": "weight_scale", "input_scale": "input_scale"}}
+
+    fp8 = LoadTimeFp8Config(Inner())
+    table = fp8.stored_tensors(QuantKind.FP8_TENSOR)
+    assert table["input_scale"] == Stored("input_scale") and table["weight_scale"] == Stored("weight_scale")
+    # the q8_0 wrapper over the same inner: its own kind is not in the inner table, so the at-load roles alone
+    assert LoadTimeQ8Config(Inner()).stored_tensors(QuantKind.Q8_0) == {"weight": Stored("weight")}
+
+
 def test_a_linear_built_under_q8_holds_packed_rows_and_the_head_too():
     from freetoken.layers.embedding import ParallelLMHead
     from freetoken.layers.linear import LinearColParallelMerged

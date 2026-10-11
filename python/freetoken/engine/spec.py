@@ -15,6 +15,10 @@ from typing import Sequence
 
 import torch
 
+from freetoken.utils import init_logger, mem_GB
+
+logger = init_logger(__name__)
+
 
 @dataclass
 class SpecResult:
@@ -108,30 +112,40 @@ def rebuild_conv_state(prev_state: torch.Tensor, conv_in: torch.Tensor, accepted
 #     syncs, and on an RTX 2060 it measured no faster than the loop).
 _ROLLBACK_MODE = os.environ.get("FREETOKEN_SPEC_ROLLBACK", "graph")
 _ROLLBACK_GRAPHS: dict = {}
-_ROLLBACK_SEEN: dict = {}
+
+
+class StaticStashes(list):
+    """The stashes a captured verify window leaves: their tensors are the window graph's static
+    buffers, the same addresses every replay, so a restore captured over them can be replayed.
+    A plain list of stashes (an eagerly run window) is restored eagerly: its tensors are fresh
+    allocations whose addresses the caching allocator reuses, and a graph keyed on them would
+    read whatever lives there now -- on two RTX 3060s that was a verify window whose graph
+    capture had failed (the conv check's .item()), a drift of the GDN states, and a crash."""
+
+    static = True
 
 
 def _rollback_key(stashes, accepted: int):
-    return (accepted, tuple(
+    return (accepted, id(stashes), tuple(
         (s.li, id(s.pool), s.slot.data_ptr(), s.prev_conv.data_ptr(), s.conv_in.data_ptr(), s.ht.data_ptr(), tuple(s.ht.shape))
         for s in stashes))
 
 
 def _restore_graphed(stashes, accepted: int) -> None:
+    if not getattr(stashes, "static", False) or not stashes[0].ht.is_cuda:
+        for s in stashes:
+            s.restore(accepted)
+        return
     key = _rollback_key(stashes, accepted)
     g = _ROLLBACK_GRAPHS.get(key)
     if g is not None:
         g.replay()
         return
-    seen = _ROLLBACK_SEEN.get(key, 0) + 1
-    if len(_ROLLBACK_SEEN) > 256:  # eager windows bring fresh buffers every step; do not grow forever
-        _ROLLBACK_SEEN.clear()
-    _ROLLBACK_SEEN[key] = seen
-    if seen < 2 or not stashes[0].ht.is_cuda:
+    if len(_ROLLBACK_GRAPHS) >= 64:  # cannot happen with static stashes; a guard, not a policy
         for s in stashes:
             s.restore(accepted)
         return
-    # the second time with these buffers: do the restore on a side stream (this step's effect),
+    # the first time with these buffers: do the restore on a side stream (this step's effect),
     # then capture the same ops into a graph for the steps after
     cur = torch.cuda.current_stream()
     side = torch.cuda.Stream()
@@ -145,6 +159,10 @@ def _restore_graphed(stashes, accepted: int) -> None:
         for s in stashes:
             s.restore(accepted)
     _ROLLBACK_GRAPHS[key] = g
+    logger.info(
+        f"spec rollback: captured the restore of {len(stashes)} GDN layers for {accepted} accepted rows "
+        f"({len(_ROLLBACK_GRAPHS)} graphs so far)"
+    )
 
 
 def restore_gdn_stashes(stashes, accepted: int) -> None:

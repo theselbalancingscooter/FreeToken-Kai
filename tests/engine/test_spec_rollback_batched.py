@@ -70,10 +70,9 @@ def test_graphed_restore_equals_per_layer_restore(monkeypatch, accepted):
     when the window buffers' contents (states, slot) change between replays."""
     monkeypatch.setattr(spec_mod, "_ROLLBACK_MODE", "graph")
     spec_mod._ROLLBACK_GRAPHS.clear()
-    spec_mod._ROLLBACK_SEEN.clear()
     T = 4
     new_pool = _pools(device="cuda")
-    new_stashes = _stashes(new_pool, T, device="cuda")
+    new_stashes = spec_mod.StaticStashes(_stashes(new_pool, T, device="cuda"))
     for step in range(4):
         # new window contents in the same buffers, as a replayed verify graph leaves them
         for s in new_stashes:
@@ -92,7 +91,28 @@ def test_graphed_restore_equals_per_layer_restore(monkeypatch, accepted):
         torch.cuda.synchronize()
         assert torch.equal(ref_pool.conv_states, new_pool.conv_states), step
         assert torch.equal(ref_pool.recurrent_states, new_pool.recurrent_states), step
-    assert len(spec_mod._ROLLBACK_GRAPHS) == 1  # captured once, replayed for steps 2 and 3
+    assert len(spec_mod._ROLLBACK_GRAPHS) == 1  # captured once, replayed after
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA graphs")
+def test_graphed_restore_leaves_eager_windows_alone(monkeypatch):
+    """A plain list of stashes (an eagerly run window: fresh tensors every step, addresses the
+    allocator reuses) is never captured -- it must be restored eagerly every time."""
+    monkeypatch.setattr(spec_mod, "_ROLLBACK_MODE", "graph")
+    spec_mod._ROLLBACK_GRAPHS.clear()
+    for step in range(4):
+        pool = _pools(device="cuda")
+        stashes = _stashes(pool, 4, device="cuda")  # a plain list, new tensors each step
+        ref_pool = _pools(device="cuda")
+        ref = [SpecGdnStash(pool=ref_pool, li=s.li, slot=s.slot, prev_conv=s.prev_conv, conv_in=s.conv_in, ht=s.ht) for s in stashes]
+        for s in ref:
+            s.restore(2)
+        restore_gdn_stashes(stashes, 2)
+        torch.cuda.synchronize()
+        assert torch.equal(ref_pool.recurrent_states, pool.recurrent_states), step
+        assert torch.equal(ref_pool.conv_states, pool.conv_states), step
+        del stashes, pool, ref_pool, ref  # free the buffers so the next step may reuse the addresses
+    assert len(spec_mod._ROLLBACK_GRAPHS) == 0
 
 
 def test_mixed_slots_fall_back_to_the_per_layer_restore():

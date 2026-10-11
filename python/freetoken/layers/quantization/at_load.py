@@ -72,11 +72,21 @@ class LoadTimeQuantConfig(QuantConfig):
 
     def stored_tensors(self, kind: QuantKind) -> dict[str, Stored]:
         # the loaders ask how the checkpoint stores a projection it DID quantize (a ModelOpt
-        # export's NVFP4 attention under --dense-quant): that is the inner dialect's answer;
-        # the at-load kind is stored as the bf16 ``weight`` the engine converts after the read
-        if kind is self.AT_LOAD.kind:
-            return {role: Stored(role) for role in sorted(self.AT_LOAD.roles)}
-        return self.inner.stored_tensors(kind)
+        # export's NVFP4 attention under --dense-quant): that is the inner dialect's answer. The
+        # at-load kind is stored as the bf16 ``weight`` the engine converts after the read -- but
+        # the checkpoint may store some projections in that same kind itself (a ModelOpt export
+        # keeps its attention in fp8, with an input_scale, under --dense-quant fp8), so the
+        # answer for the at-load kind is the inner table with the at-load roles added, never
+        # the at-load roles alone: ``storage()`` filters by each scheme's own roles.
+        if kind is not self.AT_LOAD.kind:
+            return self.inner.stored_tensors(kind)
+        try:
+            out = dict(self.inner.stored_tensors(kind))
+        except (KeyError, AttributeError):
+            out = {}
+        for role in sorted(self.AT_LOAD.roles):
+            out.setdefault(role, Stored(role))
+        return out
 
     def layer_config(self, layer: Any, layer_kind: LayerKind, scheme: QuantScheme | None):
         return self.inner.layer_config(layer, layer_kind, scheme)
