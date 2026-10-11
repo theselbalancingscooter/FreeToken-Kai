@@ -222,7 +222,11 @@ def fused_recurrent_gated_delta_rule_fwd(
     ssm_state_indices: torch.Tensor | None = None,
     num_accepted_tokens: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = False,
+    final_state_out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """``final_state_out`` (with ``inplace_final_state=False``): a ``[T, HV, V, K]`` buffer to write
+    the per-token states into instead of allocating one -- the MTP verify windows of every width
+    share one, so a captured window graph holds no state of its own (engine/spec_graph)."""
     B, T, H, K, V = *k.shape, v.shape[-1]
     HV = v.shape[2]
     N = B if cu_seqlens is None else len(cu_seqlens) - 1
@@ -235,6 +239,11 @@ def fused_recurrent_gated_delta_rule_fwd(
     o = q.new_empty(NK, *v.shape)
     if inplace_final_state:
         final_state = initial_state
+    elif final_state_out is not None:
+        assert tuple(final_state_out.shape) == (T, HV, V, K) and final_state_out.dtype == initial_state.dtype, (
+            tuple(final_state_out.shape), (T, HV, V, K), final_state_out.dtype)
+        assert final_state_out.is_contiguous()
+        final_state = final_state_out
     else:
         final_state = q.new_empty(T, HV, V, K, dtype=initial_state.dtype)
 

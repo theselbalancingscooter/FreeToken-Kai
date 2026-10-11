@@ -45,6 +45,23 @@ class SpecGdnStash:
         rec.index_copy_(0, slot, self.ht[accepted - 1 : accepted].to(rec.dtype).view_as(rec[0:1]))
 
 
+_SPEC_HT: dict = {}
+
+
+def spec_window_states(pool, li: int, rows: int) -> torch.Tensor:
+    """``[rows, HV, V, K]`` buffer for the per-token recurrent states of an MTP verify window of
+    layer ``li``: one per (pool, layer), grown to the longest window seen (the K+1-row warm run
+    comes first, before any capture). Every window graph writes the same buffer -- they never
+    replay together and the rollback reads it right after -- so the graphs of the shorter
+    windows (--spec-min-p) cost temporaries only, not a copy of every layer's states."""
+    key = (id(pool), li)
+    buf = _SPEC_HT.get(key)
+    shape = (rows, *pool.recurrent_states.shape[2:])
+    if buf is None or buf.shape[0] < rows:
+        buf = _SPEC_HT[key] = torch.empty(shape, dtype=pool.recurrent_states.dtype, device=pool.recurrent_states.device)
+    return buf[:rows]
+
+
 def channels_first_copy(conv_in: torch.Tensor) -> torch.Tensor:
     """``[total, conv_dim]`` -> a fresh ``[conv_dim, total]`` buffer. ``transpose().contiguous()``
     is NOT a copy when ``total == 1`` (a size-1 dim never breaks contiguity), and the varlen conv
@@ -287,6 +304,7 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
                     q, k, v, g, beta, self.head_k_dim ** -0.5,
                     initial_state=pool.recurrent_states[li],
                     inplace_final_state=False,
+                    final_state_out=spec_window_states(pool, li, total),
                     cu_seqlens=fla.cu_seqlens.to(torch.int64),
                     ssm_state_indices=fla.cache_indices,
                     use_qk_l2norm_in_kernel=True,
