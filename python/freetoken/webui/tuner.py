@@ -548,7 +548,7 @@ class TuneJob:
         # a candidate the settings already carry (the chunk ceiling four pieces set) is skipped by the
         # run without a start, so it is not listed either
         items = [{"key": c.key, "what": c.what_ja, "what_en": c.what_en, "change": c.change()} for c in plan
-                 if c.key not in tried and c.group not in tried and (c.after is None or c.after in kept)
+                 if c.key not in tried and c.group not in tried and c.opened_by(kept)
                  and set_flags(args, search.merge_changes(args, c.changes), c.drop) != args]
         return {"available": True, "items": items, "last": {"finished": prev.get("finished"), "mode": prev.get("mode"),
                                                             "version": prev.get("freetoken_version")},
@@ -818,7 +818,7 @@ class TuneJob:
         while True:
             self._check()
             pending = [c for c in search.plan(best_args, facts, hw, mode)
-                       if c.key not in tried and c.group not in tried and (c.after is None or c.after in kept)]
+                       if c.key not in tried and c.group not in tried and c.opened_by(kept)]
             # the page lists what is still to come, and about how long it takes; sent again before every run
             self._ev("plan", items=[{"key": x.key, "what": x.what_ja, "what_en": x.what_en, "change": x.change()} for x in pending],
                      mode=mode, use=use, update=not first,

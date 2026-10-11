@@ -161,6 +161,32 @@ def expert_bytes(facts: dict) -> int:
 
 
 # ------------------------------------------------------------------ the recommendation
+def q2_gguf_for(path: str) -> str | None:
+    """The Q2_0 GGUF of this checkpoint's experts, when one sits next to it: a sibling directory
+    whose name starts with the checkpoint's own (its quantization suffix dropped) and contains
+    "GGUF", holding ``*Q2_0*.gguf`` (shard 1 of a split). None when there is none."""
+    path = os.path.normpath(path)
+    base = os.path.basename(path)
+    stem = base
+    for suffix in ("-NVFP4", "-FP8", "-MXFP4", "-AWQ", "-GPTQ", "-bf16", "-BF16"):
+        if stem.endswith(suffix):
+            stem = stem[: -len(suffix)]
+    parent = os.path.dirname(path)
+    try:
+        siblings = sorted(os.listdir(parent))
+    except OSError:
+        return None
+    for d in siblings:
+        full = os.path.join(parent, d)
+        if d == base or not d.startswith(stem) or "GGUF" not in d.upper() or not os.path.isdir(full):
+            continue
+        for root, _, files in os.walk(full):
+            hits = sorted(f for f in files if f.endswith(".gguf") and "Q2_0" in f.upper() and ("-00001-of-" in f or "-of-" not in f))
+            if hits:
+                return os.path.join(root, hits[0])
+    return None
+
+
 def recommend(model: str, *, extra_dirs: list[str] | None = None) -> dict:
     """{flags: [...], notes: [{flag, why}], host: {...}} — the flags a person would otherwise
     have to read the guides for. Each note says why, so nothing has to be taken on faith."""
@@ -193,6 +219,10 @@ def recommend(model: str, *, extra_dirs: list[str] | None = None) -> dict:
     # (guides/23, 2026-09-19). Measured on Flash-Next only, so only Flash-Next gets it.
     one_card = (is_moe and facts.get("model_type") == "qwen4_exp" and len(cards) <= 1
                 and bool(resident) and resident > vram * 0.75)
+    # the 2.25-bit expert tier (gguf.md): proposed when the checkpoint's Q2_0 GGUF sits next to it
+    q2_gguf = q2_gguf_for(path) if facts.get("model_type") == "qwen4_exp" and is_moe else None
+    caps = [g.get("compute_cap") for g in cards if g.get("compute_cap")]
+    fp8_cores = bool(caps) and max(caps) >= 8.9
 
     def add(flag: str, value: str | None, why: str, why_en: str) -> None:
         flags.append(flag)
@@ -201,7 +231,6 @@ def recommend(model: str, *, extra_dirs: list[str] | None = None) -> dict:
         notes.append({"flag": flag, "value": value, "why": why, "why_en": why_en})
 
     # --- bf16 is emulated before Ampere: measured 592 -> 285 tok/s of prompt processing on a 2060
-    caps = [g.get("compute_cap") for g in cards if g.get("compute_cap")]
     if caps and max(caps) < 8.0:
         sm = int(min(caps) * 10)
         add("--dtype", "float16",
@@ -254,7 +283,17 @@ def recommend(model: str, *, extra_dirs: list[str] | None = None) -> dict:
             add("--moe-cpu-threads", str(max(2, min(cores - 2, 8))),
                 f"物理コア {cores} 個から、ほかの処理のぶんを残した数です。",
                 f"{cores} physical cores, leaving some for everything else.")
-        if one_card:
+        if one_card and q2_gguf:
+            n = 3 * int(facts.get("num_experts") or 0)
+            add("--moe-cache-size", str(n),
+                f"GPU に載せるエキスパートの枠を 3 層分（{n}）に固定します。Q2_0 の枠は NVFP4 の半分の大きさで、この数が 12 GB に入り、"
+                "プロンプト処理の 2 層分の二重バッファも取れます（3060 12GB 1 枚で生成 26.8 tok/s、2026-10-10）。",
+                f"Keep three layers of experts on the GPU ({n} slots): Q2_0 slots are half the size of NVFP4's, this many fit a 12 GB card, "
+                "and prompt processing gets its two-layer double buffer (26.8 tok/s generation on one 3060 12 GB, 2026-10-10).")
+            add("--moe-prefill-overlap", None,
+                "プロンプト処理のエキスパート転送を計算と重ね合わせます（枠が 2 層分あるときだけ）。",
+                "Overlap prompt processing's expert copies with its GEMMs (possible with two layers of slots).")
+        elif one_card:
             n = int(facts.get("num_experts") or 0)
             add("--moe-cache-size", str(n),
                 f"GPU に載せるエキスパートの枠を 1 層分（{n}）に固定します。自動で決めると、この VRAM では最小の計画に KV の予約と"
@@ -319,9 +358,32 @@ def recommend(model: str, *, extra_dirs: list[str] | None = None) -> dict:
             "プロンプト処理で GDN と attention だけをチャンクの中で 2 つに分け、チャンクを広げます（2060・Ornith で 490 → 649 tok/s、3060×2・Flash-Next で 437 → 546 tok/s の実測）。",
             "Runs GDN and attention over two pieces of each prefill chunk so the chunk can be wider (490 -> 649 tok/s on a 2060 with Ornith, 437 -> 546 on two 3060s with Flash-Next).")
     if facts.get("model_type") == "qwen4_exp":
-        add("--dense-quant", "fp8",
-            "エキスパート以外の bf16 の重みを読み込み時に fp8 にします。常駐分が 1 枚あたり 4.9 → 2.9 GB になり、空いた VRAM がエキスパートの枠に回ります。",
-            "Quantizes the bf16 non-expert weights to fp8 at load: resident weights go from 4.9 to 2.9 GB per card, and the freed VRAM goes to the expert cache.")
+        if fp8_cores:
+            add("--dense-quant", "fp8",
+                "エキスパート以外の bf16 の重みを読み込み時に fp8 にします。常駐分が 1 枚あたり 4.9 → 2.9 GB になり、空いた VRAM がエキスパートの枠に回ります。",
+                "Quantizes the bf16 non-expert weights to fp8 at load: resident weights go from 4.9 to 2.9 GB per card, and the freed VRAM goes to the expert cache.")
+        else:
+            add("--dense-quant", "q8_0",
+                "エキスパート以外の bf16 の重みを読み込み時に ggml Q8_0（int8）にします。常駐分が 1 枚あたり 4.9 → 3.1 GB になり、"
+                "この GPU には fp8 のテンソルコアが無いので、同梱の int8 カーネルが fp8 より速く動きます（3060×2・Flash-Next で生成 +2〜6 tok/s、プロンプト処理 +3〜6%）。",
+                "Quantizes the bf16 non-expert weights to ggml Q8_0 (int8) at load: resident weights go from 4.9 to 3.1 GB per card, and "
+                "this GPU has no fp8 tensor cores, so the vendored int8 kernels beat fp8 (two 3060s with Flash-Next: +2..6 tok/s generation, +3..6% prompt processing).")
+    if q2_gguf:
+        add("--moe-expert-gguf", q2_gguf,
+            "隣に見つかった Q2_0 の GGUF からエキスパートを読みます: 速さの段です（バンク 63.5 GiB → 34 GB、1 トークンあたりの読みが半分、"
+            "3060×2 で参照 10 問が 37〜58 tok/s、NVFP4 は 23〜28）。答えは変わります（10 問で 9/10、考える長さは 35% 増）。正確さが要るときはこの行を外します。",
+            "Read the experts from the Q2_0 GGUF found next to the checkpoint: the fast tier (banks 63.5 GiB -> 34 GB, half the bytes per token, "
+            "37-58 tok/s on the ten reference prompts on two 3060s against NVFP4's 23-28). The answers change (9 of 10, thinking 35% longer); drop this line when accuracy matters.")
+        add("--reasoning-budget", "6000",
+            "2 bit の段は温度 0 で堂々巡りすることがあるので、思考を 6,000 トークンで打ち切って答えさせます。",
+            "The 2-bit tier can think in circles at temperature 0; the thinking is cut at 6,000 tokens and the model answers from there.")
+        add("--spec-mtp", "5", "この段では MTP の窓の固定費を削ってあり、本物の答えで 23 → 37〜58 tok/s になります。",
+            "On this tier the verify window's fixed costs are cut: 23 -> 37-58 tok/s on real answers.")
+        add("--spec-min-p", "0.6", "ヘッドの確信度が 0.6 を下回った最初のドラフトで窓を切ります（文章で 37 → 62 tok/s）。",
+            "End a window at the first draft the head scores below 0.6 (prose: 37 -> 62 tok/s).")
+        if not fp8_cores:
+            add("--spec-draft-head-quant", "q4_0", "ドラフトの採点を 4 bit に詰めた lm_head の複製で行います（Q8_0 の dense と組で使います）。",
+                "Score the drafts through a 4-bit copy of the lm_head (paired with the Q8_0 dense weights).")
     if one_card:
         add("--prefill-chunk-budget", "0.75",
             "プロンプト処理の 1 チャンクが空き VRAM の 75% まで使えるようにします（2 枚構成で 510 → 700 tok/s の実測と同じ設定）。",

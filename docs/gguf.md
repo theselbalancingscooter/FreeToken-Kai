@@ -67,6 +67,12 @@ wall, not the kernel. On the ten prompts with `--reasoning-budget 6000` the Q2_0
 9 or 10 of 10 across runs (the miss, when it happens, is a translation that thinks past the
 budget). `FREETOKEN_DENSE_QUANT_HC=1` kept 10 of 10 but did not shorten the window: leave it off.
 
+One card: the 34 GB of Q2_0 banks fit a 12 GB card's host pin budget where the NVFP4 banks did not,
+so every layer decodes on the GPU and plain decode measured 26.8 tok/s against the NVFP4 tier's 19.2
+(2026-10-10, 1,536 cache slots). Use `--moe-prefill-overlap` with it: the one-card launch profile
+turns the prefill double buffer off for NVFP4's one-layer cache, and without the overlap a prompt
+read at 202 tok/s. [kai.md](kai.md#running-qwen38-flash-next-on-one-rtx-3060-12-gb) has the command.
+
 A caution for benchmarks: a 1,500-token greedy generation with EOS ignored runs past the answer
 into repetition, whose draft acceptance (2.2-3.7 tokens a step) depends on which repetition the
 text drifts into, and a change in the last bits of the arithmetic (a kernel's summation order)

@@ -1154,6 +1154,15 @@ def parse_args(
             "--moe-cache-size >= 2 * num_experts."
         ),
     )
+    parser.add_argument(
+        "--moe-prefill-overlap",
+        action="store_true",
+        dest="moe_prefill_overlap",
+        help="Turn the prefill double buffer back on after a profile or script passed "
+        "--disable-moe-prefill-overlap (the later flag wins). It needs 2 x num_experts cache "
+        "slots; with Q2_0 expert banks one 12 GB card has them (--moe-cache-size 1536), where "
+        "its NVFP4 banks did not",
+    )
 
     parser.add_argument(
         "--enable-special-token-ckpt",

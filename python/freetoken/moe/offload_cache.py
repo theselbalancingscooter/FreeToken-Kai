@@ -133,6 +133,9 @@ class OffloadMoeCache:
     device: torch.device
     cache_policy: str = "lru"
     prefill_overlap: bool = False
+    # set by Engine._measure_prefill_transient: the probe's MoE layers take the whole-layer
+    # prefill path (layers/moe.py), never the split / CPU shortcuts
+    probe_whole_layer: bool = False
     # Prefill hit/miss split: experts already resident in the slot cache (slots
     # >= 2 * num_experts) are gathered device-side into the double buffer instead
     # of re-crossing PCIe; only the misses are H2D'd (one cudaMemcpyBatchAsync of

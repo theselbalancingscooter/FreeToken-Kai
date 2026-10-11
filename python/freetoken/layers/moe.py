@@ -427,8 +427,15 @@ class OffloadMoELayer(MoELayer):
         cache = self.offload_cache
         assert cache is not None
         apply_permutation(topk_ids, self.expert_perm)
+        # The startup transient probe (Engine._measure_prefill_transient) sets probe_whole_layer:
+        # it must walk the path a full chunk walks -- the whole-layer stream and its GEMM
+        # buffers -- not the split or CPU shortcuts a 1,024-token forward would otherwise take,
+        # whose GPU transient is a fraction of the chunk's. Measured through the shortcut, the
+        # chunk it solved OOM'd on one RTX 3060 with 1.8 GiB free (7,168 tokens at 0.75).
+        probing = getattr(cache, "probe_whole_layer", False)
         if (
-            PREFILL_SPLIT_MIN_TOKENS <= hidden_states.shape[0] <= prefill_split_max_tokens(cache)
+            not probing
+            and PREFILL_SPLIT_MIN_TOKENS <= hidden_states.shape[0] <= prefill_split_max_tokens(cache)
             and not self.apply_router_weight_on_input
             and not cache.is_unpinned_layer(self.layer_id)
         ):
@@ -437,7 +444,8 @@ class OffloadMoELayer(MoELayer):
         # the decision is per forward (every layer sees the same row count), so a forward that
         # goes this way never touches the overlap machinery
         if (
-            getattr(cache, "cpu_executor", None) is not None
+            not probing
+            and getattr(cache, "cpu_executor", None) is not None
             and 0 < hidden_states.shape[0] <= cpu_prefill_max_tokens()
         ):
             return self._prefill_on_cpu(cache, hidden_states, topk_weights, topk_ids)

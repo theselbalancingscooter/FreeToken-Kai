@@ -168,12 +168,15 @@ while one holds the GPU.
    - **Standard** tries the settings with the largest effects on the machines this fork was measured
      on (an RTX 2060 and two RTX 3060s): offload instead of hybrid, the CPU thread count, each
      expert kernel this PC can run, a 16-bit KV cache, prefill overlap, a chunk budget of 0.75, four
-     prefill pieces, moving the pipeline split one layer, pinned PLE, MTP 3 and 5. Other hardware can
-     differ, which is what thorough is for.
+     prefill pieces, moving the pipeline split one layer, pinned PLE, Q8_0 dense weights on a card
+     without fp8 tensor cores, MTP 3 and 5, and on a kept window min-p 0.6 over a 5-token window and
+     the 4-bit draft head (not with fp8 dense weights). Other hardware can differ, which is what
+     thorough is for.
    - **Thorough** adds the finer settings, which did not help on those machines: computing every
      missing expert on the CPU, the linear kernels, a q4_0 KV cache, device-side copies of cache
-     hits, chunk budget 0.9, one piece, a 16k prefill length, no host embedding, bf16 dense weights,
-     the split moved two layers, `--pp-send-ahead` and `--pp-prefill-group`.
+     hits, chunk budget 0.9, one piece, a 16k prefill length, no host embedding, bf16 or fp8 dense
+     weights (Q8_0 on a card with fp8 tensor cores), the split moved two layers, `--pp-send-ahead`
+     and `--pp-prefill-group`.
    - Kernels this PC cannot run are not started: marlin without vLLM, b12x below sm_120. They are
      listed with the reason among what was not measured.
    - **Main use** (prose, code or both) decides a change that helps one and hurts the other, such
@@ -184,8 +187,9 @@ while one holds the GPU.
    - Not searched, with the reason on the result page: `--memory-ratio` (the risk is later VRAM use
      by other programs, which a benchmark cannot see), `--max-running-req` and
      `--cuda-graph-max-bs` (throughput, not one person's speed), `--moe-cpu-layers` and
-     `--attention-backend` (auto already picks what starts), and the settings that decide what fits
-     rather than how fast.
+     `--attention-backend` (auto already picks what starts), `--moe-expert-gguf` (another file and
+     other answers: the recommendation proposes it when the model's Q2_0 GGUF sits next to the
+     checkpoint), and the settings that decide what fits rather than how fast.
    - Time depends on the GPUs and the model: two RTX 3060s with Flash-Next take about 1.5-2 hours in
      standard mode and about 3 in thorough mode (29 starts of about 6 minutes each), an RTX 2060
      with Ornith about an hour in standard mode. While it runs, the header shows the time left,

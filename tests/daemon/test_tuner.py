@@ -195,7 +195,7 @@ def test_kernels_that_cannot_run_here_are_not_tried_and_say_why():
 def test_standard_plan_on_a_2060_with_ornith():
     keys = _keys(ORNITH_ARGS, ORNITH, HW_2060, "standard")
     assert keys == ["strategy_offload", "threads_all", "threads_fewer", "kernel_moe_triton", "kernel_moe_marlin", "kernel_moe_b12x",
-                    "kv_16bit", "overlap_on", "budget_075", "pieces_4", "mtp_3", "mtp_5"]
+                    "kv_16bit", "overlap_on", "budget_075", "pieces_4", "mtp_3", "mtp_5", "minp_06"]  # no draft head: Ornith's lm_head is NVFP4
 
 
 def test_thorough_plan_adds_the_rarely_winning_ones():
@@ -216,10 +216,36 @@ def test_two_3060s_with_flash_next():
     assert {"pp_layers_26", "send_ahead_3", "prefill_group_2", "dense_bf16"} <= set(thorough)
 
 
+def test_dense_q8_is_standard_without_fp8_tensor_cores_and_thorough_with_them():
+    ampere = {"measurements": dict(HW_3060["measurements"], gpus=[{"index": 0, "compute_cap": 8.6}, {"index": 1, "compute_cap": 8.6}])}
+    ada = {"measurements": dict(HW_3060["measurements"], gpus=[{"index": 0, "compute_cap": 8.9}])}
+    assert "dense_q8" in _keys(FLASH_ARGS, FLASH, ampere, "standard")
+    assert "dense_q8" not in _keys(FLASH_ARGS, FLASH, ada, "standard")
+    assert "dense_q8" in _keys(FLASH_ARGS, FLASH, ada, "thorough")
+    q8_args = [a if a != "fp8" else "q8_0" for a in FLASH_ARGS]
+    keys = _keys(q8_args, FLASH, ampere, "thorough")
+    assert "dense_fp8" in keys and "dense_bf16" in keys and "dense_q8" not in keys
+    # the three undo each other: one group
+    groups = {c.key: c.group for c in search.plan(q8_args, FLASH, ampere, "thorough")}
+    assert groups["dense_fp8"] == groups["dense_bf16"] == "dense"
+
+
+def test_min_p_and_the_draft_head_follow_the_window():
+    plan = {c.key: c for c in search.plan(FLASH_ARGS, FLASH, HW_3060, "standard")}
+    # without a window in the base flags they wait for a kept mtp candidate (either of the two)
+    assert plan["minp_06"].after == ("mtp_3", "mtp_5") and plan["minp_06"].opened_by({"mtp_5"}) and not plan["minp_06"].opened_by(set())
+    assert "draft_q4" not in plan  # fp8 dense: the 4-bit head packed from an fp8 head loses acceptance
+    q8_args = [a if a != "fp8" else "q8_0" for a in FLASH_ARGS] + ["--spec-mtp", "3"]
+    plan = {c.key: c for c in search.plan(q8_args, FLASH, HW_3060, "standard")}
+    assert plan["draft_q4"].after is None and plan["minp_06"].after is None  # the base already has a window
+    assert "mtp_3" not in plan and "mtp_5" in plan  # the base's own K is not re-tried
+    assert plan["minp_06"].changes == {"--spec-min-p": "0.6", "--spec-mtp": "5"}
+
+
 def test_no_moe_candidates_for_a_dense_model_and_no_mtp_without_a_head():
     dense = dict(model_type="llama", num_layers=32, quant=None, mtp=False)
     keys = _keys(["--max-running-req", "1"], dense, {}, "thorough")
-    assert keys and all(not k.startswith(("strategy", "kernel", "kv_", "mtp", "threads")) for k in keys)
+    assert keys and all(not k.startswith(("strategy", "kernel", "kv_", "mtp", "threads", "minp", "draft")) for k in keys)
 
 
 def test_every_skip_has_a_reason_in_both_languages():

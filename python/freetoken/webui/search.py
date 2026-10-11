@@ -32,7 +32,7 @@ class Candidate:
     hold_gen: float = 0.97
     hold_prefill: float = 0.90
     thorough: bool = False
-    after: str | None = None  # only when this earlier candidate was kept
+    after: str | tuple | None = None  # only when this earlier candidate (one of these) was kept
     what_ja: str = ""
     what_en: str = ""
     code: bool = False  # generation on code is measured too (MTP acceptance depends on the text)
@@ -47,6 +47,20 @@ class Candidate:
             flag, value = next(iter(self.changes.items()))
             return {"flag": flag, "value": value}
         return {"flag": self.drop[0], "value": None, "removed": True}
+
+    def opened_by(self, kept: set) -> bool:
+        """Whether the candidate this one waits for (any of them, for a tuple) was kept."""
+        if self.after is None:
+            return True
+        after = self.after if isinstance(self.after, tuple) else (self.after,)
+        return any(a in kept for a in after)
+
+
+def no_fp8_tensor_cores(hw: dict) -> bool:
+    """True when every measured GPU predates fp8 tensor cores (sm_89 Ada; Ampere and Turing have
+    none), or when the measurement has no GPU list -- this fork's measured hosts are such cards."""
+    caps = [g.get("compute_cap") for g in ((hw or {}).get("measurements") or {}).get("gpus") or [] if g.get("compute_cap")]
+    return not caps or max(caps) < 8.9
 
 
 def flag_value(args: list[str], flag: str) -> str | None:
@@ -276,9 +290,26 @@ def plan(args: list[str], facts: dict, hw: dict, mode: str = "standard", modules
                       what_ja="埋め込み表を GPU に置く（VRAM を使うが、読み出しは GPU 内で済む）",
                       what_en="keep the embedding table on the GPU (uses VRAM, no PCIe gather)"))
     if model_type == "qwen4_exp":
-        if flag_value(args, "--dense-quant") == "fp8":
-            add(Candidate("dense_bf16", {}, drop=("--dense-quant",), goal="either", thorough=True,
-                          what_ja="エキスパート以外の重みを fp8 にせず bf16 のままにする",
+        # the dense weights: fp8 (W8A16, e4m3 expanded in the kernel), Q8_0 (int8 dp4a), or bf16.
+        # On a card without fp8 tensor cores the Q8_0 kernels run a verify window's few-row GEMMs
+        # at the memory bandwidth where fp8 ran at half of it: two RTX 3060s, Flash-Next with
+        # --spec-mtp 3, generation +2..6 tok/s and prefill +3..6% (guides/70 4.15); on Ada and
+        # newer it is a thorough trial
+        dq = flag_value(args, "--dense-quant")
+        q8_standard = no_fp8_tensor_cores(hw)
+        if dq != "q8_0":
+            add(Candidate("dense_q8", {"--dense-quant": "q8_0"}, goal="either", group="dense", thorough=not q8_standard,
+                          what_ja="エキスパート以外の重みを ggml Q8_0（int8）にして、同梱の int8 カーネルで動かす"
+                                  "（fp8 のテンソルコアが無いカードでは fp8 より速い: 3060 で生成 +2〜6 tok/s）",
+                          what_en="store the non-expert weights as ggml Q8_0 (int8) and run them through the vendored int8 kernels "
+                                  "(faster than fp8 on a card without fp8 tensor cores: +2..6 tok/s on a 3060)"))
+        if dq == "q8_0":
+            add(Candidate("dense_fp8", {"--dense-quant": "fp8"}, goal="either", group="dense", thorough=q8_standard,
+                          what_ja="エキスパート以外の重みを fp8 にする（fp8 のテンソルコアがあるカード向け）",
+                          what_en="store the non-expert weights as fp8 (for a card with fp8 tensor cores)"))
+        if dq in ("fp8", "q8_0"):
+            add(Candidate("dense_bf16", {}, drop=("--dense-quant",), goal="either", thorough=True, group="dense",
+                          what_ja="エキスパート以外の重みを量子化せず bf16 のままにする",
                           what_en="keep the non-expert weights at bf16"))
         ram, weights = (facts.get("ram_total") or 0), (facts.get("weight_bytes") or 0)
         if ram and weights and ram > weights * 1.15:
@@ -309,10 +340,27 @@ def plan(args: list[str], facts: dict, hw: dict, mode: str = "standard", modules
 
     # --- speculative decoding with the checkpoint's MTP head: its gain depends on the text
     if facts.get("mtp") and flag_value(args, "--max-running-req") in ("1", None):
+        base_k = flag_value(args, "--spec-mtp")
         for k in ("3", "5"):
+            if base_k == k:
+                continue
             add(Candidate(f"mtp_{k}", {"--spec-mtp": k}, code=True, hold_prefill=0.85,
                           what_ja=f"MTP で {k} トークン先まで予測して、まとめて確かめる（コードやツール呼び出しで効きやすい）",
                           what_en=f"draft {k} tokens ahead with the MTP head and verify them together (helps most on code and tool calls)"))
+        # the two settings on top of a kept window (or of the base's own --spec-mtp). Measured on
+        # two RTX 3060s with the Q2_0 experts (guides/70 4.18): min-p 0.6 over K=5 wrote prose at
+        # 62 tok/s where fixed K=3 wrote 37, lists the same; the 4-bit draft head is only for a
+        # bf16 or Q8_0 lm_head -- packed from an fp8 head it lost a fifth of the prose acceptance
+        opened = None if base_k else ("mtp_3", "mtp_5")
+        if flag_value(args, "--spec-min-p") is None:
+            add(Candidate("minp_06", {"--spec-min-p": "0.6", "--spec-mtp": "5"}, code=True, hold_prefill=0.85, after=opened,
+                          what_ja="窓を 5 トークンにして、ヘッドの確信度が 0.6 を下回った最初のドラフトで窓を切る（文章で効く: 3060 で 37 → 62 tok/s）",
+                          what_en="a 5-token window cut at the first draft the head scores below 0.6 (prose: 37 -> 62 tok/s on two 3060s)"))
+        # the packed head needs a bf16 (or Q8_0) lm_head: Flash-Next's is, Ornith's is NVFP4 and the engine skips it
+        if model_type == "qwen4_exp" and flag_value(args, "--spec-draft-head-quant") is None and flag_value(args, "--dense-quant") != "fp8":
+            add(Candidate("draft_q4", {"--spec-draft-head-quant": "q4_0"}, code=True, hold_prefill=0.85, after=opened,
+                          what_ja="ドラフトの採点を 4 bit に詰めた lm_head の複製で行う（ドラフト 1 回のヘッド読みが 1.9 → 1.1 ms。fp8 の dense とは組まない）",
+                          what_en="score the drafts through a 4-bit copy of the lm_head (1.9 -> 1.1 ms per draft; not with fp8 dense)"))
     return out
 
 
@@ -338,4 +386,9 @@ SKIPPED = [
     ("--expert-load", "起動にかかる時間だけに効く。", "Only affects load time."),
     ("--dtype", "Turing では bfloat16 が使えないので float16 に決まる（起動できなければ外す）。それ以外の GPU では auto。",
      "Turing has no bfloat16, so float16 (dropped if the model does not load); auto elsewhere."),
+    ("--moe-expert-gguf", "エキスパートを 2.25 bit の GGUF から読む「速さの段」。別のファイルが要り、品質も変わる（10 問で 9/10）ので、速さの探索では切り替えない。"
+     "「改善提案」が、同じモデルの Q2_0 GGUF が隣にあるときに提案する。",
+     "The 2.25-bit expert tier reads another file and changes the answers (9 of 10 on the reference prompts), so the speed search "
+     "does not switch to it; the recommendation proposes it when the model's Q2_0 GGUF sits next to the checkpoint."),
+    ("--reasoning-budget", "思考の長さの上限で、速さではなく答えの出方を決める。", "A cap on the thinking, which decides how answers end, not how fast."),
 ]

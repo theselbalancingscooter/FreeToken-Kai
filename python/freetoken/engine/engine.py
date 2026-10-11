@@ -2763,6 +2763,13 @@ class Engine:
         free_before = int(torch.cuda.mem_get_info(self.device)[0])
         held = int(torch.cuda.memory_allocated(self.device))
         torch.cuda.reset_peak_memory_stats(self.device)
+        cache = self.moe_offload_cache
+        # the probe's MoE layers take the whole-layer path a real chunk takes, not the split /
+        # CPU shortcuts of a short forward (layers/moe.py); FREETOKEN_PREFILL_PROBE_PATH=auto
+        # keeps the old behaviour
+        probe_whole = cache is not None and os.environ.get("FREETOKEN_PREFILL_PROBE_PATH", "whole") != "auto"
+        if probe_whole:
+            cache.probe_whole_layer = True
         try:
             dummy_row[:length] = torch.arange(length, dtype=torch.int32, device=self.device)
             warm_req = Req(
@@ -2788,6 +2795,8 @@ class Engine:
             peak = int(torch.cuda.max_memory_allocated(self.device))
         finally:
             dummy_row.fill_(dummy_slot)
+            if probe_whole:
+                cache.probe_whole_layer = False
             if self.moe_offload_cache is not None:
                 self.moe_offload_cache.reset()
         transient = max(0, peak - held)
