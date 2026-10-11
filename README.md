@@ -148,7 +148,7 @@ English or Japanese, following the browser. See [docs/web-console.md](docs/web-c
 ## What the benchmark chooses from
 
 Upstream FreeToken serves one model on one GPU, on Ampere (RTX 30 series) or newer. Underneath the
-console, this fork changes the engine in nine ways. The benchmark picks among their flags for you;
+console, this fork changes the engine in eleven ways. The benchmark picks among their flags for you;
 the right-hand column is for when you want to set one yourself. They are independent — take one,
 ignore the rest.
 
@@ -158,12 +158,13 @@ ignore the rest.
 | 2 | **Half the host RAM** an offloaded MoE needs. Expert banks become a file mapping with a locked resident prefix, so 128 GB configurations run in 64 GB. On a host whose driver will not register a read-only mapping -- and there are such hosts -- the resident rows are copied into private pages instead, so the GPU can still reach them and the VRAM expert cache still works. When the page cache is taken while the server is idle, the cold rows can be read back before the next request faults them in one by one. | `--moe-bank-ram 48G`, `--moe-bank-rewarm 5` |
 | 3 | **Turing (RTX 20 series, sm_75) support — and at the card's own speed.** Upstream requires Ampere or newer, and the assumption shows up as tiles and warp counts that a 64 KB shared-memory card cannot run: the prefill attention and the two GDN chunk kernels were at 1-3% of what the card does in fp16. Eight changes, each isolated to pre-Ampere. On an RTX 2060, prefill went from 192 to 469 tok/s on a 27k prompt and stopped falling off with context. | automatic |
 | 4 | **Image input without VRAM.** Upstream serves images with the vision tower on the GPU; this runs it on the CPU instead, so a 6 GB card keeps its expert cache and 64k of context. No torchvision needed, and images work with the layer split and `--spec-mtp`. | `--mm-encoder-weights cpu` |
-| 5 | **Speculative decoding with the checkpoint's own MTP head.** Verify window and draft head captured as CUDA graphs. Correctness-verified. It pays off only where a multi-row verify costs about what a single row costs: with the experts in host RAM that means long acceptance, so it wins on code and tool calls on two cards and loses on free prose and on one card. | `--spec-mtp 5` |
+| 5 | **Speculative decoding with the checkpoint's own MTP head.** Verify window and draft head captured as CUDA graphs. Correctness-verified. It pays off where a multi-row verify costs about what a single row costs: with the experts in host RAM that means long acceptance, so on the NVFP4 tier it wins on code and tool calls on two cards and loses on free prose and on one card. On the 2.25-bit tier (row 11), with the window's fixed costs cut (Q8_0 dense, the decode conv, a 4-bit draft head, a graphed rollback), the K=3 window takes 70 ms and the ten reference prompts answer at 37-58 tok/s against 23 plain; `--spec-min-p` ends a window at the first doubtful draft. | `--spec-mtp 5`, `--spec-min-p 0.6`, `--spec-draft-head-quant q4_0` |
 | 6 | **64k of context on a 6 GB card.** The input embedding table lives in host memory and the GPU reads rows from it directly. | `--host-embedding` |
 | 7 | **A KV cache 1.9x or 3.6x smaller**, stored as block-quantized codes: 1.25 GiB down to 0.35 GiB at 64k on a 6 GB card. It buys VRAM, not speed — past a few thousand tokens of context it costs about a third of the decode rate. Plain paged-attention models and gpt-oss on the Triton backend, and Qwen3.8-Flash-Next on its own sparse backend — where the cost above does not apply: measured on two RTX 3060s, `q4_0` decode is flat from 8k to 125k of context (−1.4%) while the KV drops 1.55 GiB to 0.47 GiB per rank, because its attention reads a fixed budget of tokens however long the context is. On gpt-oss use `q8_0`: it runs gpt-oss-120b at 128k of context on two RTX 3060s, and `q4_0` breaks its answers. | `--kv-cache-dtype q4_0` (gpt-oss: `q8_0`) |
-| 8 | **The checkpoint's bf16 dense weights served as fp8.** Attention, GDN, shared expert, lm_head and the embedding are quantized per output row at load and read W8A16; the router, hyper-connection, QSA indexer, PLE and GDN gates stay bf16. Qwen3.8-Flash-Next's resident dense weights go from 4.9 GB per card to 2.9 GB, and the freed VRAM goes to the expert cache. | `--dense-quant fp8` |
+| 8 | **The checkpoint's bf16 dense weights served as fp8 or Q8_0.** Attention, GDN, shared expert, lm_head and the embedding are quantized at load and read W8A16; the router, hyper-connection, QSA indexer, PLE and GDN gates stay bf16. Qwen3.8-Flash-Next's resident dense weights go from 4.9 GB per card to 2.9 GB, and the freed VRAM goes to the expert cache. `q8_0` (ggml blocks through int8 dp4a kernels) is the one for cards without fp8 tensor cores: the few-row GEMMs of a verify window run at the memory bandwidth where fp8 ran at half of it. | `--dense-quant fp8` / `q8_0` |
 | 9 | **A prefill chunk sized to the VRAM that is actually free.** Upstream's fixed 8192 needs 0.97 GiB of transient on a 35B MoE; a 6 GB card does not have it, so long prompts crawled and sometimes died. The transient is measured at startup; the chunk itself is solved before every prefill, against the VRAM free at that moment, with `--max-prefill-length` left as the ceiling. Running the GDN and attention over pieces of a chunk, and the MoE over all of it, makes the chunk wider still: a 20k-token prompt went 490 → 722 tok/s on a 2060 and 437 → 546 on two 3060s. | automatic, `--prefill-chunk-budget`; `--prefill-mixer-pieces 2` |
 | 10 | **Short prompts prefilled by the CPU and the GPU at once.** A prefill moved every layer's whole expert bank to the GPU, however few tokens it held, and a short prompt uses most experts only once or twice. Now a prompt of 64 to 1024 tokens gives each layer's least-used experts to the CPU and moves only the others, both running at the same time. On two RTX 3060s a fresh 270-token prompt's first token came after 3.0 s instead of 8.4 s, a 64-token one after 2.1 s instead of 5.6. Layers whose banks could not be pinned, and `--moe-bank-ram`, keep the old path. | automatic (`FREETOKEN_PREFILL_SPLIT=0` turns it off) |
+| 11 | **2.25-bit expert banks from a GGUF.** Qwen3.8-Flash-Next's routed experts read from ISTA-DASLab's calibrated Q2_0 build while the dense weights, the PLE table and the vision tower stay with the safetensors checkpoint: the banks go from 63.5 GiB to 34 GB, a decode step reads 0.66 GB of experts per token instead of 1.18, and the same GPU cache holds twice the experts. The fast tier, not the accurate one -- 9 of 10 reference prompts against NVFP4's 10, thinking 35% longer; `--reasoning-budget` for the greedy requests that would think in circles. Not chosen by the benchmark: it needs the GGUF file. | `--moe-expert-gguf FILE`, `--reasoning-budget 6000` |
 
 Everything else is upstream FreeToken.
 
@@ -175,7 +176,7 @@ direction: on the single-card rows it is clearly slower (8–22 tok/s against 25
 19–35 against 41–46 on one 3060), while on the two-card Flash-Next row it depends on the text —
 30–36 tok/s on code and tool calls, 11–14 on free prose, against 18–20 plain. With the experts in
 host RAM every row of the verify window pays its own expert traffic, so the window only earns its
-cost where acceptance runs long. [docs/kai.md](docs/kai.md) has the per-step timings.
+cost where acceptance runs long. The exception is the 2.25-bit row: there the window's fixed costs were cut (2026-10), and the ten reference prompts answer at 37-58 tok/s with `--spec-mtp 5 --spec-min-p 0.6` against 23 plain. [docs/kai.md](docs/kai.md) has the per-step timings, [docs/gguf.md](docs/gguf.md) the 2.25-bit configuration.
 
 | GPU | Host RAM | Model | Context | Decode |
 |---|---|---|---|---|
@@ -185,6 +186,7 @@ cost where acceptance runs long. [docs/kai.md](docs/kai.md) has the per-step tim
 | 2× RTX 3060 12 GB, one card used | 64 GB* | `openai/gpt-oss-120b` (117B MoE, MXFP4) | 32k | **15 tok/s** (`--moe-bank-ram 48G`) |
 | 2× RTX 3060 12 GB | 128 GB | `RadixArk/Qwen3.8-Flash-Next-NVFP4` (125B MoE, vision) | **128k** | **18–20 tok/s**, and flat with context — 18.8 at 16k, 19.2 at 98k over 58,000 sampled steps (`--pp-size 2`) |
 | 2× RTX 3060 12 GB | 64 GB* | same model | 128k | **14–15 tok/s** (`--moe-bank-ram 48G`) |
+| 2× RTX 3060 12 GB | 128 GB | same model, experts from ISTA-DASLab's Q2_0 GGUF (`--moe-expert-gguf`, 34 GB of banks) | 128k reserved, measured at short context | **22–23 tok/s** plain; **37–58 tok/s** on the ten reference prompts with `--spec-mtp 5 --spec-min-p 0.6`, `--dense-quant q8_0` and the q4_0 draft head (2026-10-12). Prefill of a 25k-token prompt 1,070–1,135 tok/s against 575–700 |
 
 Qwen3.8-Flash-Next does not fit one 12 GB card at all; the two-card rows are what make it run.
 gpt-oss-120b puts 98% of its parameters in experts, which is why a single 12 GB card can serve it.
@@ -293,7 +295,7 @@ has the chunk-by-chunk timings.
 | [docs/prefix-reuse.md](docs/prefix-reuse.md) | Why switching conversations re-prefills everything on hybrid GDN models (`--linear-state-cache-ratio`), and keeping prefixes on disk (`--prefix-disk-cache`, experimental) |
 | [docs/turing.md](docs/turing.md) | Turing (sm_75): six symptoms, six causes, six fixes |
 | [docs/image-input.md](docs/image-input.md) | Image input: upstream's path, and the vision tower on the CPU (`--mm-encoder-weights cpu`) |
-| [docs/gguf.md](docs/gguf.md) | Why 3-bit and 2-bit GGUF experts are not the shortcut they look like — a road not taken, with the numbers |
+| [docs/gguf.md](docs/gguf.md) | The 2.25-bit expert bank from a GGUF (`--moe-expert-gguf`): what it costs, the configuration that measured best, and the 2026-09 survey of why the community GGUF builds do not load |
 
 ## Who wrote this
 

@@ -4,7 +4,7 @@ An unofficial fork of [FlashML-org/FreeToken](https://github.com/FlashML-org/Fre
 merged with upstream `main` at commit `2d8b9cc` (2026-10-09). It is not affiliated with, endorsed
 by, or supported by FlashML. The license is unchanged (Apache-2.0).
 
-The fork adds nine things upstream does not have:
+The fork adds eleven things upstream does not have:
 
 1. **Image input without VRAM** (`--mm-encoder-weights cpu`). Upstream serves images on the Qwen
    VL families with the vision tower on the GPU; this runs the tower on the CPU instead, so a
