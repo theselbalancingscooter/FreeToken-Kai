@@ -10,6 +10,7 @@ GEMMs of a verify window read the weights at bandwidth on cards without fp8 tens
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 from .configs.base import NoQuantConfig, QuantConfig, Stored
@@ -30,11 +31,24 @@ AT_LOAD_Q8_0 = q8_0_scheme()
 # state decays. They are small, so they buy little VRAM, and they are the last place to spend
 # accuracy. The vision tower stays too: its blocks are streamed from pinned host banks, so fp8
 # would save host RAM, not VRAM, and every image feature the model sees comes out of it.
-KEEP_BF16 = name_set((
-    "*.gate", "*.shared_expert_gate", "*hyper_connection*", "*.indexer", "*.ple",
-    "*.in_proj_ba", "*.in_proj_b", "*.in_proj_a",
-    "visual", "*.visual",
-))
+def _keep_bf16_patterns() -> tuple[str, ...]:
+    pats = [
+        "*.gate", "*.shared_expert_gate", "*hyper_connection*", "*.indexer", "*.ple",
+        "*.in_proj_ba", "*.in_proj_b", "*.in_proj_a",
+        "visual", "*.visual",
+    ]
+    # FREETOKEN_DENSE_QUANT_HC=1 quantizes the hyper-connection GEMMs too (bf16 cutlass, 3.5 ms
+    # of a verify window per rank on an RTX 3060); FREETOKEN_DENSE_QUANT_ROUTER=1 the routers.
+    # Both trade accuracy for bytes in the places that decide where tokens go -- A/B material.
+    if os.environ.get("FREETOKEN_DENSE_QUANT_HC") == "1":
+        pats.remove("*hyper_connection*")
+    if os.environ.get("FREETOKEN_DENSE_QUANT_ROUTER") == "1":
+        pats.remove("*.gate")
+        pats.remove("*.shared_expert_gate")
+    return tuple(pats)
+
+
+KEEP_BF16 = name_set(_keep_bf16_patterns())
 
 
 class LoadTimeQuantConfig(QuantConfig):

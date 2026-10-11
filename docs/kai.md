@@ -426,6 +426,12 @@ on acceptance), because its per-step fixed costs are larger. The head is also su
 Qwen3.8-Flash-Next (its `mtp.*` block has four residual streams and a hyper-connection mixer;
 the 512 bf16 experts become one NVFP4 bank layer, 1.35 GB pinned).
 
+`--spec-min-p P` ends a window at the first draft the head scores below `P` (Strata's rule; its
+calibration picks 0.70): a confident stretch gets all K drafts, a doubtful one is verified no
+further than it should be. The window then varies from 2 to K+1 rows and a CUDA graph is captured
+for every width, sharing one memory pool. Without it the chain runs on the device end to end and
+the K drafts come back in one read.
+
 `--spec-draft-head-quant q4_0` (or `q8_0`) scores the drafts through a packed copy of the lm_head
 instead of the model's own: a draft only decides what the target verifies, so a coarser head costs
 at most acceptance, never correctness, and the 248k-vocab head read that every draft pays drops
@@ -466,6 +472,7 @@ model that does). Not yet measured on a card.
 | `FREETOKEN_STAGED_COPY` / `FREETOKEN_STAGED_COPY_MB` | on / `32` | Whole-layer prefill copies of non-pinned bank layers go through two pinned staging buffers of this size |
 | `FREETOKEN_GGUF_MMQ_MIN_ROWS` | `2` | GGUF expert banks (`--moe-expert-gguf`, gemma4 GGUF): from this many rows (tokens x top_k) the tiled MMQ kernel serves the experts, reading each expert once per tile of 4 tokens instead of once per row as the MMVQ GEMV does -- the prefill chunks and the `--spec-mtp` verify windows. `0` keeps MMVQ everywhere (a decoded single token always uses it) |
 | `FREETOKEN_Q8_0_MMVQ_MAX_ROWS` / `FREETOKEN_Q8_0_MMQ_MAX_ROWS` | `1` / `64` | `--dense-quant q8_0`: rows (tokens) up to which a dense projection runs the per-row MMVQ GEMV, and up to which the tiled int8 MMQ; above the second the weight is dequantized once per call and cuBLAS runs the GEMM on tensor cores (prefill). The verify window of `--spec-mtp K` is K+1 rows |
+| `FREETOKEN_DENSE_QUANT_HC` / `FREETOKEN_DENSE_QUANT_ROUTER` | off | `--dense-quant`: also quantize the hyper-connection GEMMs (bf16 cutlass, 3.5 ms of a verify window per rank on an RTX 3060) / the MoE routers. Both decide where tokens go, so they stay bf16 unless asked; check the answers before keeping either |
 | `FREETOKEN_SPEC_ROLLBACK` | `loop` | How a `--spec-mtp` window's GDN states are rolled back to the accepted rows: `loop` restores layer by layer, `batched` stacks every layer's state and writes the pools with two indexed stores. On an RTX 2060 (30 GDN layers) the stacked version was not faster (3.1-3.4 ms against 2.5-3.2), so the loop stays the default |
 | `FREETOKEN_GDN_WINDOW_CONV` | `update` | The GatedDeltaNet conv of a `--spec-mtp` verify window (one request, K+1 tokens) runs the decode-style update kernel over the window; `varlen` keeps the chunked prefill conv it used before (0.23 ms per layer for 4 tokens on an RTX 3060: 4 ms of each rank's window). `FT_SPEC_CHECK_GDN=1` runs both for the first windows and logs the difference |
 | `FREETOKEN_GGUF_MMQ_WIDE_MIN_ROWS` | `256` | Q2_0 banks: from this many rows the MMQ tile is 32 tokens x 64 rows (8 warps) instead of 4 x 32 -- a prefill chunk routes about 100 tokens to each expert, which the 4-token tile reads 25 times over. On an RTX 2060, 10,240 rows over 128 experts: 26.6 -> 11.4 ms; on two RTX 3060s a 25k-token prompt 829 -> 1,010 tok/s, the chunk's GPU time now within 10% of its x4 expert transfer. `0` keeps the 4-token tile everywhere |
