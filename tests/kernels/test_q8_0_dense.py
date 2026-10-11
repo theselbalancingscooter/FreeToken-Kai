@@ -91,6 +91,25 @@ def test_the_three_paths_agree_with_each_other():
     assert (via_mmvq - via_mmq).abs().max() / scale < 3e-3
 
 
+def test_a_row_length_off_the_kernel_step_takes_the_dequant_path_and_stays_finite():
+    """K = 320 (the hyper-connection up projection): the vendored kernels' last warp step would
+    read past the last row. The method dequantizes instead; the product must be finite and right
+    even with NaN-decoding bytes placed right after the weight."""
+    torch.manual_seed(7)
+    N, K = 1024, 320
+    w = torch.randn(N, K, device="cuda", dtype=torch.bfloat16) * 0.05
+    method, layer = _layer(w)
+    poison = torch.full((65536,), 0xFF, dtype=torch.uint8, device="cuda")
+    buf = torch.cat([layer.weight.reshape(-1), poison])
+    layer.weight = buf[: N * (K // 32 * 34)].view(N, K // 32 * 34)
+    for rows in (1, 4, 6, 100):
+        x = torch.randn(rows, K, device="cuda", dtype=torch.bfloat16)
+        out = method.apply(layer, x).float()
+        assert torch.isfinite(out).all()
+        ref = x.float() @ w.float().t()
+        assert (out - ref).abs().max() / ref.abs().max() < 2e-2
+
+
 def test_leading_dims_and_non_contiguous_input():
     torch.manual_seed(5)
     N, K = 256, 512

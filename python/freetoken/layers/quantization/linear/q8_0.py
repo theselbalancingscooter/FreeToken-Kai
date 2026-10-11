@@ -19,6 +19,12 @@ from ..scheme import QuantKind
 from .base import LinearConfig, LinearKernel, LinearMethod
 
 Q8_0_BLOCK = 32
+# The vendored dense MMQ walks a row in warp steps of 4 blocks (128 weights) and the MMVQ in
+# steps of its own; a row whose length is not a multiple of 128 makes the last step read past
+# the row -- into the next row (harmless: the activation padding there is zero) or, for the
+# last row, past the buffer (a NaN scale poisons the output). Such shapes (the hyper-connection
+# up projection: K = 320) take the dequantize + cuBLAS path at every M.
+Q8_0_KERNEL_STEP = 128
 
 
 def mmvq_max_rows() -> int:
@@ -51,9 +57,10 @@ class GgmlQ8_0LinearKernel(LinearKernel):
         if not x2.is_contiguous():
             x2 = x2.contiguous()
         rows, N = x2.shape[0], layer.out_features
-        if rows <= mmvq_max_rows():
+        kernels_ok = K % Q8_0_KERNEL_STEP == 0
+        if kernels_ok and rows <= mmvq_max_rows():
             out = ggml_mul_mat_vec_a8(layer.weight, x2, GGML_Q8_0, N)
-        elif rows <= mmq_max_rows():
+        elif kernels_ok and rows <= mmq_max_rows():
             out = ggml_mul_mat_a8(layer.weight, x2, GGML_Q8_0, N)
         else:
             w = ggml_dequantize(layer.weight, GGML_Q8_0, N, K, x2.dtype)
