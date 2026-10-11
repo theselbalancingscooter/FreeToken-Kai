@@ -87,10 +87,11 @@ The fork adds nine things upstream does not have:
    PLE table and the vision tower stay with the safetensors checkpoint. The banks go from
    63.5 GiB to 34 GB, a decode step reads 0.66 GB of experts per token instead of 1.18, and the
    same GPU cache holds twice the experts; the ggml MMVQ and MMQ kernels and the CPU executor
-   dequantise the blocks in place (W2A8). On two RTX 3060s with `--spec-mtp 5` it decodes at
-   28 tok/s against NVFP4's 19-20 and prefills a 25k-token prompt at 1,010 tok/s against 575-700.
-   It is the fast tier, not the accurate one: on ten prompts the Q2_0 build matched NVFP4 on 9
-   (all code tasks included) and thought 35% longer. See [gguf.md](gguf.md).
+   dequantise the blocks in place (W2A8). On two RTX 3060s, with `--dense-quant q8_0`, the q4_0
+   draft head and `--spec-mtp 5 --spec-min-p 0.6`, the ten reference prompts answer at 37-58
+   tok/s against the NVFP4 tier's 23-28, and a 25k-token prompt prefills at 1,070-1,135 tok/s
+   against 575-700. It is the fast tier, not the accurate one: on ten prompts the Q2_0 build
+   matched NVFP4 on 9 (all code tasks included) and thought 35% longer. See [gguf.md](gguf.md).
 
 11. **A reasoning budget** (`--reasoning-budget N`, or `reasoning_budget` in a chat / completion
    request): the tokens a request may spend between `<think>` and `</think>`. At the cap the
