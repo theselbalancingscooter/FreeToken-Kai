@@ -67,6 +67,7 @@ class TuneBody(BaseModel):
     mode: str = "standard"  # "thorough" adds the candidates that rarely win
     use: str = "both"  # which generation decides: "prose", "code" or "both"
     from_last: bool = False  # pick up from the model's last result: only the candidates it has not tried
+    experts: str | None = None  # "checkpoint" or "q2" (the Q2_0 GGUF next to it); None = what the recommendation proposes
 
 
 class BenchBody(BaseModel):
@@ -495,7 +496,14 @@ def build_app(
         @app.get("/engine/config", dependencies=auth)
         async def engine_config():
             st = manager.status()
-            return {"model": st.get("model"), "port": st.get("port"), "args": manager.serve_args()}
+            args = manager.serve_args()
+            # the profile this server was started from (POST /profiles/{name}/start), for as long as
+            # the engine still runs what that start gave it: two profiles may share a model and a
+            # port, and once one of them is edited the flags alone cannot say whose server this is
+            sp = getattr(app.state, "started_profile", None)
+            mine = bool(sp and st.get("running") and sp["model"] == st.get("model") and sp["port"] == st.get("port")
+                        and sp["args"] == list(args))
+            return {"model": st.get("model"), "port": st.get("port"), "args": args, "profile": sp["name"] if mine else None}
 
         def _view_port() -> int:
             st = manager.status()
@@ -548,12 +556,12 @@ def build_app(
             return {"models": await run(console_pool, list_models)}
 
         @app.get("/recommend", dependencies=auth)
-        async def recommend(model: str):
+        async def recommend(model: str, experts: str | None = None):
             # reads nvidia-smi, /proc and the checkpoint's config; no GPU work, so the proxy pool is fine
             from freetoken.webui.recommend import recommend as build
 
             try:
-                rec = await run(console_pool, build, model)
+                rec = await run(console_pool, functools.partial(build, model, experts=experts))
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc))
             except Exception as exc:  # noqa: BLE001
@@ -562,9 +570,10 @@ def build_app(
             tune = getattr(app.state, "tune", None)
             if tune is not None:
                 from freetoken.webui.models import resolve_model
-                from freetoken.webui.tuner import with_benchmark
+                from freetoken.webui.tuner import experts_of, with_benchmark
 
-                rec = with_benchmark(rec, tune.last(resolve_model(model)))
+                # the result measured with the experts this recommendation serves, not the other one's
+                rec = with_benchmark(rec, tune.last(resolve_model(model), experts_of(rec.get("flags") or [])))
             return rec
 
         @app.get("/serve-flags", dependencies=auth)
@@ -581,10 +590,10 @@ def build_app(
         # ---- the benchmark: measure this PC with a model, settle the flags on the numbers (webui/tuner.py)
         from freetoken.webui.tuner import Busy, NoLastResult, TuneJob
 
-        def _recommend_quiet(model: str) -> dict:
+        def _recommend_quiet(model: str, experts: str | None = None) -> dict:
             from freetoken.webui.recommend import recommend as build
 
-            return build(model)
+            return build(model, experts=experts)
 
         tune = TuneJob(
             manager,
@@ -606,8 +615,14 @@ def build_app(
                 doc = await run(proxy_pool, probe.health, default_serve_port)
                 if doc.get("reachable") and doc.get("status") in ("ok", "loading"):
                     return JSONResponse(status_code=409, content={"error": "a server started outside ft mgr is running", "code": "external_serve"})
+            if body.experts == "q2":
+                from freetoken.webui.models import q2_gguf_for
+
+                if not await run(console_pool, q2_gguf_for, model):
+                    return JSONResponse(status_code=409, content={"error": "no Q2_0 GGUF next to this checkpoint", "code": "no_q2_gguf"})
             try:
-                return tune.start(model, body.trials, body.port, mode=body.mode, use=body.use, from_last=body.from_last)
+                return tune.start(model, body.trials, body.port, mode=body.mode, use=body.use, from_last=body.from_last,
+                                  experts=body.experts)
             except Busy as exc:
                 return JSONResponse(status_code=409, content={"error": str(exc), "code": "busy"})
             except NoLastResult as exc:
@@ -628,7 +643,7 @@ def build_app(
             return await run(console_pool, bench_profiles)
 
         @app.get("/tune/pending", dependencies=auth)
-        async def tune_pending(model: str, mode: str = "standard"):
+        async def tune_pending(model: str, mode: str = "standard", experts: str | None = None):
             """What picking up from the model's last result would try (nothing is run)."""
             from freetoken.webui.models import resolve_model
 
@@ -636,14 +651,14 @@ def build_app(
                 path = resolve_model(model)
             except ValueError:
                 return {"available": False, "reason": "no_last", "items": []}
-            return await run(console_pool, tune.pending, path, mode)
+            return await run(console_pool, tune.pending, path, mode, experts)
 
         @app.get("/tune/last", dependencies=auth)
-        async def tune_last(model: str):
+        async def tune_last(model: str, experts: str | None = None):
             from freetoken.webui.models import resolve_model
 
             try:
-                return {"result": tune.last(resolve_model(model))}
+                return {"result": tune.last(resolve_model(model), experts)}
             except ValueError:
                 return {"result": None}
 
@@ -665,6 +680,23 @@ def build_app(
                 if not await run(lifecycle_pool, profiles.delete, name):
                     raise HTTPException(status_code=404, detail="no such profile")
                 return {"deleted": name}
+
+            @app.post("/profiles/{name}/start", dependencies=auth)
+            async def profiles_start(name: str, body: StopBody | None = None):
+                """Start a profile, replacing what runs (``/engine/switch`` with the profile's own
+                model, port and flags), and remember that the server was started from it."""
+                found = next((p for p in await run(lifecycle_pool, profiles.list) if p.get("name") == name), None)
+                if found is None:
+                    raise HTTPException(status_code=404, detail="no such profile")
+                port = resolve_port(found.get("port"))
+                model = resolve_model_arg(found["model"])
+                args = list(found.get("args") or [])
+                try:
+                    out = await run(lifecycle_pool, manager.switch, model, port, args, bool(body and body.force))
+                except (AccountingPrepareError, AccountingOutboxError) as exc:
+                    return accounting_error(exc)
+                app.state.started_profile = {"name": name, "model": model, "port": port, "args": args}
+                return out
 
 
     if console:

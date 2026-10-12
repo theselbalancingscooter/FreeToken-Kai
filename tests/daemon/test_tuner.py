@@ -66,6 +66,42 @@ def test_keep_by_goal_and_use():
     assert not tuner.keep(_t(251, 18.4), _t(517, 17.0), gen, "prose")  # but not at 8% of generation
 
 
+def _w(prefill, prose, code, short, prose_runs, code_runs):
+    """A trial measured under an MTP window: 600-token runs, the median, every run on record."""
+    return {"ok": True, "prefill_tps": prefill, "decode_tps": prose, "decode_code_tps": code, "short_s": short,
+            "gen_tokens": tuner.DECODE_TOKENS_MTP, "decode_runs": prose_runs, "decode_code_runs": code_runs}
+
+
+def test_under_a_window_a_generation_difference_inside_the_swing_decides_nothing():
+    # two RTX 3060s, Flash-Next with the Q2_0 experts, the night of 2026-10-12: the figures the benchmark saw
+    base = _w(698.0, 33.99, 40.58, 1.62, [36.0, 28.1, 34.0], [40.9, 39.3, 40.6])
+    budget = search.Candidate("budget_075", {"--prefill-chunk-budget": "0.75"}, goal="prefill", gain=1.05)
+    for run in (_w(919.9, 32.58, 39.92, 1.74, [31.8, 32.6, 32.8], [36.8, 39.9, 41.0]),
+                _w(915.5, 29.89, 37.49, 1.74, [29.9, 30.1, 27.9], [38.1, 37.5, 36.7]),
+                _w(914.8, 32.40, 38.08, 1.65, [34.0, 31.0, 32.4], [37.9, 42.3, 38.1])):
+        # +31% of prompt processing, generation 3-10% lower as the same settings swing: turned down three times then
+        assert tuner.keep(base, run, budget, "both")
+    assert tuner.gen_band(base, base) == tuner.GEN_BAND_MAX  # 36.0 / 28.1 / 34.0 is wider than the cap
+    # changes that moved nothing are still not kept
+    threads = search.Candidate("threads_fewer", {"--moe-cpu-threads": "7"})
+    assert not tuner.keep(base, _w(685.5, 30.60, 37.56, 1.75, [31.7, 28.7, 30.6], [37.6, 40.3, 34.0]), threads, "both")
+    kv = search.Candidate("kv_q8", {"--kv-cache-dtype": "q8_0"}, group="kv")
+    assert not tuner.keep(base, _w(248.2, 30.32, 37.28, 2.70, [29.8, 30.3, 30.9], [37.3, 37.3, 37.1]), kv, "both")
+    # the checkpoint's experts the same night: min-p over a 5-token window read 3-5% faster on one start and
+    # cost 17% of prompt processing -- a gain inside the swing, paid for with more than it gains
+    nv = _w(689.9, 22.76, 29.18, 2.93, [23.2, 22.8, 22.2], [29.2, 31.7, 27.8])
+    minp = search.Candidate("minp_06", {"--spec-min-p": "0.6", "--spec-mtp": "5"}, code=True, hold_prefill=0.85)
+    assert not tuner.keep(nv, _w(570.7, 23.42, 30.74, 2.91, [24.9, 23.4, 22.9], [26.7, 33.2, 30.7]), minp, "both")
+    # a window where there was none is far outside any swing (16.9 -> 28.4 tok/s on seven answered prompts)
+    plain = {"ok": True, "prefill_tps": 645.0, "decode_tps": 16.9, "decode_code_tps": 17.0, "short_s": 2.9, "gen_tokens": tuner.DECODE_TOKENS,
+             "decode_runs": [16.8, 16.9, 16.7], "decode_code_runs": [17.0, 16.9, 16.8]}
+    mtp = search.Candidate("mtp_3", {"--spec-mtp": "3"}, code=True, hold_prefill=0.85)
+    windowed = _w(662.0, 28.4, 29.0, 2.9, [28.6, 28.4, 28.1], [29.2, 29.0, 28.7])
+    assert tuner.keep(plain, windowed, mtp, "both") and tuner.gen_band(plain, windowed) == tuner.GEN_BAND_MIN
+    # plain decoding is judged as it always was
+    assert tuner.gen_band(_t(600, 30.0), _t(640, 29.2)) == 0.0 and tuner.gen_band(plain, plain) == 0.0
+
+
 def test_the_short_prompt_must_hold_and_can_win_alone():
     base = dict(_t(600, 30.0), short_s=3.0)
     gen = search.Candidate("x", {"--a": "1"})
@@ -192,6 +228,14 @@ def test_kernels_that_cannot_run_here_are_not_tried_and_say_why():
     assert "kernel_moe_b12x" in _keys(ORNITH_ARGS, ORNITH, blackwell, "standard")
 
 
+def test_no_expert_kernel_of_the_checkpoints_format_when_the_experts_come_from_a_gguf():
+    # the GGUF's experts are Q2_0: moe.nvfp4=<kernel> selects nothing, so trying it measures only the swing
+    plain = _keys(FLASH_ARGS, FLASH, HW_3060, "thorough")
+    gguf = _keys(FLASH_ARGS + ["--moe-expert-gguf", "/m/x-Q2_0.gguf"], FLASH, HW_3060, "thorough")
+    assert [k for k in plain if k.startswith("kernel_moe_")] and not [k for k in gguf if k.startswith("kernel_moe_")]
+    assert [k for k in gguf if not k.startswith("kernel_moe_")] == [k for k in plain if not k.startswith("kernel_moe_")]
+
+
 def test_standard_plan_on_a_2060_with_ornith():
     keys = _keys(ORNITH_ARGS, ORNITH, HW_2060, "standard")
     assert keys == ["strategy_offload", "threads_all", "threads_fewer", "kernel_moe_triton", "kernel_moe_marlin", "kernel_moe_b12x",
@@ -202,15 +246,18 @@ def test_thorough_plan_adds_the_rarely_winning_ones():
     standard = set(_keys(ORNITH_ARGS, ORNITH, HW_2060, "standard"))
     thorough = set(_keys(ORNITH_ARGS, ORNITH, HW_2060, "thorough"))
     assert standard < thorough
-    assert {"fetch_none", "kv_q4", "hit_d2d", "budget_090", "pieces_1", "max_prefill_16k", "no_host_embedding",
+    assert {"fetch_none", "kv_q4", "hit_d2d", "pieces_1", "max_prefill_16k", "no_host_embedding",
             "kernel_linear_marlin"} <= thorough - standard
+    assert "budget_090" not in thorough  # never won, and killed the server with the Q2_0 experts on two RTX 3060s
+    assert "mtp_4" not in thorough  # a 4-token window is tried where it was measured (Flash-Next)
 
 
 def test_two_3060s_with_flash_next():
     keys = _keys(FLASH_ARGS, FLASH, HW_3060, "standard")
     assert "pp_layers_25" in keys  # rank 1 sits on the x4 link: rank 0 takes one more layer
     assert "threads_fewer" in keys and "threads_all" not in keys  # already at every core
-    assert "mtp_3" in keys and "mtp_5" in keys
+    assert "mtp_3" in keys and "mtp_4" in keys and "mtp_5" in keys
+    assert "mtp_4" not in _keys(FLASH_ARGS + ["--spec-mtp", "4"], FLASH, HW_3060, "standard")  # the window the settings already have
     assert "ple_pinned" not in keys  # 135 GiB of weights do not leave RAM for the PLE table
     thorough = _keys(FLASH_ARGS, FLASH, HW_3060, "thorough")
     assert {"pp_layers_26", "send_ahead_3", "prefill_group_2", "dense_bf16"} <= set(thorough)
@@ -232,8 +279,8 @@ def test_dense_q8_is_standard_without_fp8_tensor_cores_and_thorough_with_them():
 
 def test_min_p_and_the_draft_head_follow_the_window():
     plan = {c.key: c for c in search.plan(FLASH_ARGS, FLASH, HW_3060, "standard")}
-    # without a window in the base flags they wait for a kept mtp candidate (either of the two)
-    assert plan["minp_06"].after == ("mtp_3", "mtp_5") and plan["minp_06"].opened_by({"mtp_5"}) and not plan["minp_06"].opened_by(set())
+    # without a window in the base flags they wait for a kept mtp candidate (any of them)
+    assert plan["minp_06"].after == ("mtp_3", "mtp_4", "mtp_5") and plan["minp_06"].opened_by({"mtp_4"}) and not plan["minp_06"].opened_by(set())
     assert "draft_q4" not in plan  # fp8 dense: the 4-bit head packed from an fp8 head loses acceptance
     q8_args = [a if a != "fp8" else "q8_0" for a in FLASH_ARGS] + ["--spec-mtp", "3"]
     plan = {c.key: c for c in search.plan(q8_args, FLASH, HW_3060, "standard")}
@@ -361,6 +408,9 @@ class FakeServe:
         self.lucky = lucky or {}  # "--flag=value" -> factors on the first start with it only
         self.t = 0.0
         self.code_seen = False
+        self.gen_asked = []  # max_tokens of every generation, in order
+        self.per_chunk = 1  # tokens a stream chunk carries (a verify window under MTP)
+        self.swing = None  # an iterator of factors, one per generation: the same settings giving different figures
 
     def clock(self):
         return self.t
@@ -418,10 +468,12 @@ class FakeServe:
         prose, _, code = self.rates()
         is_code = "Python module" in body["prompt"]
         self.code_seen |= is_code
-        rate = code if is_code else prose
-        for _ in range(body["max_tokens"]):
-            self.t += 1 / rate
-            yield "data: " + json.dumps({"choices": [{"text": "x"}]}) + "\n"
+        rate = (code if is_code else prose) * (next(self.swing) if self.swing else 1.0)
+        self.gen_asked.append(body["max_tokens"])
+        for i in range(0, body["max_tokens"], self.per_chunk):
+            n = min(self.per_chunk, body["max_tokens"] - i)
+            self.t += n / rate
+            yield "data: " + json.dumps({"choices": [{"text": "x" * n}]}) + "\n"
         yield "data: " + json.dumps({"choices": [], "usage": {"completion_tokens": body["max_tokens"]}}) + "\n"
         yield "data: [DONE]\n"
 
@@ -607,6 +659,142 @@ def test_the_recommendation_follows_the_last_benchmark(tmp_path):
     assert tuner.with_benchmark(rec, None) is rec and tuner.with_benchmark(rec, {"error": "x", "args": ["--a"]}) is rec
 
 
+def test_the_warm_up_is_counted_in_tokens_not_in_chunks():
+    # plain decoding, one token a chunk at 20 tok/s after a slow first 60: chunk 61 on is timed, as before
+    slow = [i * 0.2 for i in range(60)]
+    plain = slow + [slow[-1] + 0.2 + i * 0.05 for i in range(240)]
+    assert tuner.rate_after_warmup(plain, 300) == pytest.approx(20.0)
+    # MTP, three tokens a window: 300 tokens are 100 chunks, the warm-up is the first 20 of them and
+    # 79 windows are timed -- counting 60 chunks would have left 39
+    windows = [i * 0.6 for i in range(20)] + [19 * 0.6 + 0.6 + i * 0.1 for i in range(80)]
+    assert tuner.rate_after_warmup(windows, 300) == pytest.approx(30.0)
+    slower_tail = windows[:61] + [windows[60] + (i + 1) * 0.3 for i in range(39)]  # the last 39 windows at 10 tok/s
+    assert tuner.rate_after_warmup(slower_tail, 300) < 20.0  # the 40 windows before them count too
+    # too short for a warm-up: the whole run; nothing to time: None
+    assert tuner.rate_after_warmup([0.0, 1.0, 2.0], 30) == pytest.approx(14.5)
+    assert tuner.rate_after_warmup([1.0], 5) is None and tuner.rate_after_warmup([], None) is None
+    assert tuner.rate_after_warmup(plain, None) == pytest.approx(20.0)  # no usage count: a chunk is a token
+
+
+def test_a_run_with_an_mtp_window_generates_longer_and_takes_the_median(tmp_path):
+    m = FakeManager()
+    serve = FakeServe(m)
+    serve.per_chunk = 3
+    job = _job(tmp_path, m, serve, rec=_moe_rec(mtp=True))
+    # one generation in three comes out 60% faster, as when the text happens to take every draft
+    import itertools
+    serve.swing = itertools.cycle([1.0, 1.6, 1.0, 1.0])
+    plain = job._trial("A", "/models/M", 1919, ["--max-seq-len-override", "16384"], code=True)
+    asked, serve.gen_asked = serve.gen_asked, []
+    assert set(asked) == {tuner.DECODE_TOKENS} and len(asked) == 8  # a warm-up and three runs, on prose and on code
+    assert plain["gen_tokens"] == 300 and plain["decode_tps"] == pytest.approx(48.0, rel=0.01)  # no window: the best run
+    assert len(plain["decode_runs"]) == 3 and len(plain["decode_code_runs"]) == 3
+    serve.swing = itertools.cycle([1.0, 1.6, 1.0, 1.0])
+    win = job._trial("B", "/models/M", 1919, ["--max-seq-len-override", "16384", "--spec-mtp", "3"], code=True)
+    assert serve.gen_asked == [300, 600, 600, 600] * 2  # the warm-up stays short
+    assert win["gen_tokens"] == 600 and win["decode_tps"] == pytest.approx(30.0, rel=0.01)  # a window: the median, not the lucky run
+    assert sorted(win["decode_runs"]) == [pytest.approx(30.0, rel=0.01), pytest.approx(30.0, rel=0.01), pytest.approx(48.0, rel=0.01)]
+    zero = job._trial("C", "/models/M", 1919, ["--max-seq-len-override", "16384", "--spec-mtp", "0"], code=True)
+    assert zero["gen_tokens"] == 300  # --spec-mtp 0 is no window
+
+
+def test_a_pickup_from_a_result_that_timed_few_windows_judges_mtp_again(tmp_path):
+    m = FakeManager()
+    serve = FakeServe(m, effects={"--kv-reserve-tokens=32768": (0.5, 1.0, 0.5)})
+    job = _pickup_job(tmp_path, m, serve, rec=_moe_rec(mtp=True))
+    first = _run(job, mode="standard")["result"]
+    assert first["gen_method"] == tuner.GEN_METHOD and {"mtp_3", "mtp_5"} <= set(first["tried"])
+    assert job.pending("/models/M", "standard")["items"] == [] and not job.pending("/models/M", "standard")["windows_missing"]
+    # the same result as an older build saved it: no record of how generation was measured
+    path = tmp_path / "tune" / "M.json"
+    old = json.loads(path.read_text())
+    del old["gen_method"]
+    path.write_text(json.dumps(old))
+    pend = job.pending("/models/M", "standard")
+    assert {"mtp_3", "mtp_5"} <= {i["key"] for i in pend["items"]} and pend["windows_missing"]
+    assert not {i["key"] for i in pend["items"]} - tuner.MTP_UNJUDGED  # and nothing else is opened again
+    job._spawn = _no_hw
+    job.start("/models/M", True, mode="standard", from_last=True)
+    job._thread.join(30)
+    st = job.status()
+    assert st["state"] == "done", st["error"]
+    assert {"mtp_3", "mtp_5"} <= {t.get("key") for t in st["result"]["trials"]}
+    assert st["result"]["gen_method"] == tuner.GEN_METHOD and job.pending("/models/M", "standard")["items"] == []
+
+
+GGUF_FLAGS = ["--moe-expert-gguf", "/models/M-GGUF/M-Q2_0.gguf", "--reasoning-budget", "6000"]
+
+
+def _experts_job(tmp_path, m, asked):
+    """A job whose recommendation proposes the Q2_0 GGUF unless the checkpoint's experts are asked for."""
+    def recommend(model, experts=None):
+        asked.append(experts)
+        rec = json.loads(json.dumps(DENSE_REC))
+        if experts != "checkpoint":
+            rec["flags"] += GGUF_FLAGS
+        return rec
+
+    job = _job(tmp_path, m, FakeServe(m))
+    job._recommend = recommend
+    return job
+
+
+def _start(job, **kw):
+    job.start("/models/M", **kw)
+    job._thread.join(30)
+    st = job.status()
+    assert st["state"] == "done", st["error"]
+    return st["result"]
+
+
+def test_each_experts_choice_keeps_its_own_result(tmp_path):
+    asked: list = []
+    job = _experts_job(tmp_path, FakeManager(), asked)
+    plain, q2 = tmp_path / "tune" / "M.json", tmp_path / "tune" / "M.q2_0.json"
+
+    ckpt = _start(job, experts="checkpoint")
+    assert ckpt["experts"] == "checkpoint" and "--moe-expert-gguf" not in ckpt["args"]
+    assert plain.exists() and not q2.exists()
+    before = plain.read_bytes()
+
+    fast = _start(job, experts="q2")
+    assert fast["experts"] == "q2" and "--moe-expert-gguf" in fast["args"] and "--moe-expert-gguf" in fast["base_args"]
+    assert plain.read_bytes() == before  # measuring the GGUF did not replace the checkpoint's result
+    assert job.last("/models/M")["experts"] == "checkpoint" and job.last("/models/M", "checkpoint")["experts"] == "checkpoint"
+    assert job.last("/models/M", "q2")["experts"] == "q2"
+
+    # a pickup continues the result of the experts asked for, and files what it finds there
+    assert job.pending("/models/M", experts="q2")["available"] and job.pending("/models/M")["available"]
+    again = _start(job, from_last=True, experts="q2")
+    assert again["from_last"] and again["experts"] == "q2" and "--moe-expert-gguf" in again["args"]
+    assert plain.read_bytes() == before and json.loads(q2.read_text())["from_last"]
+    assert "checkpoint" in asked and "q2" in asked
+
+    # no choice: the recommendation's own (the GGUF, since it is there), filed under what it served
+    asked.clear()
+    assert _start(job)["experts"] == "q2" and asked[0] is None and plain.read_bytes() == before
+
+
+def test_a_q2_result_saved_under_the_plain_name_is_not_taken_for_the_checkpoints(tmp_path):
+    # before results were filed by experts, a run with the GGUF next to the checkpoint wrote M.json
+    job = _experts_job(tmp_path, FakeManager(), [])
+    os.makedirs(tmp_path / "tune")
+    (tmp_path / "tune" / "M.json").write_text(json.dumps({"args": GGUF_FLAGS, "finished": 1.0}))
+    assert job.last("/models/M") is None and job.last("/models/M", "q2")["finished"] == 1.0
+    assert job.pending("/models/M")["reason"] == "no_last"
+
+
+def test_asking_for_the_gguf_where_there_is_none_fails_before_any_server_starts(tmp_path):
+    m = FakeManager()
+    job = _job(tmp_path, m, FakeServe(m))  # this recommendation never proposes a GGUF
+    job._recommend = lambda model, experts=None: DENSE_REC
+    job.start("/models/M", experts="q2")
+    job._thread.join(30)
+    st = job.status()
+    assert st["state"] == "error" and "Q2_0" in st["error"]
+    assert not [c for c in m.calls if c[0] == "switch"] and not (tmp_path / "tune").exists()
+
+
 def test_a_change_dropped_for_generation_alone_is_judged_against_the_base_measured_again(tmp_path):
     m = FakeManager()
     # the budget gains 20% prefill; its start lands on a slow patch of the PC (generation -12%), and the
@@ -677,14 +865,20 @@ def test_undoing_candidates_are_not_both_tried(tmp_path):
 
 
 def test_mtp_is_measured_on_code_and_the_use_decides(tmp_path):
-    effects = {"--spec-mtp=3": (0.85, 0.95, 1.6), "--spec-mtp=5": (0.80, 0.95, 1.7), "--kv-reserve-tokens=32768": (0.5, 1.0, 0.5)}
+    effects = {"--spec-mtp=3": (0.85, 0.95, 1.6), "--spec-mtp=5": (0.80, 0.95, 2.0), "--kv-reserve-tokens=32768": (0.5, 1.0, 0.5)}
     m = FakeManager()
     serve = FakeServe(m, effects=effects)
     r = _run(_job(tmp_path, m, serve, rec=_moe_rec(mtp=True)), use="code")["result"]
     assert serve.code_seen
     decisions = {k: d for _, k, d in _tried(r)}
-    assert decisions["mtp_3"] == "kept" and decisions["mtp_5"] == "kept"
+    assert decisions["mtp_3"] == "kept" and decisions["mtp_5"] == "kept"  # 5 tokens: a quarter faster on code than 3
     assert dict(tuner.parse_flags(r["args"]))["--spec-mtp"] == "5"
+    # between two windows a gain inside the swing of windowed generation (6% here) is not a gain
+    m3 = FakeManager()
+    close = dict(effects, **{"--spec-mtp=5": (0.80, 0.95, 1.7)})
+    r3 = _run(_job(tmp_path / "close", m3, FakeServe(m3, effects=close), rec=_moe_rec(mtp=True)), use="code")["result"]
+    d3 = {k: d for _, k, d in _tried(r3)}
+    assert d3["mtp_3"] == "kept" and d3["mtp_5"] == "rejected" and dict(tuner.parse_flags(r3["args"]))["--spec-mtp"] == "3"
     mtp_runs = [t for t in r["trials"] if (t.get("key") or "").startswith("mtp_")]
     assert all(t["decode_code_tps"] > t["decode_tps"] for t in mtp_runs)
     assert all(t.get("decode_code_tps") for t in r["trials"] if t.get("ok"))  # every run, so the figures compare

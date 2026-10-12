@@ -32,6 +32,7 @@ import json
 import math
 import os
 import random
+import statistics
 import subprocess
 import threading
 import time
@@ -51,6 +52,25 @@ PREFILL_TOKENS = 16384
 # three runs, median: on a 2060 two 200-token runs swung 31-36 tok/s between runs that should match
 DECODE_TOKENS = 300
 DECODE_RUNS = 3
+# With MTP a chunk of the stream is a verify window of several tokens, so 300 tokens are 80-120
+# windows, and with the warm-up set aside a second or two of them were timed: two RTX 3060s with
+# the Q2_0 experts gave 32, 33, 36 and 55 tok/s for the same settings, and a 5-token window could
+# not be told from a 3-token one (2026-10-12). A run with a window generates this many tokens, the
+# warm-up is counted in tokens (rate_after_warmup), and its figure is the median of the runs.
+DECODE_TOKENS_MTP = 600
+# How generation is measured. A result records it; a pickup from a result measured the older way
+# judges the MTP candidates again (MTP_UNJUDGED).
+GEN_METHOD = 2
+MTP_UNJUDGED = frozenset({"mtp_3", "mtp_4", "mtp_5", "minp_06", "draft_q4"})
+# Generation under an MTP window still swings between starts of the same settings: two RTX 3060s
+# with the Q2_0 experts read them at 29.4, 32.2 and 34.2 tok/s (600-token runs, the median of
+# three), and the three runs of one start as far apart as 36.0 / 28.1 / 34.0. A verdict that asked
+# generation to hold within 3% turned down a wider prefill chunk three times -- 915 against 698
+# tok/s of prompt processing, a change that does not touch generation. So with a window in play a
+# shortfall or a gain inside the swing is neither: the band is what the runs of the two trials
+# show, no less than GEN_BAND_MIN and no more than GEN_BAND_MAX.
+GEN_BAND_MIN = 0.08
+GEN_BAND_MAX = 0.15
 # a short prompt, fresh: the split prefill's range (64-1024 rows), where two RTX 3060s went from
 # 8.4 s to 3.0 s for 270 tokens -- none of which a 16k prompt shows. Its first token swung up to
 # 25% between runs of the same settings there (2.0-2.6 s), hence three runs and a loose hold.
@@ -93,13 +113,21 @@ def measured_short(prev: dict | None) -> bool:
     return bool(prev) and any(t.get("short_s") for t in prev.get("trials") or [])
 
 
+def measured_windows(prev: dict | None) -> bool:
+    """Whether ``prev`` measured generation the way that can judge an MTP window (GEN_METHOD)."""
+    return bool(prev) and (prev.get("gen_method") or 1) >= GEN_METHOD
+
+
 def prior_for_pickup(prev: dict, facts: dict, hw: dict) -> tuple[set[str], set[str]]:
     """(tried, kept) a run picking up from ``prev`` starts from: what it tried and the groups that
-    closes, less what it could not judge without the short prompt."""
+    closes, less what it could not judge without the short prompt, and less the MTP candidates when
+    its generation figures timed only a few windows."""
     done, kept = prior_trials(prev)
     done |= closed_groups(prev, done, facts, hw)
     if not measured_short(prev):
         done -= SHORT_UNJUDGED
+    if not measured_windows(prev):
+        done -= MTP_UNJUDGED
     return done, kept
 
 
@@ -207,6 +235,15 @@ def has_flag(args: list[str], flag: str) -> bool:
     return any(k == flag for k, _ in parse_flags(args))
 
 
+EXPERTS = ("checkpoint", "q2")  # whose experts a run serves: the checkpoint's own, or the Q2_0 GGUF next to it
+
+
+def experts_of(args: list[str]) -> str:
+    """Which experts these flags serve. A result is filed under it, so measuring the Q2_0 GGUF
+    does not replace what was measured with the checkpoint's own experts."""
+    return "q2" if has_flag(args, "--moe-expert-gguf") else "checkpoint"
+
+
 # ------------------------------------------------------------------ deciding from measurements
 def with_benchmark(rec: dict, result: dict | None) -> dict:
     """The recommendation for a model that was benchmarked on this PC: the benchmark's flags and
@@ -238,8 +275,25 @@ PROMPT_SEED = 20260917  # every run reads the same excerpts: on two 3060s one 16
 # while the process and its front end stayed up, and the request waited out its ten minutes
 PROMPT_STALL_S = 300  # no chunk finished: even a 16k chunk at 60 tok/s is done by then
 PROMPT_UNREACHABLE_S = 60  # the progress counter cannot be read at all
-DECODE_SKIP = 60  # chunks not timed: the expert cache is still filling for this prompt
+DECODE_SKIP = 60  # tokens not timed: the expert cache is still filling for this prompt
 UPSTREAM_QUIET_S = 600  # ft bench bw prints a line per format; one format can take a few minutes
+
+
+def rate_after_warmup(stamps: list[float], tokens: int | None, skip_tokens: int = DECODE_SKIP) -> float | None:
+    """tok/s of one streamed generation, from the arrival time of each chunk that carried text and
+    the usage count, with the first ``skip_tokens`` tokens set aside. A chunk is one token in plain
+    decoding and a verify window of several under MTP (or none, when a token ends mid-character),
+    so how many chunks the warm-up is comes from the average the usage count gives: 60 of 300
+    one-token chunks, 20 of 100 three-token windows. Setting aside 60 chunks whatever they carried
+    left an MTP run a fifth of its windows to time."""
+    chunks = len(stamps)
+    if chunks < 2 or stamps[-1] <= stamps[0]:
+        return None
+    tokens = tokens or chunks  # a chunk can carry several tokens or none: the usage count is exact
+    skip = round(skip_tokens * chunks / tokens)
+    if chunks > skip + 1 and stamps[-1] > stamps[skip]:
+        return tokens * (chunks - skip - 1) / chunks / (stamps[-1] - stamps[skip])
+    return (tokens - 1) / (stamps[-1] - stamps[0])
 
 
 def bench_profiles() -> dict:
@@ -303,6 +357,21 @@ def generations(best: dict, t: dict, use: str) -> tuple[float, float]:
     return best.get("decode_tps") or 0.0, t.get("decode_tps") or 0.0
 
 
+def gen_band(best: dict, t: dict) -> float:
+    """How much of a generation difference between these two trials is swing, not the change: 0
+    where every chunk is a token (plain decoding, judged as before), and with an MTP window in
+    either trial the widest spread among the runs each recorded, within GEN_BAND_MIN..GEN_BAND_MAX."""
+    if (best.get("gen_tokens") or 0) < DECODE_TOKENS_MTP and (t.get("gen_tokens") or 0) < DECODE_TOKENS_MTP:
+        return 0.0
+    spread = 0.0
+    for trial in (best, t):
+        for key in ("decode_runs", "decode_code_runs"):
+            runs = sorted(r for r in trial.get(key) or [] if r)
+            if len(runs) >= 2 and runs[len(runs) // 2]:
+                spread = max(spread, (runs[-1] - runs[0]) / runs[len(runs) // 2])
+    return min(GEN_BAND_MAX, max(GEN_BAND_MIN, spread))
+
+
 def keep(best: dict, t: dict, c: search.Candidate, use: str) -> bool:
     """A change is kept when either figure gains while the other holds, whatever it was tried for:
     a 16-bit KV cache is tried for generation, but on two 3060s it doubled prompt processing.
@@ -316,11 +385,17 @@ def keep(best: dict, t: dict, c: search.Candidate, use: str) -> bool:
     s0, s1 = best.get("short_s"), t.get("short_s")
     if s0 and s1 and s1 > SHORT_HOLD * s0:
         return False
-    gen_gain = c.gain if c.goal == "gen" else 1.03
+    band = gen_band(best, t)  # under an MTP window: a difference inside the swing is neither a gain nor a shortfall
+    gen_gain = (c.gain if c.goal == "gen" else 1.03) + band
+    hold_gen = c.hold_gen - band
     prefill_gain = c.gain if c.goal == "prefill" else 1.05
-    if s0 and s1 and s1 <= SHORT_GAIN * s0 and p1 >= c.hold_prefill * p0 and g1 >= c.hold_gen * g0:
+    if s0 and s1 and s1 <= SHORT_GAIN * s0 and p1 >= c.hold_prefill * p0 and g1 >= hold_gen * g0:
         return True
-    return (g1 >= gen_gain * g0 and p1 >= c.hold_prefill * p0) or (p1 >= prefill_gain * p0 and g1 >= c.hold_gen * g0)
+    # a generation gain that pays with prompt processing has to pay less than it gains: a 5-token
+    # window cut by min-p read 3-5% faster than a fixed 3 on one start and cost 17% of the prompt
+    if g1 >= gen_gain * g0 and p1 >= c.hold_prefill * p0 and (not band or g1 / g0 >= p0 / max(p1, 1e-9)):
+        return True
+    return p1 >= prefill_gain * p0 and g1 >= hold_gen * g0
 
 
 FIGURES = ("prefill_tps", "decode_tps", "decode_code_tps", "short_s")
@@ -336,7 +411,7 @@ def close_on_generation(best: dict, t: dict, c: search.Candidate, use: str, band
     g0, g1 = generations(best, t, use)
     p0, p1 = best.get("prefill_tps") or 0.0, t.get("prefill_tps") or 0.0
     prefill_gain = c.gain if c.goal == "prefill" else 1.05
-    return bool(g0) and p1 >= prefill_gain * p0 and band * g0 <= g1 < c.hold_gen * g0
+    return bool(g0) and p1 >= prefill_gain * p0 and band * g0 <= g1 < (c.hold_gen - gen_band(best, t)) * g0
 
 
 def slower_of(a: dict, b: dict) -> dict:
@@ -539,11 +614,14 @@ class TuneJob:
 
     # ---- control
     def start(self, model: str, trials: bool = True, port: int | None = None, mode: str = "standard", use: str = "both",
-              from_last: bool = False) -> dict:
+              from_last: bool = False, experts: str | None = None) -> dict:
+        """``experts`` is whose experts to measure ("checkpoint" or "q2"); None leaves it to the
+        recommendation, which proposes the Q2_0 GGUF when one sits next to the checkpoint."""
+        experts = experts if experts in EXPERTS else None
         prev = None
         if from_last:
             trials = True  # picking up is only ever about the runs
-            prev = self.last(model)
+            prev = self.last(model, experts)
             why = last_refusal(prev, self._gpu_indices() or [0])
             if why:
                 raise NoLastResult(why)
@@ -556,21 +634,27 @@ class TuneJob:
         self._cancel.clear()
         mode = mode if mode in MODES else "standard"
         use = use if use in USES else "both"
-        self._thread = threading.Thread(target=self._run, args=(model, trials, port or self.default_port, mode, use, prev),
+        self._thread = threading.Thread(target=self._run, args=(model, trials, port or self.default_port, mode, use, prev, experts),
                                         name="ft-mgr-benchmark", daemon=True)
         self._thread.start()
         return {"started": True}
 
-    def pending(self, model: str, mode: str = "standard") -> dict:
+    def _rec(self, model: str, experts: str | None = None) -> dict:
+        """The recommendation the run starts from, for the experts asked for (None: its own choice)."""
+        if not self._recommend:
+            return {"flags": [], "notes": []}
+        return self._recommend(model, experts=experts) if experts else self._recommend(model)
+
+    def pending(self, model: str, mode: str = "standard", experts: str | None = None) -> dict:
         """What a run picking up from the last result would try, before any measurement: the
         candidates the last result's settings open that it has not tried. Ones that only open
         after a change is kept cannot be known in advance and are not listed."""
-        prev = self.last(model)
+        prev = self.last(model, experts)
         why = last_refusal(prev, self._gpu_indices() or [0])
         if why:
             return {"available": False, "reason": why, "items": []}
         mode = mode if mode in MODES else "standard"
-        rec = self._recommend(model) if self._recommend else {}
+        rec = self._rec(model)  # read for the host and the model only, which the experts do not change
         facts, hw = host_facts(rec), prev.get("hw") or {}
         tried, kept = prior_for_pickup(prev, facts, hw)
         known = known_to(prev, facts, hw)
@@ -585,7 +669,9 @@ class TuneJob:
                                                             "version": prev.get("freetoken_version")},
                 # the page says the last result predates the short prompt: the settings are measured
                 # again with it and hybrid / offload is tried again
-                "short_missing": not measured_short(prev)}
+                "short_missing": not measured_short(prev),
+                # ... or measured generation too briefly to judge an MTP window: those candidates are tried again
+                "windows_missing": not measured_windows(prev) and any(i["key"] in MTP_UNJUDGED for i in items)}
 
     def cancel(self) -> dict:
         self._cancel.set()
@@ -597,15 +683,24 @@ class TuneJob:
                 pass
         return {"cancelling": self.state == "running"}
 
-    def last(self, model: str) -> dict | None:
-        try:
-            with open(self._path(model)) as fh:
-                return json.load(fh)
-        except (OSError, ValueError):
-            return None
+    def last(self, model: str, experts: str | None = None) -> dict | None:
+        """The model's last result with these experts (None: the checkpoint's own)."""
+        want = experts if experts in EXPERTS else "checkpoint"
+        # a Q2_0 result saved before results were filed by experts sits under the plain name, so
+        # the plain file is read for either and taken only when its flags serve the experts asked for
+        for path in dict.fromkeys((self._path(model, want), self._path(model))):
+            try:
+                with open(path) as fh:
+                    doc = json.load(fh)
+            except (OSError, ValueError):
+                continue
+            if experts_of(doc.get("args") or doc.get("base_args") or []) == want:
+                return doc
+        return None
 
-    def _path(self, model: str) -> str:
-        return os.path.join(self.dir, os.path.basename(model.rstrip("/")) + ".json")
+    def _path(self, model: str, experts: str = "checkpoint") -> str:
+        # one result per model and per experts: the Q2_0 GGUF's does not overwrite the checkpoint's
+        return os.path.join(self.dir, os.path.basename(model.rstrip("/")) + (".q2_0" if experts == "q2" else "") + ".json")
 
     def _check(self) -> None:
         if self._cancel.is_set():
@@ -613,11 +708,11 @@ class TuneJob:
 
     # ---- the job
     def _run(self, model: str, trials: bool, port: int, mode: str = "standard", use: str = "both",
-             last: dict | None = None) -> None:
+             last: dict | None = None, experts: str | None = None) -> None:
         prev = self.manager.status()
         prev_cfg = (prev.get("model"), prev.get("port"), list(self.manager.serve_args())) if prev.get("running") else None
         result: dict = {"model": model, "port": port, "started": time.time(), "trials": [], "mode": mode, "use": use,
-                        "freetoken_version": FT_VERSION,
+                        "freetoken_version": FT_VERSION, "gen_method": GEN_METHOD,
                         "skipped": [{"flag": f, "why": ja, "why_en": en} for f, ja, en in search.SKIPPED]}
         try:
             if prev_cfg:
@@ -647,12 +742,16 @@ class TuneJob:
                 hw = self._hardware(model)
                 result["hw"] = hw
                 self._check()
-                rec = self._recommend(model) if self._recommend else {"flags": [], "notes": []}
+                rec = self._rec(model, experts)
                 args, notes = self._apply_hw(rec, hw)
                 result["base_args"] = list(args)
+                if experts == "q2" and experts_of(args) != "q2":
+                    raise RuntimeError("no Q2_0 GGUF of this model's experts was found next to the checkpoint")
+            # the experts the settings serve name the result's file; no candidate switches them
+            result["experts"] = experts_of(args)
             if trials:
                 if rec is None:
-                    rec = self._recommend(model) if self._recommend else {"flags": [], "notes": []}
+                    rec = self._rec(model)  # picking up: read for the host and the model only
                 facts = host_facts(rec)
                 prior = prior_for_pickup(last, facts, hw) if last is not None else None
                 known = known_to(last, facts, hw) if last is not None else set()
@@ -663,7 +762,7 @@ class TuneJob:
             result["notes"] = notes
             result["finished"] = time.time()
             os.makedirs(self.dir, exist_ok=True)
-            with open(self._path(model), "w") as fh:
+            with open(self._path(model, result["experts"]), "w") as fh:
                 json.dump(result, fh)
             with self._lock:
                 self.result, self.state = result, "done"
@@ -1091,15 +1190,24 @@ class TuneJob:
         out["short_s"] = round(sorted(waits)[len(waits) // 2], 2)
         self._ev("trial", trial=label, step="short", state="done", value=out["short_s"])
 
+        # with a verify window in play a run is longer and the median counts (DECODE_TOKENS_MTP)
+        windowed = (_int(search.flag_value(args, "--spec-mtp")) or 0) > 0
+        gen_tokens = DECODE_TOKENS_MTP if windowed else DECODE_TOKENS
+        out["gen_tokens"] = gen_tokens
         for kind in (("prose", "code") if code else ("prose",)):
             self._check()
             step = "decode" if kind == "prose" else "decode_code"
-            self._ev("trial", trial=label, step=step, state="start", tokens=DECODE_TOKENS)
+            self._ev("trial", trial=label, step=step, state="start", tokens=gen_tokens)
             self._decode(label, port, model_id, rng, kind)  # untimed: routing and the cache settle on this text
-            runs = [self._decode(label, port, model_id, rng, kind) for _ in range(DECODE_RUNS)]
+            runs = [self._decode(label, port, model_id, rng, kind, gen_tokens) for _ in range(DECODE_RUNS)]
             runs = [r for r in runs if r]
-            value = round(max(runs), 2) if runs else None
+            # The best of the runs where every chunk is one token: other programs on the PC only ever
+            # slow a run down. With a window the figure also moves with how many drafts the text
+            # happened to take, up as well as down, so the best would be the luckiest: the median.
+            value = round(statistics.median(runs) if windowed else max(runs), 2) if runs else None
             out["decode_tps" if kind == "prose" else "decode_code_tps"] = value
+            # every run is kept on record, so a result shows how far the same settings swung
+            out["decode_runs" if kind == "prose" else "decode_code_runs"] = [round(r, 2) for r in runs]
             self._ev("trial", trial=label, step=step, state="done", value=value)
 
         experts = self._http(port, "/v1/kai/experts?window=60", timeout=30) or {}
@@ -1166,15 +1274,17 @@ class TuneJob:
             raise out["error"]
         return out.get("doc")
 
-    def _decode(self, label: str, port: int, model_id: str, rng: random.Random, kind: str = "prose") -> float | None:
+    def _decode(self, label: str, port: int, model_id: str, rng: random.Random, kind: str = "prose",
+                tokens: int = DECODE_TOKENS) -> float | None:
         source = self._corpus["code" if kind == "code" else "prose"] if self._corpus else " ".join(_FALLBACK_WORDS)
         lead = "# Continue this Python module.\n" if kind == "code" else "Continue this document.\n\n"
         prompt = f"[{label}-{kind}-{os.urandom(5).hex()}]\n{lead}{excerpt(source, 2400, rng)}"
-        body = {"model": model_id, "prompt": prompt, "max_tokens": DECODE_TOKENS, "ignore_eos": True,
+        body = {"model": model_id, "prompt": prompt, "max_tokens": tokens, "ignore_eos": True,
                 "stream": True, "stream_options": {"include_usage": True}}
         sample_id = f"{label}.decode" if kind == "prose" else f"{label}.decode_code"
         first = last = None
-        chunks, usage, skip_t = 0, None, None
+        chunks, usage = 0, None
+        stamps: list[float] = []  # when each chunk that carried text arrived
         for raw in self._stream(port, "/v1/completions", body):
             line = raw.strip()
             if not line.startswith("data:") or line.endswith("[DONE]"):
@@ -1191,19 +1301,12 @@ class TuneJob:
             first = first if first is not None else now
             last = now
             chunks += 1
-            if chunks == DECODE_SKIP + 1:
-                skip_t = now
+            stamps.append(now)
             if chunks % 20 == 0 and last > first:
                 self._ev("sample", id=sample_id, value=round((chunks - 1) / (last - first), 2))
             if self._cancel.is_set():
                 break
-        if first is None or last is None or last <= first or chunks < 2:
-            return None
-        # a chunk can carry several tokens (MTP) or none (a token that ends mid-character): the usage count is exact
-        tokens = usage if usage else chunks
-        if skip_t is not None and last > skip_t:
-            return tokens * (chunks - DECODE_SKIP - 1) / chunks / (last - skip_t)
-        return (tokens - 1) / (last - first)
+        return rate_after_warmup(stamps, usage)
 
     def _wait_ready(self, label: str, port: int, timeout: float = 1800.0) -> bool | str:
         deadline = self._clock() + timeout

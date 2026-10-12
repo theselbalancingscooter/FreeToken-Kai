@@ -25,6 +25,9 @@ FTI18N.add({
   bm_ph_from_last: "前回の結果から続けています",
   bm_from_last_note: "{when} の結果から続けた測定です（まだ試していなかった候補だけ）。それ以前の測定は下に畳んであります。",
   bm_earlier: "{when} の測定（{mode}、{n} 回）",
+  bm_windows_missing: "前回の結果は、MTP を使う設定の生成を短く測っていました（1 回に数秒ぶん）。続きから測ると、MTP の候補を長い計測で試し直します。",
+  bm_experts_hint: "結果はエキスパートごとに別々に残ります。Q2_0 の GGUF で測っても、チェックポイントのエキスパートで測った結果は消えません。",
+  bm_no_q2_gguf: "このモデルの隣に Q2_0 の GGUF が見つかりません。",
   bm_no_last: "このモデルの前回の結果がありません。", bm_last_incomplete: "前回はモデルを測っていない（ハードウェアだけの）結果なので、続けられません。",
   bm_last_other_gpus: "前回と GPU の数が違うので、続けられません。",
   bm_view_only: "この画面から測定を始めるには、この PC で開くかトークンが必要です。",
@@ -98,6 +101,9 @@ FTI18N.add({
   bm_ph_from_last: "Picking up from the last result",
   bm_from_last_note: "Picked up from the result of {when}: only the candidates it had not tried. The earlier runs are folded below.",
   bm_earlier: "Run of {when} ({mode}, {n} runs)",
+  bm_windows_missing: "The last result timed generation with MTP for a few seconds a run. Picking up tries the MTP candidates again with the longer measurement.",
+  bm_experts_hint: "Results are kept per choice: measuring with the Q2_0 GGUF does not replace the result measured with the checkpoint's experts.",
+  bm_no_q2_gguf: "No Q2_0 GGUF was found next to this checkpoint.",
   bm_no_last: "This model has no last result.", bm_last_incomplete: "The last result measured only the hardware, so there is nothing to pick up from.",
   bm_last_other_gpus: "The last result had a different number of GPUs, so it cannot be picked up from.",
   bm_view_only: "Starting a benchmark from this page needs this PC or the token.",
@@ -585,6 +591,24 @@ FTI18N.add({
   $("#bm-start").disabled = !FT.canWrite || !models.length;
   if (!FT.canWrite) { const w = $("#bm-warn"); w.hidden = false; w.textContent = t("bm_view_only"); }
 
+  // whose experts to measure: offered when the server found the model's Q2_0 GGUF next to the
+  // checkpoint (/models reports it). Each choice has its own last result and its own pickup.
+  $("#bm-experts").innerHTML = `<option value="checkpoint">${esc(t("pe_tier_ckpt"))}</option><option value="q2">${esc(t("pe_tier_q2"))}</option>`;
+  const hasGguf = () => !demo && !!models.find((m) => m.value === $("#bm-model").value)?.expert_gguf;
+  const experts = () => (hasGguf() ? $("#bm-experts").value : null);
+  const expertsQuery = () => (experts() ? `&experts=${experts()}` : "");
+  const lastOf = async (which) => {
+    try { return (await FT.raw(`/tune/last?model=${encodeURIComponent($("#bm-model").value)}&experts=${which}`)).result; } catch { return null; }
+  };
+  async function syncExperts() {
+    $("#bm-experts-row").hidden = !hasGguf();
+    if (!hasGguf()) return;
+    // the recommendation proposes the GGUF when it is there, so that is the default -- unless only
+    // the checkpoint's experts have a result here, which is then the one to show and pick up from
+    const [ckpt, q2] = await Promise.all([lastOf("checkpoint"), lastOf("q2")]);
+    $("#bm-experts").value = ckpt && !q2 ? "checkpoint" : "q2";
+  }
+
   let lastResult = null;
   async function loadProfiles() {
     const box = $("#bm-profiles");
@@ -608,7 +632,7 @@ FTI18N.add({
     lastResult = null;
     $("#bm-last").hidden = true; $("#bm-last-when").textContent = "";
     if (demo) return;
-    try { lastResult = (await FT.raw(`/tune/last?model=${encodeURIComponent($("#bm-model").value)}`)).result; } catch {}
+    try { lastResult = (await FT.raw(`/tune/last?model=${encodeURIComponent($("#bm-model").value)}${expertsQuery()}`)).result; } catch {}
     if (lastResult) {
       $("#bm-last").hidden = false;
       $("#bm-last-when").textContent = t("bm_last_when", { when: new Date(lastResult.finished * 1000).toLocaleString(lang() === "ja" ? "ja-JP" : "en-US") });
@@ -621,19 +645,22 @@ FTI18N.add({
     row.hidden = true;
     if (demo) return;
     const mode = document.querySelector('input[name="bm-mode"]:checked')?.value || "standard";
-    try { pendingDoc = await FT.raw(`/tune/pending?model=${encodeURIComponent($("#bm-model").value)}&mode=${mode}`); } catch { return; }
+    try { pendingDoc = await FT.raw(`/tune/pending?model=${encodeURIComponent($("#bm-model").value)}&mode=${mode}${expertsQuery()}`); } catch { return; }
     if (!pendingDoc?.available) { $("#bm-fromlast").checked = false; return; }
     row.hidden = false;
     const items = pendingDoc.items || [];
     const name = (it) => lang() === "ja" ? (it.what || it.key) : (it.what_en || it.key);
-    $("#bm-fromlast-items").textContent = (pendingDoc.short_missing ? `${t("bm_short_missing")}\n` : "") + (items.length
+    $("#bm-fromlast-items").textContent = (pendingDoc.short_missing ? `${t("bm_short_missing")}\n` : "")
+      + (pendingDoc.windows_missing ? `${t("bm_windows_missing")}\n` : "") + (items.length
       ? `${t("bm_fromlast_items", { n: items.length, list: items.map(name).join(" / ") })}\n${t("bm_fromlast_more")}`
       : pendingDoc.short_missing ? "" : t("bm_fromlast_nothing"));
   }
-  $("#bm-model").onchange = () => { loadLast(); loadPending(); };
+  $("#bm-model").onchange = async () => { await syncExperts(); loadLast(); loadPending(); };
+  $("#bm-experts").onchange = () => { loadLast(); loadPending(); };
   for (const r of document.querySelectorAll('input[name="bm-mode"]')) r.addEventListener("change", loadPending);
   $("#bm-trials").onchange = () => { $("#bm-opts").hidden = !$("#bm-trials").checked; };
   $("#bm-last").onclick = () => { show("result"); renderResult(lastResult); };
+  await syncExperts();
   loadLast();
   loadPending();
   setupReady = true;
@@ -654,11 +681,11 @@ FTI18N.add({
     if (!await FT.ask(msg, { title: t("bm_title"), ok: t("bm_start") })) return;
     if (demo) { DemoJob.start(trials); run = null; show("run"); return; }
     try {
-      await FT.raw("/tune/start", { method: "POST", json: { model: $("#bm-model").value, trials, mode, use, from_last: fromLast } });
+      await FT.raw("/tune/start", { method: "POST", json: { model: $("#bm-model").value, trials, mode, use, from_last: fromLast, experts: experts() } });
       run = null; show("run");
     } catch (e) {
       const code = e.body?.code;
-      FT.notice(code === "external_serve" ? t("bm_external") : code === "busy" ? t("bm_busy") : ["no_last", "last_incomplete", "last_other_gpus"].includes(code) ? t(`bm_${code}`) : (e.body?.detail || e.body?.error || e.message), t("bm_title"));
+      FT.notice(code === "external_serve" ? t("bm_external") : code === "busy" ? t("bm_busy") : ["no_last", "last_incomplete", "last_other_gpus", "no_q2_gguf"].includes(code) ? t(`bm_${code}`) : (e.body?.detail || e.body?.error || e.message), t("bm_title"));
     }
   };
   $("#bm-cancel").onclick = () => (demo ? DemoJob.cancel() : FT.raw("/tune/cancel", { method: "POST", json: {} }).catch(() => {}));
@@ -750,6 +777,8 @@ FTI18N.add({
       <div class="card" style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
         <div><div class="small muted">${esc(t("bm_result"))}</div>
           <div style="font-weight:600;font-size:16px">${esc(modelName(r.model))}</div>
+          ${r.experts === "q2" || models.find((m) => m.value === r.model)?.expert_gguf
+            ? `<div class="small">${esc(t("pe_tier"))}: ${esc(t(r.experts === "q2" ? "pe_tier_q2" : "pe_tier_ckpt"))}</div>` : ""}
           <div class="small muted">${esc(t("bm_took", { when: new Date((r.finished || Date.now() / 1000) * 1000).toLocaleString(lang() === "ja" ? "ja-JP" : "en-US"), min: Math.floor(took / 60), sec: took % 60 }))}</div></div>
         <span class="grow"></span>
         <div style="display:flex;gap:8px;flex-wrap:wrap" ${FT.canWrite && !demo ? "" : "hidden"}>

@@ -90,6 +90,19 @@ def test_measured_prefill_and_dense_flags(tmp_path, monkeypatch):
     assert f["--pp-size"] == "2"
     assert f["--prefill-mixer-pieces"] == "2" and f["--dense-quant"] == "q8_0"  # Ampere: no fp8 tensor cores
     assert "--moe-expert-gguf" not in f  # no Q2_0 GGUF next to it
+    # split across 12 GB cards: what a night's search on two RTX 3060s found (2026-10-13). The KV cache stays at
+    # 16 bits (q8_0 ran prompt processing at 258 tok/s, 16-bit at 579), 131k of context costs nothing, and a
+    # prefill chunk takes 75% of the free VRAM (555 -> 662 tok/s; 90% was slower, and killed the server with Q2_0)
+    assert "--kv-cache-dtype" not in f and f["--kv-reserve-tokens"] == f["--max-seq-len-override"] == "131072"
+    assert f["--prefill-chunk-budget"] == "0.75"
+    assert "16 bits" in next(n["why_en"] for n in rec.recommend(str(tmp_path / "Flash-Next"))["notes"] if n["flag"] == "--kv-reserve-tokens")
+    assert "--spec-mtp" not in f  # this fixture's checkpoint has no MTP head
+    with_head = _flags(rec.recommend(_model(tmp_path, "Flash-Next-mtp", weight_gib=135, mtp_num_hidden_layers=1, **flash)))
+    assert with_head["--spec-mtp"] == "3" and "--spec-min-p" not in with_head and "--spec-draft-head-quant" not in with_head
+    _host(monkeypatch, [("NVIDIA GeForce RTX 3070", 8, 8.6)] * 2, ram_gib=128, cores=8)
+    small = _flags(rec.recommend(str(tmp_path / "Flash-Next-mtp")))  # smaller cards: not measured, nothing of it is proposed
+    assert small["--kv-cache-dtype"] == "q8_0" and "--prefill-chunk-budget" not in small and "--spec-mtp" not in small
+    assert small["--kv-reserve-tokens"] == "16384"
 
     _host(monkeypatch, [("NVIDIA GeForce RTX 4090", 24, 8.9)] * 2, ram_gib=128, cores=8)
     f = _flags(rec.recommend(_model(tmp_path, "Flash-Next-ada", weight_gib=135, **flash)))
@@ -195,8 +208,18 @@ def test_the_q2_gguf_next_to_the_checkpoint_proposes_the_fast_tier(tmp_path, mon
     (g / "Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf").write_bytes(b"")
     f = _flags(rec.recommend(model))
     assert f["--moe-expert-gguf"].endswith("Q2_0-00001-of-00002.gguf")
-    assert f["--reasoning-budget"] == "6000" and f["--spec-mtp"] == "5" and f["--spec-min-p"] == "0.6"
+    # two RTX 3060s, the fastest of 34 configurations (2026-10-13): a fixed 4-token window (min-p and 5 tokens
+    # generate alike and cost a tenth of prompt processing), the 4-bit draft head, a 75% chunk, 131k of context
+    assert f["--reasoning-budget"] == "6000" and f["--spec-mtp"] == "4" and "--spec-min-p" not in f
     assert f["--spec-draft-head-quant"] == "q4_0" and f["--dense-quant"] == "q8_0"
+    assert f["--prefill-chunk-budget"] == "0.75" and f["--kv-reserve-tokens"] == "131072"
+    assert "--kv-cache-dtype" not in f  # 16-bit with either experts: 245 -> 660 tok/s of prompt processing with the GGUF's
+    # asked for the checkpoint's own experts (the benchmark measures either): as if the GGUF were not there
+    g.rename(tmp_path / "elsewhere")
+    without = rec.recommend(model)["flags"]
+    (tmp_path / "elsewhere").rename(g)
+    assert rec.recommend(model, experts="checkpoint")["flags"] == without and "--moe-expert-gguf" not in without
+    assert rec.recommend(model, experts="q2")["flags"] == rec.recommend(model)["flags"]
     # one card: three layers of Q2_0 slots, otherwise the configuration that measured (fp8 dense, no MTP, overlap off)
     _host(monkeypatch, [("NVIDIA GeForce RTX 3060", 12, 8.6)], ram_gib=128, cores=8)
     f = _flags(rec.recommend(model))

@@ -161,9 +161,11 @@ def expert_bytes(facts: dict) -> int:
 
 
 # ------------------------------------------------------------------ the recommendation
-def recommend(model: str, *, extra_dirs: list[str] | None = None) -> dict:
+def recommend(model: str, *, extra_dirs: list[str] | None = None, experts: str | None = None) -> dict:
     """{flags: [...], notes: [{flag, why}], host: {...}} — the flags a person would otherwise
-    have to read the guides for. Each note says why, so nothing has to be taken on faith."""
+    have to read the guides for. Each note says why, so nothing has to be taken on faith.
+    ``experts="checkpoint"`` keeps the checkpoint's own experts although a Q2_0 GGUF sits next to
+    it (the benchmark measures either one on request); otherwise the GGUF is proposed when it is there."""
     path = resolve_model(model, extra_dirs)
     facts = model_facts(path) if os.path.isdir(path) else {}
     cards, mem, cores = gpus(), host_memory(), physical_cores()
@@ -193,8 +195,15 @@ def recommend(model: str, *, extra_dirs: list[str] | None = None) -> dict:
     # (guides/23, 2026-09-19). Measured on Flash-Next only, so only Flash-Next gets it.
     one_card = (is_moe and facts.get("model_type") == "qwen4_exp" and len(cards) <= 1
                 and bool(resident) and resident > vram * 0.75)
+    # Flash-Next split across cards of 12 GB or more: the class two RTX 3060s were searched on for a
+    # night (2026-10-13: 56 runs, each timed on a 16k-token prompt and on seven reference
+    # prompts answered to their end, one flag changed at a time, winners measured twice). What it
+    # found is proposed for this class only -- the 16-bit KV cache, a prefill chunk of 75% of the
+    # free VRAM, a fixed MTP window, and 131k of context, which cost nothing there.
+    split12 = (is_moe and facts.get("model_type") == "qwen4_exp" and len(cards) > 1 and bool(resident)
+               and resident > vram * 0.75 and vram >= 11.5 * GiB)
     # the 2.25-bit expert tier (gguf.md): proposed when the checkpoint's Q2_0 GGUF sits next to it
-    q2_gguf = q2_gguf_for(path) if facts.get("model_type") == "qwen4_exp" and is_moe else None
+    q2_gguf = q2_gguf_for(path) if facts.get("model_type") == "qwen4_exp" and is_moe and experts != "checkpoint" else None
     caps = [g.get("compute_cap") for g in cards if g.get("compute_cap")]
     fp8_cores = bool(caps) and max(caps) >= 8.9
 
@@ -312,16 +321,31 @@ def recommend(model: str, *, extra_dirs: list[str] | None = None) -> dict:
         add("--max-seq-len-override", str(ctx), "宣伝する長さと実際に入る長さをそろえます。",
             "The advertised context matches what actually fits.")
     elif max_ctx:
-        tier = 16384 if vram <= 8 * GiB else 65536 if vram <= 16 * GiB else 131072
+        # split12: 131k measured no slower than 65k on two RTX 3060s (Q2_0 experts 1,024 / 38.5 tok/s
+        # against 1,013 / 37.0; NVFP4 668 / 28.7 against 663 / 29.7), so the longer one is where it starts
+        tier = 131072 if split12 else 16384 if vram <= 8 * GiB else 65536 if vram <= 16 * GiB else 131072
         ctx = min(max_ctx, tier)
-        if is_moe:
+        # split12 keeps its KV cache at 16 bits: quantized, its prompt processing ran at less than
+        # half. Two RTX 3060s: 258 -> 579 tok/s with the checkpoint's experts and 245 -> 660 with the
+        # Q2_0 GGUF's, generation unchanged; the benchmark kept the 16-bit cache every time it tried
+        # it there (2026-09-17, twice on 2026-10-12), and going back to q8_0 was turned down at 248
+        # against 698 and 231 against 690. Smaller cards and other models keep q8_0: an RTX 2060 with
+        # Ornith tried the 16-bit cache and did not keep it. The benchmark still tries q8_0 (kv_q8).
+        kv16 = split12
+        if kv16:
+            per_token = kv_bytes_per_token(facts, quantized=False)
+        elif is_moe:
             add("--kv-cache-dtype", "q8_0", "KV を量子化して、空いた VRAM をエキスパートに回します。",
                 "Quantize the KV cache and give the VRAM it frees to the experts.")
         size = f"{ctx * per_token / GiB:.1f} GiB" if per_token else None
         add("--kv-reserve-tokens", str(ctx),
-            f"まず起動できる長さです（KV {size or '不明'}、VRAM {vram / GiB:.0f} GiB のカード向け）。起動後に「改善提案」が GPU の空きを見て伸ばす値を出します。",
+            f"まず起動できる長さです（KV {size or '不明'}、VRAM {vram / GiB:.0f} GiB のカード向け）。起動後に「改善提案」が GPU の空きを見て伸ばす値を出します。"
+            + ("KV は量子化しません（16bit）。このモデルを複数のカードに分ける構成では、量子化するとプロンプト処理が半分以下になります"
+               "（3060×2 の実測で 258 → 579 tok/s、生成は変わらず）。" if kv16 else ""),
             f"A length that starts (KV {size or 'unknown'}, for a {vram / GiB:.0f} GiB card). Once the server runs, "
-            "“From measurements” proposes a longer one from the free VRAM.")
+            "“From measurements” proposes a longer one from the free VRAM."
+            + (" The KV cache stays at 16 bits: with this model split across cards, a quantized one ran prompt processing at "
+               "less than half (258 -> 579 tok/s measured on two RTX 3060s, generation unchanged)." if kv16 else ""))
         add("--max-seq-len-override", str(ctx), "宣伝する長さと実際に入る長さをそろえます。",
             "The advertised context matches what actually fits.")
     # --- prefill and dense weights: measured in this fork, and not upstream's defaults
@@ -347,20 +371,43 @@ def recommend(model: str, *, extra_dirs: list[str] | None = None) -> dict:
     if q2_gguf:
         add("--moe-expert-gguf", q2_gguf,
             "隣に見つかった Q2_0 の GGUF からエキスパートを読みます。速さを優先する構成です（バンク 63.5 GiB → 34 GB、1 トークンあたりの読みが半分、"
-            "3060×2 で参照 10 問が 37〜58 tok/s、NVFP4 は 23〜28）。答えは少し変わります（10 問で 9/10、考える長さは 35% 増）。答えの正確さが要るときはこの行を外します。",
-            "Read the experts from the Q2_0 GGUF found next to the checkpoint: the fast tier (banks 63.5 GiB -> 34 GB, half the bytes per token, "
-            "37-58 tok/s on the ten reference prompts on two 3060s against NVFP4's 23-28). The answers change (9 of 10, thinking 35% longer); drop this line when accuracy matters.")
+            "3060×2 で、最後まで答えさせた参照の 7 問が約 38 tok/s、NVFP4 は約 28。16k トークンのプロンプト処理は 1,024 対 668 tok/s）。"
+            "答えは少し変わります（10 問で 9/10、考える長さは 35% 増）。答えの正確さが要るときはこの行を外します。",
+            "Read the experts from the Q2_0 GGUF found next to the checkpoint: the fast tier (banks 63.5 GiB -> 34 GB, half the bytes per token; "
+            "on two RTX 3060s seven reference prompts answered to their end at about 38 tok/s against NVFP4's 28, and a 16k-token prompt was "
+            "read at 1,024 tok/s against 668). The answers change (9 of 10, thinking 35% longer); drop this line when accuracy matters.")
         add("--reasoning-budget", "6000",
             "2 bit のエキスパートは温度 0 で堂々巡りすることがあるので、思考を 6,000 トークンで打ち切って答えさせます。",
             "The 2-bit tier can think in circles at temperature 0; the thinking is cut at 6,000 tokens and the model answers from there.")
         if not one_card:  # one card: MTP 3 measured no gain (27.4 against 26.8), MTP 5 fell to eager, and the head copy did not fit
-            add("--spec-mtp", "5", "Q2_0 のエキスパートでは MTP の窓の固定費を削ってあり、本物の答えで 23 → 37〜58 tok/s になります。",
-                "On this tier the verify window's fixed costs are cut: 23 -> 37-58 tok/s on real answers.")
-            add("--spec-min-p", "0.6", "ヘッドの確信度が 0.6 を下回った最初のドラフトで窓を切ります（文章で 37 → 62 tok/s）。",
-                "End a window at the first draft the head scores below 0.6 (prose: 37 -> 62 tok/s).")
+            if split12:
+                # Seven reference prompts answered to their end on two RTX 3060s (2026-10-13): a fixed
+                # window of 3, 4 or 5 tokens and a 5-token one cut by --spec-min-p 0.6 all wrote at
+                # about 38 tok/s (no window: 21), so the window is chosen for what it leaves prompt
+                # processing -- 1,010-1,028 tok/s with 4, 987-995 with 3, 902-927 with 5 or with min-p
+                add("--spec-mtp", "4",
+                    "MTP で 4 トークン先まで予測して、まとめて確かめます。3060×2 で、最後まで答えさせた 7 問の生成が 21 → 約 38 tok/s になります。"
+                    "窓 3・4・5 と min-p 0.6 で生成は同じで、窓 5 と min-p はプロンプト処理が 1 割遅いので（902〜927 対 1,010〜1,028 tok/s）、固定の 4 にします。",
+                    "Draft 4 tokens ahead with the MTP head and verify them together: on two RTX 3060s seven prompts answered to their end went from "
+                    "21 to about 38 tok/s. Windows of 3, 4 and 5 and --spec-min-p 0.6 generate alike, and 5 or min-p cost a tenth of prompt "
+                    "processing (902-927 against 1,010-1,028 tok/s), hence a fixed 4.")
+            else:
+                add("--spec-mtp", "5", "Q2_0 のエキスパートでは MTP の窓の固定費を削ってあり、MTP なしより生成が速くなります（3060×2 で 21 → 約 38 tok/s）。",
+                    "On this tier the verify window's fixed costs are cut, and generation beats no window (21 -> about 38 tok/s on two RTX 3060s).")
+                add("--spec-min-p", "0.6", "ヘッドの確信度が 0.6 を下回った最初のドラフトで窓を切ります。",
+                    "End a window at the first draft the head scores below 0.6.")
             if not fp8_cores:
-                add("--spec-draft-head-quant", "q4_0", "ドラフトの採点を 4 bit に詰めた lm_head の複製で行います（Q8_0 の dense と組で使います）。",
-                    "Score the drafts through a 4-bit copy of the lm_head (paired with the Q8_0 dense weights).")
+                add("--spec-draft-head-quant", "q4_0",
+                    "ドラフトの採点を 4 bit に詰めた lm_head の複製で行います（Q8_0 の dense と組で使います）。3060×2 で、これが無いと生成が 38.7 → 32.0 tok/s に落ちます。",
+                    "Score the drafts through a 4-bit copy of the lm_head (paired with the Q8_0 dense weights): without it generation fell from 38.7 to 32.0 tok/s on two RTX 3060s.")
+    elif split12 and facts.get("mtp"):
+        # the checkpoint's own experts: a fixed 3-token window. Same seven prompts: 16.9 -> 28.4 tok/s, prompt
+        # processing unchanged (645 -> 662); 5 tokens wrote at 27.1, min-p 0.6 over 5 cost prompt processing
+        # (546), and the 4-bit draft head did too (544), so neither is proposed here
+        add("--spec-mtp", "3",
+            "MTP で 3 トークン先まで予測して、まとめて確かめます。3060×2 で、最後まで答えさせた 7 問の生成が 16.9 → 28.4 tok/s になり、プロンプト処理は変わりません。",
+            "Draft 3 tokens ahead with the MTP head and verify them together: on two RTX 3060s seven prompts answered to their end went from "
+            "16.9 to 28.4 tok/s, and prompt processing did not change.")
     if one_card and q2_gguf:
         add("--prefill-chunk-budget", "0.5",
             "1 枚に Q2_0 のエキスパートのとき、チャンクに空き VRAM の 50% まで。75% では 25k トークンのプロンプトが途中のチャンクで VRAM 切れになりました（3 回）。50% は 4,608 トークンのチャンクで最後まで読めます（202 tok/s）。",
@@ -369,6 +416,13 @@ def recommend(model: str, *, extra_dirs: list[str] | None = None) -> dict:
         add("--prefill-chunk-budget", "0.75",
             "プロンプト処理の 1 チャンクが空き VRAM の 75% まで使えるようにします（2 枚構成で 510 → 700 tok/s の実測と同じ設定）。",
             "Let one prefill chunk use 75% of the free VRAM (the setting measured at 510 -> 700 tok/s on two cards).")
+    elif split12:
+        add("--prefill-chunk-budget", "0.75",
+            "プロンプト処理の 1 チャンクが空き VRAM の 75% まで使えるようにします。3060×2 の 16k トークンのプロンプトで、NVFP4 は 555 → 662 tok/s、"
+            "Q2_0 は 834 → 1,010〜1,028 tok/s。90% にすると Q2_0 ではサーバが落ち、NVFP4 では遅くなる（614）ので、75% で止めます。",
+            "Let one prefill chunk use 75% of the free VRAM: on two RTX 3060s a 16k-token prompt went from 555 to 662 tok/s with the checkpoint's "
+            "experts and from 834 to 1,010-1,028 with the Q2_0 ones. At 90% the server died with the Q2_0 experts and was slower with the "
+            "checkpoint's (614), so 75% is where it stops.")
     if facts.get("model_type") in ("qwen3_5_moe", "qwen4_exp") and (vram <= 8 * GiB or one_card):
         add("--host-embedding", None, "埋め込み表を RAM に置いて、その分の VRAM を KV に回します。",
             "Keep the embedding table in RAM and give its VRAM to the KV cache.")

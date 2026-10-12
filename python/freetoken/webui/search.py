@@ -228,7 +228,11 @@ def plan(args: list[str], facts: dict, hw: dict, mode: str = "standard", modules
 
         # --- kernels for the expert format
         fmt = expert_format(facts.get("quant"))
-        for name in MOE_KERNELS.get(fmt or "", ()):
+        # experts read from a GGUF (--moe-expert-gguf) are in the GGUF's format, not the checkpoint's:
+        # a kernel for the checkpoint's expert format is then picked for nothing. Two RTX 3060s with the
+        # Q2_0 experts kept moe.nvfp4=triton on three runs that differed only by the swing of MTP generation
+        gguf_experts = flag_value(args, "--moe-expert-gguf") is not None
+        for name in MOE_KERNELS.get(fmt or "", ()) if not gguf_experts else ():
             if kernel_unusable(name, hw, modules):
                 continue
             add(Candidate(f"kernel_moe_{name}", {"--quant-backend": f"moe.{fmt}={name}"}, goal="either",
@@ -274,8 +278,8 @@ def plan(args: list[str], facts: dict, hw: dict, mode: str = "standard", modules
         add(Candidate("budget_075", {"--prefill-chunk-budget": "0.75"}, goal="prefill", gain=1.05,
                       what_ja="プロンプト処理の 1 チャンクが空き VRAM の 75% まで使えるようにして、チャンクを広げる",
                       what_en="let one prefill chunk take 75% of the free VRAM, so chunks are wider"))
-    add(Candidate("budget_090", {"--prefill-chunk-budget": "0.9"}, goal="prefill", gain=1.05, thorough=True, after="budget_075",
-                  what_ja="チャンクに空き VRAM の 90% まで使わせる", what_en="let one prefill chunk take 90% of the free VRAM"))
+    # 90% is not tried: it never won (two RTX 3060s: 597 against 669 tok/s on 2026-09-17, 614 against
+    # 662 on 2026-10-13), and with the Q2_0 experts the backend died in the middle of a 16k-token prompt
     pieces = flag_value(args, "--prefill-mixer-pieces")
     if gdn and (model_type == "qwen4_exp" or (model_type == "qwen3_5_moe" and pp == 1)):
         if pieces != "4":
@@ -346,21 +350,26 @@ def plan(args: list[str], facts: dict, hw: dict, mode: str = "standard", modules
     # --- speculative decoding with the checkpoint's MTP head: its gain depends on the text
     if facts.get("mtp") and flag_value(args, "--max-running-req") in ("1", None):
         base_k = flag_value(args, "--spec-mtp")
-        for k in ("3", "5"):
+        # 4 for Flash-Next, where it was measured: with the Q2_0 experts on two RTX 3060s a window of
+        # 3, 4 or 5 answered at the same 38 tok/s and 4 left prompt processing the most (1,010-1,028
+        # tok/s against 987-995 and 902-927)
+        for k in ("3", "4", "5") if model_type == "qwen4_exp" else ("3", "5"):
             if base_k == k:
                 continue
             add(Candidate(f"mtp_{k}", {"--spec-mtp": k}, code=True, hold_prefill=0.85,
                           what_ja=f"MTP で {k} トークン先まで予測して、まとめて確かめる（コードやツール呼び出しで効きやすい）",
                           what_en=f"draft {k} tokens ahead with the MTP head and verify them together (helps most on code and tool calls)"))
         # the two settings on top of a kept window (or of the base's own --spec-mtp). Measured on
-        # two RTX 3060s with the Q2_0 experts (guides/70 4.18): min-p 0.6 over K=5 wrote prose at
-        # 62 tok/s where fixed K=3 wrote 37, lists the same; the 4-bit draft head is only for a
-        # bf16 or Q8_0 lm_head -- packed from an fp8 head it lost a fifth of the prose acceptance
-        opened = None if base_k else ("mtp_3", "mtp_5")
+        # two RTX 3060s with the Q2_0 experts: min-p 0.6 over K=5 wrote an essay that never ends at
+        # 62 tok/s where fixed K=3 wrote 37 (guides/70 4.18), but on seven prompts answered to their
+        # end it wrote at the same 38 tok/s as a fixed window and cost a tenth of prompt processing
+        # (2026-10-13). The 4-bit draft head is only for a bf16 or Q8_0 lm_head -- packed from an
+        # fp8 head it lost a fifth of the prose acceptance
+        opened = None if base_k else ("mtp_3", "mtp_4", "mtp_5")
         if flag_value(args, "--spec-min-p") is None:
             add(Candidate("minp_06", {"--spec-min-p": "0.6", "--spec-mtp": "5"}, code=True, hold_prefill=0.85, after=opened,
-                          what_ja="窓を 5 トークンにして、ヘッドの確信度が 0.6 を下回った最初のドラフトで窓を切る（文章で効く: 3060 で 37 → 62 tok/s）",
-                          what_en="a 5-token window cut at the first draft the head scores below 0.6 (prose: 37 -> 62 tok/s on two 3060s)"))
+                          what_ja="窓を 5 トークンにして、ヘッドの確信度が 0.6 を下回った最初のドラフトで窓を切る（終わらない文章では効く。最後まで答えさせた質問では固定の窓と同じだった）",
+                          what_en="a 5-token window cut at the first draft the head scores below 0.6 (helps text that runs on; on prompts answered to their end it matched a fixed window)"))
         # the packed head needs a bf16 (or Q8_0) lm_head: Flash-Next's is, Ornith's is NVFP4 and the engine skips it
         if model_type == "qwen4_exp" and flag_value(args, "--spec-draft-head-quant") is None and flag_value(args, "--dense-quant") != "fp8":
             add(Candidate("draft_q4", {"--spec-draft-head-quant": "q4_0"}, code=True, hold_prefill=0.85, after=opened,

@@ -284,17 +284,36 @@
 
   async function loadConfig() { try { engineConfig = await FT.raw("/engine/config"); } catch {} }
 
+  // Which profile the running server belongs to. Two profiles may share a model and a port (the
+  // checkpoint's experts and the Q2_0 GGUF's), so "same model and port" is not it: starting one
+  // showed the other as running too, and as "edited, not applied". In order: the profile the
+  // server was started from, while it still runs what that start gave it (ft mgr remembers the
+  // name); else the one whose flags it runs; else, when a single profile has its model and port,
+  // that one, edited since. Only that profile is in use or edited; with several candidates and
+  // none of them known, each can stop the server but none claims it.
+  function profileStates(list, cfg, running) {
+    const same = (p) => !!running && !!cfg && cfg.model === p.model && (cfg.port ?? null) === (p.port ?? null);
+    const exact = (p) => same(p) && JSON.stringify(p.args) === JSON.stringify(cfg.args);
+    const sameList = list.filter(same);
+    const owner = sameList.find((p) => cfg.profile && p.name === cfg.profile) || sameList.find(exact)
+      || (sameList.length === 1 ? sameList[0] : null);
+    return list.map((p) => ({
+      inUse: p === owner && exact(p),
+      stale: p === owner && !exact(p),
+      stoppable: !owner && same(p),
+    }));
+  }
+  window.FTProfileStates = profileStates;  // read by the console's own checks
+  // through the profile's route, so ft mgr knows which profile this server was started from
+  const startProfile = (p) => FT.raw(`/profiles/${encodeURIComponent(p.name)}/start`, { method: "POST", json: {} });
+
   async function loadProfiles() {
     let list = [];
     try { list = (await FT.raw("/profiles")).profiles || []; }
     catch { $("#profiles").innerHTML = `<div class="muted small">${esc(t("dash_profiles_failed"))}</div>`; return; }
-    const cur = engineConfig ? JSON.stringify([engineConfig.model, engineConfig.port, engineConfig.args]) : "";
+    const states = profileStates(list, engineConfig, engineRunning);
     $("#profiles").innerHTML = list.length ? list.map((p, i) => {
-      // only while the manager's engine actually runs: its last config survives a stop
-      const sameServer = !!engineRunning && engineConfig?.model === p.model && (engineConfig?.port ?? null) === (p.port ?? null);
-      const inUse = sameServer && JSON.stringify(p.args) === JSON.stringify(engineConfig.args);
-      // same model and port but different flags: the profile was edited after the server started
-      const stale = sameServer && !inUse;
+      const { inUse, stale, stoppable } = states[i];
       // one quiet line, not the whole command: the flags belong in the editor
       const flags = (p.args || []).filter((a) => a.startsWith("--"));
       const shown = flags.slice(0, 3).map((f) => f.replace(/^--/, "")).join(" · ");
@@ -306,9 +325,9 @@
                title="${esc(homePath((p.args || []).join(" ")))}">${esc(modelName(p.model))} · ${esc(p.port ? t("dash_port", { port: p.port }) : t("dash_port_default"))}${flags.length ? ` · ${esc(shown + more)}` : ""}</div>
         </div>
         <div style="display:flex;gap:4px;flex-shrink:0;align-self:center" ${FT.canWrite ? "" : "hidden"}>
-          ${sameServer
+          ${inUse || stale
             ? iconBtn("stop", i, t("dash_stop")) + iconBtn("restart", i, t(stale ? "dash_restart_apply" : "dash_restart"))
-            : iconBtn("apply", i, t("dash_apply_tip"))}
+            : (stoppable ? iconBtn("stop", i, t("dash_stop")) : "") + iconBtn("apply", i, t("dash_apply_tip"))}
           ${iconBtn("edit", i, t("dash_edit"))}
           ${iconBtn("copy", i, t("dash_copy"))}
           ${iconBtn("del", i, t("dash_delete"))}
@@ -319,14 +338,14 @@
       const p = list[+b.dataset.i];
       if (b.dataset.act === "apply") {
         if (!await FT.ask(t("dash_confirm_apply", { name: p.name }), { title: t("dash_apply_tip"), ok: t("dash_ok_start") })) return;
-        lifecycle(t("dash_lc_apply"), () => FT.raw("/engine/switch", { method: "POST", json: { model: p.model, port: p.port, args: p.args } }));
+        lifecycle(t("dash_lc_apply"), () => startProfile(p));
       } else if (b.dataset.act === "stop") {
         if (!await FT.ask(t("dash_confirm_stop"), { title: t("dash_stop"), ok: t("dash_stop"), danger: true })) return;
         lifecycle(t("dash_lc_stop"), () => FT.raw("/engine/stop", { method: "POST", json: {} }));
       } else if (b.dataset.act === "restart") {
         // restarting from the row uses the profile's flags, so an edited profile is applied here
         if (!await FT.ask(t("dash_confirm_restart"), { title: t("dash_restart"), ok: t("dash_restart") })) return;
-        lifecycle(t("dash_lc_restart"), () => FT.raw("/engine/switch", { method: "POST", json: { model: p.model, port: p.port, args: p.args } }));
+        lifecycle(t("dash_lc_restart"), () => startProfile(p));
       } else if (b.dataset.act === "edit") editProfile(p);
       else if (b.dataset.act === "copy") {
         const taken = new Set(list.map((x) => x.name));
