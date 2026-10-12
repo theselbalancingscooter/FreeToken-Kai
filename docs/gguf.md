@@ -54,14 +54,38 @@ Speed on two RTX 3060s (`--pp-size 2`, hybrid). The configuration that measured 
 to start from:
 
 ```
---moe-expert-gguf <shard 1> --dense-quant q8_0 --spec-draft-head-quant q4_0 --spec-mtp 5 --spec-min-p 0.6 --reasoning-budget 6000
+--moe-expert-gguf <shard 1> --dense-quant q8_0 --spec-draft-head-quant q4_0 --spec-mtp 4 --prefill-chunk-budget 0.75 --reasoning-budget 6000
 ```
 
-With it (2026-10-12) the ten reference prompts answer at 37-58 tok/s (the NVFP4 tier: 23-28), the
-K=3 verify window takes 70 ms against 80-83 with fp8 dense and the chunked window conv (the
-window's experts 5 ms, the dense 5, the rest small kernels and the host), and `--spec-min-p 0.6`
-over K=5 wrote prose at 62 tok/s where fixed K=3 wrote 37. Prefill of a 25k-token prompt
-1,070-1,135 tok/s (NVFP4: 575-700). A 3,840-token chunk spends 2.6-3.1 s on the GPU against
+It is what the console's **Recommended** proposes for two 12 GB cards, and the fastest found in 34
+runs on them over a night (2026-10-13: one flag changed at a time, each run timed on a 16k-token
+prompt and on seven reference prompts answered to their end at temperature 0, the median of the
+seven counting). Measured three times, it read the prompt at 1,028 / 1,010 / 1,024 tok/s and wrote
+the answers at 38.7 / 38.5 / 35.0 (the NVFP4 tier: 666-670 and 28.1-29.0). What moved those
+figures and what did not:
+
+- No MTP window: 21 tok/s. No 4-bit draft head: 32.
+- A fixed window of 3, 4 or 5 tokens writes alike: 38.2-38.4 tok/s with 3, 35.0-38.9 with 4, 38.1
+  with 5. Prompt processing differed: 987-995 tok/s with 3, 1,008-1,028 with 4, 927 with 5. A
+  window takes VRAM the prefill chunk would otherwise have, which accounts for 5 and not for 4
+  reading faster than 3.
+- Read 4 over 3 as 2-3% more prompt processing and no more generation. In most runs with the
+  4-token window one of the seven prompts was answered wrong (the tier misses one on some runs
+  with either window, see below) and one prompt was written at 55-58 tok/s where no other run
+  passed 45, which lifts the median: the 4-token runs in which all seven were right gave
+  35.0-37.5 tok/s, and the runs with 3 tokens, all seven right, 38.2-38.4. On all ten prompts
+  the 4-token window answered 9.
+- `--spec-min-p 0.6` over K=5 wrote an essay that never ends at 62 tok/s where fixed K=3 wrote 37
+  (2026-10-12), but the answered prompts at the same 38, with the prompt at 902; 0.4 and 0.8 lost
+  a tenth of generation (34-35).
+- The default chunk budget read the prompt at 834 tok/s; 0.9 killed the backend in the middle of
+  it.
+- Seven CPU threads or eight, four prefill pieces, the vision tower on the CPU, fp8 dense
+  weights, 65k of context instead of 131k: within 2% either way.
+
+The K=3 verify window takes 70 ms against 80-83 with fp8 dense and the chunked window conv (the
+window's experts 5 ms, the dense 5, the rest small kernels and the host). Prefill of a 25k-token
+prompt 1,070-1,135 tok/s (NVFP4: 575-700, 2026-10-12). A 3,840-token chunk spends 2.6-3.1 s on the GPU against
 2.8 s moving 16.5 GiB of experts over the second card's x4 link, so the transfer is the next
 wall, not the kernel. On the ten prompts with `--reasoning-budget 6000` the Q2_0 tier answered
 9 or 10 of 10 across runs (the miss, when it happens, is a translation that thinks past the

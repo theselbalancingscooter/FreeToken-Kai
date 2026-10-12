@@ -88,9 +88,10 @@ The fork adds eleven things upstream does not have:
    63.5 GiB to 34 GB, a decode step reads 0.66 GB of experts per token instead of 1.18, and the
    same GPU cache holds twice the experts; the ggml MMVQ and MMQ kernels and the CPU executor
    dequantise the blocks in place (W2A8). On two RTX 3060s, with `--dense-quant q8_0`, the q4_0
-   draft head and `--spec-mtp 5 --spec-min-p 0.6`, the ten reference prompts answer at 37-58
-   tok/s against the NVFP4 tier's 23-28, and a 25k-token prompt prefills at 1,070-1,135 tok/s
-   against 575-700. It is the fast tier, not the accurate one: on ten prompts the Q2_0 build
+   draft head, `--spec-mtp 4` and `--prefill-chunk-budget 0.75`, seven reference prompts answered
+   to their end are written at 38.5 tok/s against the NVFP4 tier's 28-29, and a 16k-token prompt
+   is read at 1,010-1,028 tok/s against 660-670 (2026-10-13, the fastest of the configurations
+   tried there). It is the fast tier, not the accurate one: on ten prompts the Q2_0 build
    matched NVFP4 on 9 (all code tasks included) and thought 35% longer. See [gguf.md](gguf.md).
 
 11. **A reasoning budget** (`--reasoning-budget N`, or `reasoning_budget` in a chat / completion
@@ -458,7 +459,10 @@ further than it should be. The window then varies from 2 to K+1 rows and a CUDA 
 for every width, sharing one memory pool. A doubtful first draft is still verified, alone: a step
 with no drafts is a plain one-row decode, which runs eagerly on the drafting rank (60 ms on two RTX
 3060s against the 27 ms of a two-row window -- the reason min-p first measured slower there). Without it the chain runs on the device end to end and
-the K drafts come back in one read.
+the K drafts come back in one read. What it buys depends on the text: with the Q2_0 experts on
+two RTX 3060s, 0.6 over K=5 wrote an essay that never ends at 62 tok/s where fixed K=3 wrote 37,
+and seven prompts answered to their end at the 38 tok/s of a fixed window, while the 5-token
+window it needs read a 16k-token prompt at 902 tok/s against the 1,010-1,028 of a fixed 4.
 
 `--spec-draft-head-quant q4_0` (or `q8_0`) scores the drafts through a packed copy of the lm_head
 instead of the model's own: a draft only decides what the target verifies, so a coarser head costs

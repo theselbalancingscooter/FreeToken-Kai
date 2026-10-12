@@ -85,7 +85,13 @@ A profile is a model, a port and the flags for `ft serve`, kept in `~/.freetoken
   compared with the profile: **not set**, **different value** (current -> recommended), **drop**
   (a flag the benchmark removed) and **already set**. **Apply all** applies all but the last. The
   context length the rules propose is one that starts on the card, not a prediction of the most
-  that fits.
+  that fits. A MoE model's KV cache is proposed as `q8_0`, with one exception: Qwen3.8-Flash-Next
+  split across cards of 12 GB or more starts from the 16-bit cache, because quantized it ran prompt
+  processing at less than half there (two RTX 3060s: 258 -> 579 tok/s, generation unchanged). For
+  that case the rules propose what was fastest on two RTX 3060s in a search of 56 runs
+  (2026-10-13): the 16-bit cache at 131k of context, `--prefill-chunk-budget 0.75`, and a fixed
+  MTP window -- `--spec-mtp 3` with the checkpoint's experts (668 tok/s of prompt processing, 28.7
+  of generation), `--spec-mtp 4` and the 4-bit draft head with the Q2_0 GGUF (1,024 / 38.5).
 - **From measurements** (while the server runs): changes read off the running server, each
   applicable with one click: collecting expert statistics, more RAM for the expert banks, more
   expert slots from free VRAM, a longer context once the free VRAM is known, or a shorter one to
@@ -102,6 +108,24 @@ drawn live on a speedometer while it runs. It needs the GPU: the server `ft mgr`
 first and started again with its own settings at the end, whether the run finished, failed or was
 cancelled. A server started outside `ft mgr` is not touched, and the benchmark refuses to start
 while one holds the GPU.
+
+Where a Q2_0 GGUF of the model's experts sits next to the checkpoint ([gguf.md](gguf.md)), the
+setup card asks which **experts** to measure: the checkpoint's own, or the GGUF's. Each choice
+starts from its own recommended settings and keeps its own result (the GGUF's is filed apart), so
+measuring one does not replace the other, and "pick up from the last result" continues the result
+of the experts chosen. The kernels for the checkpoint's expert format are not tried with the
+GGUF's experts: they would select nothing.
+
+On two RTX 3060s with Flash-Next the benchmark of 2026-10-12 (standard mode) ended at 690 tok/s of
+prompt processing with the checkpoint's experts and at 687 with the Q2_0 GGUF. A search the night
+after (56 runs, one flag changed at a time, each timed on a 16k-token prompt and on seven
+reference prompts answered to their end) measured those two results at 662 tok/s of prompt
+processing and 28.4 of generation, and 699 and 38.6, and found 668 / 28.7 and 1,024 / 38.5. With
+the checkpoint's experts the benchmark had arrived. With the GGUF's it had stopped a third short
+on prompt processing: it turned down the wider prefill chunk three times over generation figures
+that swing more than its bar. That verdict is changed (see **Generation** below), a fixed 4-token
+window is now tried (**Standard**), and the recommended settings the benchmark starts from are
+the ones the search found. The benchmark has not been run again on that machine since.
 
 1. **Upstream's measurement** (a few minutes per GPU): `ft bench bw --gpu <n>` runs as it is, the
    same command the desktop app runs, on every GPU. It rewrites the profile the engine reads
@@ -130,8 +154,8 @@ while one holds the GPU.
    - These figures stay in the result; the profile is `ft bench bw`'s alone.
 3. **Real runs** (optional). Setting A is the recommended settings plus the above. Each later run
    is a fresh `ft serve` with one thing changed from the best so far (`webui/search.py`); what is
-   kept is carried on and can open or close later candidates (a chunk budget of 0.9 is tried only
-   after 0.75 was kept).
+   kept is carried on and can open or close later candidates (min-p and the 4-bit draft head are
+   tried only once an MTP window is kept).
    - **Prompt processing**: two prompts cut from this repository's own documents and code, trimmed
      with the model's tokenizer to 16,384 tokens or to what the context allows. Every run reads the
      same two texts: on two RTX 3060s one 16k excerpt ran at 509 tok/s and another at 636 under the
@@ -144,13 +168,27 @@ while one holds the GPU.
      before this figure existed says so on its page and under "pick up from the last result";
      picking up from it measures the chosen settings again with the figure and tries hybrid /
      offload again, since that choice was made without it.
-   - **Generation**: one untimed warm-up, then the best of three 300-token generations continuing
-     prose, and, for a model with MTP weights, the same on Python, where MTP drafts far better. An
-     MTP model is measured on Python in every run, not only the MTP ones, and a verdict compares
-     prose with prose and code with code. The
-     first 60 tokens of each are not timed (the expert cache is still filling for that text), and
-     the best rather than the median counts because other programs on a PC in daily use only ever
-     slow a run down.
+   - **Generation**: one untimed warm-up, then three 300-token generations continuing prose, and,
+     for a model with MTP weights, the same on Python, where MTP drafts far better. An MTP model is
+     measured on Python in every run, not only the MTP ones, and a verdict compares prose with
+     prose and code with code. The first 60 tokens of each are not timed (the expert cache is still
+     filling for that text). Without an MTP window the best of the three counts, because other
+     programs on a PC in daily use only ever slow a run down. With one (`--spec-mtp`) a chunk of
+     the stream is a verify window of several tokens, and the figure also moves with how many
+     drafts the text happens to take, up as well as down: those runs are 600 tokens and their
+     median counts. Until 2026-10-12 a window was measured like the rest and the warm-up was
+     counted in chunks, which left a second or two to time: two RTX 3060s gave 32 to 55 tok/s for
+     the same settings, and a 5-token window could not be told from a 3-token one. Every run's
+     figure is kept in the result, and picking up from a result measured the old way tries the MTP
+     candidates again. It is steadier, not steady: the same machine then read the same settings at
+     29 to 34 tok/s across starts, and the three runs of one start as far apart as 36.0 / 28.1 /
+     34.0. Held to the 3% of plain decoding, a wider prefill chunk -- 915 against 698 tok/s of
+     prompt processing, nothing to do with generation -- was turned down three times there. So
+     where either side of a comparison ran under a window, a generation difference inside the
+     swing decides nothing: the swing is the spread of the runs the two recorded, taken as no less
+     than 8% and no more than 15%. Generation then holds down to that much below the bar, and
+     counts as a gain only that much above it and only when it gains more than prompt processing
+     gives up.
    - **Kept**: a change is kept when prompt processing gains 5% or generation gains 3% while the
      other holds (90% for prompt processing, 97% for generation), whatever the change was tried for.
      A 16-bit KV cache is tried for generation, yet on two RTX 3060s it doubled prompt processing.
@@ -173,12 +211,12 @@ while one holds the GPU.
      on (an RTX 2060 and two RTX 3060s): offload instead of hybrid, the CPU thread count, each
      expert kernel this PC can run, a 16-bit KV cache, prefill overlap, a chunk budget of 0.75, four
      prefill pieces, moving the pipeline split one layer, pinned PLE, Q8_0 dense weights on a card
-     without fp8 tensor cores, MTP 3 and 5, and on a kept window min-p 0.6 over a 5-token window and
-     the 4-bit draft head (not with fp8 dense weights). Other hardware can differ, which is what
-     thorough is for.
+     without fp8 tensor cores, MTP 3 and 5 (and 4 for Flash-Next, where it was the fastest with the
+     Q2_0 experts), and on a kept window min-p 0.6 over a 5-token window and the 4-bit draft head
+     (not with fp8 dense weights). Other hardware can differ, which is what thorough is for.
    - **Thorough** adds the finer settings, which did not help on those machines: computing every
      missing expert on the CPU, the linear kernels, a q4_0 KV cache, device-side copies of cache
-     hits, chunk budget 0.9, one piece, a 16k prefill length, no host embedding, bf16 or fp8 dense
+     hits, one piece, a 16k prefill length, no host embedding, bf16 or fp8 dense
      weights (Q8_0 on a card with fp8 tensor cores), the split moved two layers, `--pp-send-ahead`
      and `--pp-prefill-group`.
    - Kernels this PC cannot run are not started: marlin without vLLM, b12x below sm_120. They are
@@ -194,10 +232,12 @@ while one holds the GPU.
      `--attention-backend` (auto already picks what starts), `--moe-expert-gguf` (another file and
      other answers: the recommendation proposes it when the model's Q2_0 GGUF sits next to the
      checkpoint), and the settings that decide what fits rather than how fast.
-   - Time depends on the GPUs and the model: two RTX 3060s with Flash-Next take about 1.5-2 hours in
-     standard mode and about 3 in thorough mode (29 starts of about 6 minutes each), an RTX 2060
-     with Ornith about an hour in standard mode. While it runs, the header shows the time left,
-     worked out from the runs so far.
+   - Time depends on the GPUs and the model: two RTX 3060s with Flash-Next took 2 h 19 min in
+     standard mode (21 starts) and 1 h 11 min with the Q2_0 experts (16 starts, which load in a
+     third of the time; 2026-10-12), and about 3 hours in thorough mode (29 starts of about 6 minutes
+     each, 2026-09-17); an RTX 2060 with Ornith 2 h 57 min in standard mode (22 starts, each
+     loading for 3-4.5 minutes, 2026-10-12). While it runs, the header shows the time left, worked
+     out from the runs so far.
 
 While it runs, the dial shows the reading being taken, the chart under it the readings of that step
 over time (or per thread count), and the list one row per run with its figures and verdict; the
