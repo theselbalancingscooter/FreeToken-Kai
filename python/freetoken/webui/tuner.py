@@ -103,6 +103,36 @@ def prior_for_pickup(prev: dict, facts: dict, hw: dict) -> tuple[set[str], set[s
     return done, kept
 
 
+def known_to(prev: dict | None, facts: dict, hw: dict) -> set[str]:
+    """The candidate keys ``prev`` could have tried: the plan it recorded (``plan_keys``), or, for
+    a result from before that record, today's plan less the candidates added since. A group a
+    tried member closed closes only these -- a candidate the result never saw (Q8_0 dense weights
+    added to a group whose bf16 member a thorough run had tried) is still offered on pickup."""
+    if not prev:
+        return set()
+    if prev.get("plan_keys"):
+        return set(prev["plan_keys"])
+    keys = set()
+    for args in (prev.get("base_args"), prev.get("args")):
+        if args:
+            keys |= {c.key for c in search.plan(list(args), facts, hw, "thorough")}
+    return keys - search.ADDED_WITHOUT_PLAN_RECORD
+
+
+def pickup_open(c, tried: set[str], kept: set[str], known: set[str], run: set[str] | None = None) -> bool:
+    """Whether candidate ``c`` is still open: not tried itself, whatever it waits for kept, and its
+    group not closed. A group this run closed (``run``: the keys and groups this run tried) binds
+    every member; one that only the last result closed binds only the candidates that result knew
+    (``known``) -- a candidate added since is offered."""
+    if c.key in tried or not c.opened_by(kept):
+        return False
+    if c.group not in tried:
+        return True
+    if run and c.group in run:
+        return False
+    return c.key not in known
+
+
 def closed_groups(prev: dict, tried: set[str], facts: dict, hw: dict) -> set[str]:
     """The groups ``tried`` closes. A result records them itself (its ``tried`` holds groups too);
     for an older one they are read off the plans its first and final settings open: a group whose
@@ -543,12 +573,13 @@ class TuneJob:
         rec = self._recommend(model) if self._recommend else {}
         facts, hw = host_facts(rec), prev.get("hw") or {}
         tried, kept = prior_for_pickup(prev, facts, hw)
+        known = known_to(prev, facts, hw)
         args = list(prev["args"])
         plan = search.plan(args, facts, hw, mode)
         # a candidate the settings already carry (the chunk ceiling four pieces set) is skipped by the
         # run without a start, so it is not listed either
         items = [{"key": c.key, "what": c.what_ja, "what_en": c.what_en, "change": c.change()} for c in plan
-                 if c.key not in tried and c.group not in tried and c.opened_by(kept)
+                 if pickup_open(c, tried, kept, known)
                  and set_flags(args, search.merge_changes(args, c.changes), c.drop) != args]
         return {"available": True, "items": items, "last": {"finished": prev.get("finished"), "mode": prev.get("mode"),
                                                             "version": prev.get("freetoken_version")},
@@ -624,7 +655,10 @@ class TuneJob:
                     rec = self._recommend(model) if self._recommend else {"flags": [], "notes": []}
                 facts = host_facts(rec)
                 prior = prior_for_pickup(last, facts, hw) if last is not None else None
-                args, notes = self._trials(model, port, args, notes, result, facts, hw, mode, use, prior=prior)
+                known = known_to(last, facts, hw) if last is not None else set()
+                # the plan this run chooses from, so a later pickup knows which candidates it could have tried
+                result["plan_keys"] = sorted({c.key for c in search.plan(list(args), facts, hw, "thorough")})
+                args, notes = self._trials(model, port, args, notes, result, facts, hw, mode, use, prior=prior, known=known)
             result["args"] = [a for a in args if a != "--moe-collect-stats"]
             result["notes"] = notes
             result["finished"] = time.time()
@@ -781,7 +815,8 @@ class TuneJob:
 
     # ---- real runs
     def _trials(self, model: str, port: int, args: list[str], notes: list[dict], result: dict,
-                facts: dict, hw: dict, mode: str, use: str, prior: tuple[set[str], set[str]] | None = None):
+                facts: dict, hw: dict, mode: str, use: str, prior: tuple[set[str], set[str]] | None = None,
+                known: set[str] | None = None):
         self._ev("phase", phase="trial")
         self._tokenizer = self._load_tokenizer(model)
         labels = _labels()
@@ -811,14 +846,16 @@ class TuneJob:
         # picking up: what the earlier runs tried counts as tried here (and closes its group), and what
         # they kept opens the candidates that wait on it
         prior_tried, prior_kept = prior or (set(), set())
+        known = set(known or ())  # the keys the last result could have tried: only these are closed by its groups
         tried: set[str] = set(prior_tried)  # candidate keys and the groups they close
+        run_tried: set[str] = set()  # the part of it this run added
         kept: set[str] = set(prior_kept)
         kept_now = False
         first = True
         while True:
             self._check()
             pending = [c for c in search.plan(best_args, facts, hw, mode)
-                       if c.key not in tried and c.group not in tried and c.opened_by(kept)]
+                       if pickup_open(c, tried, kept, known, run_tried)]
             # the page lists what is still to come, and about how long it takes; sent again before every run
             self._ev("plan", items=[{"key": x.key, "what": x.what_ja, "what_en": x.what_en, "change": x.change()} for x in pending],
                      mode=mode, use=use, update=not first,
@@ -829,6 +866,7 @@ class TuneJob:
                 break
             c = pending[0]
             tried.update({c.key, c.group})
+            run_tried.update({c.key, c.group})
             cand_args = set_flags(best_args, search.merge_changes(best_args, c.changes), c.drop)
             if cand_args == best_args:
                 continue

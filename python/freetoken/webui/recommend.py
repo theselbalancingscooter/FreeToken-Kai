@@ -346,15 +346,15 @@ def recommend(model: str, *, extra_dirs: list[str] | None = None) -> dict:
                 "this GPU has no fp8 tensor cores, so the vendored int8 kernels beat fp8 (two 3060s with Flash-Next: +2..6 tok/s generation, +3..6% prompt processing).")
     if q2_gguf:
         add("--moe-expert-gguf", q2_gguf,
-            "隣に見つかった Q2_0 の GGUF からエキスパートを読みます: 速さの段です（バンク 63.5 GiB → 34 GB、1 トークンあたりの読みが半分、"
-            "3060×2 で参照 10 問が 37〜58 tok/s、NVFP4 は 23〜28）。答えは変わります（10 問で 9/10、考える長さは 35% 増）。正確さが要るときはこの行を外します。",
+            "隣に見つかった Q2_0 の GGUF からエキスパートを読みます。速さを優先する構成です（バンク 63.5 GiB → 34 GB、1 トークンあたりの読みが半分、"
+            "3060×2 で参照 10 問が 37〜58 tok/s、NVFP4 は 23〜28）。答えは少し変わります（10 問で 9/10、考える長さは 35% 増）。答えの正確さが要るときはこの行を外します。",
             "Read the experts from the Q2_0 GGUF found next to the checkpoint: the fast tier (banks 63.5 GiB -> 34 GB, half the bytes per token, "
             "37-58 tok/s on the ten reference prompts on two 3060s against NVFP4's 23-28). The answers change (9 of 10, thinking 35% longer); drop this line when accuracy matters.")
         add("--reasoning-budget", "6000",
-            "2 bit の段は温度 0 で堂々巡りすることがあるので、思考を 6,000 トークンで打ち切って答えさせます。",
+            "2 bit のエキスパートは温度 0 で堂々巡りすることがあるので、思考を 6,000 トークンで打ち切って答えさせます。",
             "The 2-bit tier can think in circles at temperature 0; the thinking is cut at 6,000 tokens and the model answers from there.")
         if not one_card:  # one card: MTP 3 measured no gain (27.4 against 26.8), MTP 5 fell to eager, and the head copy did not fit
-            add("--spec-mtp", "5", "この段では MTP の窓の固定費を削ってあり、本物の答えで 23 → 37〜58 tok/s になります。",
+            add("--spec-mtp", "5", "Q2_0 のエキスパートでは MTP の窓の固定費を削ってあり、本物の答えで 23 → 37〜58 tok/s になります。",
                 "On this tier the verify window's fixed costs are cut: 23 -> 37-58 tok/s on real answers.")
             add("--spec-min-p", "0.6", "ヘッドの確信度が 0.6 を下回った最初のドラフトで窓を切ります（文章で 37 → 62 tok/s）。",
                 "End a window at the first draft the head scores below 0.6 (prose: 37 -> 62 tok/s).")

@@ -17,6 +17,11 @@ from dataclasses import dataclass, field
 
 # the expert formats whose kernels --quant-backend can pick, as ft serve names them
 MOE_KERNELS = {"nvfp4": ("triton", "marlin", "b12x"), "mxfp4": ("triton", "triton_gptoss")}
+
+# Candidates added after results stopped recording the plan they chose from (``plan_keys``, since
+# 2026-10-12). A pickup from such a result must not take a group another member closed as closing
+# these: the result never saw them. Newer results carry their plan, and this list stays as it is.
+ADDED_WITHOUT_PLAN_RECORD = frozenset({"dense_q8", "dense_fp8", "minp_06", "draft_q4"})
 LINEAR_KERNELS = {"nvfp4": ("marlin", "triton")}
 
 
@@ -386,7 +391,7 @@ SKIPPED = [
     ("--expert-load", "起動にかかる時間だけに効く。", "Only affects load time."),
     ("--dtype", "Turing では bfloat16 が使えないので float16 に決まる（起動できなければ外す）。それ以外の GPU では auto。",
      "Turing has no bfloat16, so float16 (dropped if the model does not load); auto elsewhere."),
-    ("--moe-expert-gguf", "エキスパートを 2.25 bit の GGUF から読む「速さの段」。別のファイルが要り、品質も変わる（10 問で 9/10）ので、速さの探索では切り替えない。"
+    ("--moe-expert-gguf", "エキスパートを 2.25 bit の GGUF から読む構成。別のファイルが要り、答えも少し変わる（10 問で 9/10）ので、速さの探索では切り替えない。"
      "「改善提案」が、同じモデルの Q2_0 GGUF が隣にあるときに提案する。",
      "The 2.25-bit expert tier reads another file and changes the answers (9 of 10 on the reference prompts), so the speed search "
      "does not switch to it; the recommendation proposes it when the model's Q2_0 GGUF sits next to the checkpoint."),

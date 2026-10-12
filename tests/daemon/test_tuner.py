@@ -242,6 +242,36 @@ def test_min_p_and_the_draft_head_follow_the_window():
     assert plan["minp_06"].changes == {"--spec-min-p": "0.6", "--spec-mtp": "5"}
 
 
+def test_a_pickup_offers_a_candidate_the_last_result_never_knew_even_in_a_closed_group():
+    """A thorough run before 2026-10-12 tried dense_bf16; today that key sits in the "dense" group
+    with dense_q8, which that run never saw. Picking up from it must still offer dense_q8 (and the
+    other candidates added since) while keeping the group closed for the members it did know."""
+    from freetoken.webui import tuner
+
+    ampere = {"measurements": dict(HW_3060["measurements"], gpus=[{"index": 0, "compute_cap": 8.6}, {"index": 1, "compute_cap": 8.6}])}
+    prev = {"args": list(FLASH_ARGS), "base_args": list(FLASH_ARGS), "hw": ampere,
+            "tried": ["dense_bf16", "kv_16bit", "mtp_3", "mtp_5"], "kept": ["mtp_5"],
+            "trials": [{"key": "base", "decision": "base", "short_s": 1.0}]}
+    tried, kept = tuner.prior_for_pickup(prev, FLASH, ampere)
+    known = tuner.known_to(prev, FLASH, ampere)
+    assert "dense" in tried  # dense_bf16 closed the group it now belongs to
+    assert "dense_q8" not in known and "dense_bf16" in known
+    plan = {c.key: c for c in search.plan(list(FLASH_ARGS), FLASH, ampere, "thorough")}
+    assert tuner.pickup_open(plan["dense_q8"], tried, kept, known)      # never seen: offered
+    assert not tuner.pickup_open(plan["dense_bf16"], tried, kept, known)  # tried itself
+    assert tuner.pickup_open(plan["minp_06"], tried, kept, known)       # mtp_5 was kept, so the window's follow-ups open
+    # a member of the closed group that the last result did know stays closed
+    other = search.Candidate("dense_other", {"--dense-quant": "other"}, group="dense")
+    assert not tuner.pickup_open(other, tried, kept, known | {"dense_other"})
+    assert tuner.pickup_open(other, tried, kept, known)  # ... and one it did not know is open
+    # within a run, a group this run closed binds every member, known or not
+    assert not tuner.pickup_open(other, tried | {"dense_q8", "dense"}, kept, known, run={"dense_q8", "dense"})
+    # a result that recorded its plan: whatever it did not list is new to it
+    prev2 = dict(prev, plan_keys=["dense_bf16", "kv_16bit", "kv_q4", "mtp_3", "mtp_5"])
+    known2 = tuner.known_to(prev2, FLASH, ampere)
+    assert known2 == set(prev2["plan_keys"]) and tuner.pickup_open(plan["dense_q8"], tried, kept, known2)
+
+
 def test_no_moe_candidates_for_a_dense_model_and_no_mtp_without_a_head():
     dense = dict(model_type="llama", num_layers=32, quant=None, mtp=False)
     keys = _keys(["--max-running-req", "1"], dense, {}, "thorough")
