@@ -178,12 +178,14 @@ def test_derive_offload_when_the_link_keeps_up():
 def test_bench_profiles_say_which_version_measured_them(tmp_path, monkeypatch):
     import os
 
+    from freetoken.moe.bench_profile import PROFILE_VERSION
+
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
     d = tmp_path / "freetoken" / "benchbw"
     os.makedirs(d)
     for uuid, extra in (("GPU-a", {}), ("GPU-b", {"freetoken_version": "0.0.1"})):
         with open(d / f"{uuid}.json", "w") as fh:
-            json.dump({"version": 4, "epoch": 1, "gpu": {"index": 0, "name": "RTX", "uuid": uuid}, "dtypes": {"nvfp4": "hybrid"}, **extra}, fh)
+            json.dump({"version": PROFILE_VERSION, "epoch": 1, "gpu": {"index": 0, "name": "RTX", "uuid": uuid}, "dtypes": {"nvfp4": "hybrid"}, **extra}, fh)
     tuner.stamp_profile(str(d / "GPU-a.json"))
     doc = tuner.bench_profiles()
     assert doc["current"] == tuner.FT_VERSION

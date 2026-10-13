@@ -85,7 +85,7 @@ class _Manager:
     def serve_args(self):
         return []
 
-    def start(self, model, port, args):
+    def start(self, model, port, args, api_key=None):
         self.started = (model, port, args)
         return {"pid": 1, "model": model, "port": port}
 

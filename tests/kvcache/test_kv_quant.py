@@ -44,10 +44,15 @@ def test_roundtrip_stays_inside_half_a_step_of_the_block_scale(spec, dtype):
     # Per block, the error a symmetric quantizer can leave is half a step, and the step is
     # absmax/qmax. Checking against the block's own scale (not a global tolerance) is what
     # makes this meaningful for K rows with outlier channels.
+    # The step is the STORED scale: absmax/qmax rounded to fp16, the only one a reader has.
+    # Against the unrounded quotient a block may sit past the bound by the rounding (3.5e-5
+    # on one q4_0 block of the data torch 2.14 draws for this seed; 2.11 drew other numbers).
     blocks = x.reshape(7, 3, 256 // BLOCK, BLOCK)
     err = (back - x).reshape(7, 3, 256 // BLOCK, BLOCK).abs().amax(dim=-1)
-    step = blocks.abs().amax(dim=-1) / spec.qmax
+    step = scales.to(torch.float32)
     assert torch.all(err <= step / 2 + 1e-6)
+    exact = blocks.abs().amax(dim=-1) / spec.qmax
+    assert torch.all((step - exact).abs() <= exact * 2.0**-10)  # fp16 keeps 11 significant bits
 
 
 @pytest.mark.parametrize("spec", [Q8_0, Q4_0], ids=lambda s: s.name)
