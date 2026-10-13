@@ -16,6 +16,8 @@ import urllib.request
 from collections.abc import Sequence
 from typing import Any
 
+from freetoken.launch import resolve_api_key
+
 DEFAULT_URL = "http://127.0.0.1:1900"       # server.DEFAULT_PORT
 MGR_URL = "http://127.0.0.1:1901"          # server.MGR_PORT: kai's manager
 DEFAULT_TIMEOUT = 10.0
@@ -146,6 +148,10 @@ def _build_parser(prog: str, console: bool = False) -> argparse.ArgumentParser:
         sp = sub.add_parser(name, parents=[common], help=f"POST /engine/{name}")
         sp.add_argument("model", help="Model path/id")
         sp.add_argument("--port", type=int, default=None, help="Serve port")
+        sp.add_argument(
+            "--api-key",
+            help="API key the serve requires, set in its environment (default: $FREETOKEN_API_KEY)",
+        )
         if name == "switch":
             sp.add_argument(
                 "--force",
@@ -183,6 +189,8 @@ def main(argv: Sequence[str] | None = None, *, prog: str = "ft daemon", console:
             body: dict[str, Any] = {"model": args.model, "args": list(args.serve_args)}
             if args.port is not None:
                 body["port"] = args.port
+            if api_key := resolve_api_key(args.api_key):
+                body["apiKey"] = api_key
             if args.verb == "switch" and args.force:
                 body["force"] = True
             method, path = "POST", f"/engine/{args.verb}"

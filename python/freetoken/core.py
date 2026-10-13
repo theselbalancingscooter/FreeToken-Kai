@@ -24,6 +24,8 @@ class SamplingParams:
     # Stop strings (OpenAI `stop` / Anthropic `stop_sequences`). Generation finishes when one
     # appears in the decoded output; the matched substring (and anything after) is trimmed.
     stop_strs: list[str] = field(default_factory=list)
+    presence_penalty: float = 0.0
+    frequency_penalty: float = 0.0
     # Reasoning budget (Kai): tokens the model may spend between <think> and </think> before
     # </think> is forced. None = the server's --reasoning-budget, 0 = unlimited.
     reasoning_budget: int | None = None
@@ -80,6 +82,7 @@ class Req:
     # handler must not free resources under an in-flight forward; it sets this flag and
     # _process_last_data frees the request when the batch drains (after copy_done.synchronize).
     aborted: bool = False
+    output_token_counts: torch.Tensor | None = field(default=None, init=False, repr=False)
     # --- reasoning budget (scheduler-owned): inside a <think> span?, tokens spent in it, and
     # the token id the next sample must return (-1 = sample freely). None = not derived yet.
     reasoning_open: bool | None = None

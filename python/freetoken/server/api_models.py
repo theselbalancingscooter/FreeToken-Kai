@@ -74,8 +74,8 @@ class ChatCompletionRequest(BaseModel):
     stream: bool = False
     stream_options: StreamOptions | None = None
     stop: str | list[str] | None = None
-    presence_penalty: float = 0.0
-    frequency_penalty: float = 0.0
+    presence_penalty: float = Field(default=0.0, ge=-2.0, le=2.0, allow_inf_nan=False)
+    frequency_penalty: float = Field(default=0.0, ge=-2.0, le=2.0, allow_inf_nan=False)
     chat_template_kwargs: dict[str, Any] = Field(default_factory=dict)
     reasoning_effort: str | None = None
     # DeepSeek-wire thinking toggle ({"type": "enabled"|"disabled"}). Any so a
@@ -119,8 +119,8 @@ class CompletionRequest(BaseModel):
     stream: bool = False
     stream_options: StreamOptions | None = None
     stop: str | list[str] | None = None
-    presence_penalty: float = 0.0
-    frequency_penalty: float = 0.0
+    presence_penalty: float = Field(default=0.0, ge=-2.0, le=2.0, allow_inf_nan=False)
+    frequency_penalty: float = Field(default=0.0, ge=-2.0, le=2.0, allow_inf_nan=False)
     reasoning_budget: int | None = None  # Kai, as in ChatCompletionRequest
     ignore_eos: bool = False
     logprobs: int | None = None

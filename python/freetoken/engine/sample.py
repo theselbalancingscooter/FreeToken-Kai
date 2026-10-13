@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List
 
 import torch
@@ -19,6 +19,7 @@ class BatchSamplingArgs:
     # per row: the token the sample must return (the scheduler's reasoning budget forcing
     # </think>), -1 where the row samples freely; None when no row is forced
     force_token: torch.Tensor | None = None
+    penalties: list[tuple[int, torch.Tensor, float, float]] = field(default_factory=list)
 
 
 def make_device_tensor(data: List, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
@@ -66,8 +67,20 @@ class Sampler:
         force = (
             make_device_tensor(forces, torch.int32, self.device) if any(f >= 0 for f in forces) else None
         )
+        penalties = []
+        for row, req in enumerate(batch.reqs):
+            p = req.sampling_params
+            if not (p.presence_penalty or p.frequency_penalty) or not req.can_decode:
+                continue
+            if req.output_token_counts is None:
+                req.output_token_counts = torch.zeros(
+                    self.vocab_size, dtype=torch.int32, device=self.device
+                )
+            penalties.append(
+                (row, req.output_token_counts, p.presence_penalty, p.frequency_penalty)
+            )
         if all(is_greedy):
-            return BatchSamplingArgs(temperatures=None, force_token=force)
+            return BatchSamplingArgs(temperatures=None, force_token=force, penalties=penalties)
 
         MIN_P = MIN_T = 1e-6
         # Greedy outputs are selected explicitly in sample(); use neutral sampling
@@ -91,12 +104,21 @@ class Sampler:
             make_device_tensor(is_greedy, torch.bool, self.device) if any(is_greedy) else None
         )
         return BatchSamplingArgs(
-            temperatures, top_k=top_k, top_p=top_p, greedy_mask=greedy_mask, force_token=force
+            temperatures,
+            top_k=top_k,
+            top_p=top_p,
+            greedy_mask=greedy_mask,
+            force_token=force,
+            penalties=penalties,
         )
 
     @nvtx_annotate("Sampler")
     def sample(self, logits: torch.Tensor, args: BatchSamplingArgs) -> torch.Tensor:
         with torch.cuda.nvtx.range("Sampler"):
+            if args.penalties:
+                logits = logits.float().clone()
+                for row, counts, presence, frequency in args.penalties:
+                    logits[row] -= frequency * counts + presence * (counts > 0)
             if args.temperatures is None:  # greedy sampling
                 tokens = torch.argmax(logits, dim=-1)
             else:
@@ -111,4 +133,11 @@ class Sampler:
                 # drafts then survive only where they drafted that very token)
                 force = args.force_token
                 tokens = torch.where(force >= 0, force.to(tokens.dtype), tokens)
+            # Update on the sampling stream: overlapped scheduling can prepare the next
+            # batch before the previous token reaches Req.input_ids on the CPU.
+            # (Kai: after the forced token is in, so a forced </think> is what gets counted.)
+            for row, counts, _, _ in args.penalties:
+                counts.scatter_add_(
+                    0, tokens[row : row + 1].long(), counts.new_ones(1)
+                )
             return tokens

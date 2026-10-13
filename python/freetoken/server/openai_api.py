@@ -79,6 +79,8 @@ def chat_request_to_genspec(
             model_sampling=model_sampling,
             stop=req.stop,
             default_max_tokens=default_max_tokens,
+            presence_penalty=req.presence_penalty,
+            frequency_penalty=req.frequency_penalty,
             reasoning_budget=req.reasoning_budget,
         ),
         chat_template_kwargs=ctk,
@@ -558,6 +560,8 @@ def _resolve_sampling(
         model_sampling=model_sampling,
         stop=req.stop,
         default_max_tokens=default_max_tokens,
+        presence_penalty=req.presence_penalty,
+        frequency_penalty=req.frequency_penalty,
         reasoning_budget=getattr(req, "reasoning_budget", None),
     )
 
