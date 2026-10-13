@@ -14,7 +14,7 @@ next person does not have to repeat it.
 with `an illegal memory access was encountered`. `CUDA_LAUNCH_BLOCKING=1` moves the reported
 location to an unrelated `.to()` call.
 
-**Cause.** The `sgl_kernel` (sglang-kernel 0.4.5) wheel ships no sm_75 cubins. Every one of its
+**Cause.** The `sgl_kernel` (sglang-kernel 0.4.5, and still 0.4.9) wheel ships no sm_75 cubins. Every one of its
 launches fails with `cudaErrorNoKernelImageForDevice`. `moe_align_block_size` does not check the
 result and returns its `torch.empty` outputs (`sorted_ids`, `expert_ids`) uninitialised; the
 grouped GEMM then indexes expert weights with garbage ids. The error surfaces far from its origin.

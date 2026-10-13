@@ -1,7 +1,7 @@
 # FreeToken Kai (改)
 
 An unofficial fork of [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken),
-merged with upstream `main` at commit `2d8b9cc` (2026-10-09). It is not affiliated with, endorsed
+merged with upstream `main` at commit `9c635a1` (2026-10-13). It is not affiliated with, endorsed
 by, or supported by FlashML. The license is unchanged (Apache-2.0).
 
 The fork adds eleven things upstream does not have:
@@ -238,6 +238,22 @@ enough on its own: uv reuses its cached build unless `pyproject.toml` or `setup.
 Upstream `f5b9700` renamed the disk PLE store to `_row_store`; until it is built,
 `--ple-backend disk` (Flash-Next) fails at import. Other backends are not affected.
 
+Upstream `74a3877` and `9c635a1` (merged 2026-10-13) moved the dependencies to torch 2.14.1,
+triton 3.8, sglang-kernel 0.4.9 and flashlib 0.4.0, and the extensions to C++20. After pulling
+past that merge, run `uv pip install -e ".[accel]"` once more in the same venv. Here both files
+uv watches did change, so this one command upgrades the packages and rebuilds the three
+extensions against the new torch (about 100 s on the RTX 2060 host, wheels downloaded); extensions
+built under torch 2.11 still import under 2.14, but they were compiled against other headers and
+must not be kept. torch 2.14.1 still carries sm_75, and the sglang-kernel wheel still does not
+(`docs/turing.md` §1), so nothing changes for a Turing card.
+
+The same merge brought upstream `95ac86f`, which raises the version of the `ft bench bw` profile
+from 4 to 5 and has the engine ignore older ones (`benchbw profile ... predates this engine` in
+the log). Run `ft bench bw` again after the update. Until then a start without `--moe-strategy`
+stays on `offload`, and `--moe-hybrid-max-fetch auto` falls back to a fixed cap of one fetched
+expert per layer per step, which measured about 3% slower than the benched share on the RTX 2060
+(Ornith) and 4.5% slower on an RTX 3060 (19.33 against 18.45 tok/s).
+
 ## Running Ornith-1.5-35B-A3B on an RTX 2060 (6 GB) under WSL2
 
 ```bash
@@ -413,6 +429,12 @@ unquantized and the engine quantizes its experts itself. A head the exporter did
 refused where it is read. Verified on modelopt MIXED_PRECISION (Ornith / Qwen3.6-35B-A3B-NVFP4)
 and on the Flash-Next NVFP4 export. The `Spec decode` line in the decode status shows the mean
 accepted length.
+
+A request's `presence_penalty` / `frequency_penalty` hold inside a verify window too: each row is
+penalized by the output so far plus the drafts before it, which is what a plain decode would have
+counted by that token, and only the tokens the window commits are added to the counts. The draft
+head does not see the penalties, so a request that uses them accepts fewer drafts; its answer is
+the one plain decoding would sample.
 
 CUDA graphs: the K+1-row verify window and the draft head (window pass + one chain step) are
 captured at startup and replayed per step, the way the decode step is; windows shorter than

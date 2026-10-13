@@ -9,7 +9,7 @@ how they trade against each other on your card. Now a benchmark in the browser m
 with the model, tries the settings one at a time, and hands you the fastest as a launch profile.
 
 > An unofficial fork of [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken), merged
-> with upstream `main` at `2d8b9cc` (2026-10-09). Not affiliated with, endorsed by, or supported by
+> with upstream `main` at `9c635a1` (2026-10-13). Not affiliated with, endorsed by, or supported by
 > FlashML. The license is unchanged (Apache-2.0).
 >
 > **Please keep questions and bug reports about this fork in this repository.** The FreeToken
@@ -32,6 +32,13 @@ with the model, tries the settings one at a time, and hands you the fastest as a
    After a `git pull` that changes the C++ extensions, rebuild them in place with
    `python setup.py build_ext --inplace` (venv active). Since `f5b9700` the disk PLE store is
    `_row_store`, and `--ple-backend disk` does not start until it is built.
+
+   The merge of 2026-10-13 follows upstream to torch 2.14.1 (with triton 3.8, flashlib 0.4.0 and
+   sglang-kernel 0.4.9). After pulling past it, run `uv pip install -e ".[accel]"` once more in
+   the same venv: it moves those packages up and rebuilds the extensions against the new torch.
+   Then run `ft bench bw` again (or the console's benchmark): profiles written before this
+   merge are ignored, and without one a `hybrid` server fetches one expert per layer per step
+   instead of the measured share.
 
 2. **Open the console.**
 
