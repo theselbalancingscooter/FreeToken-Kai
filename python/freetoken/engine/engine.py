@@ -7,6 +7,7 @@ import math
 import os
 import re
 import time
+from dataclasses import replace
 from datetime import timedelta
 from typing import Any, Dict, Iterable, Iterator, NamedTuple, Tuple
 
@@ -660,8 +661,33 @@ def _traceback_tail(exc: BaseException, lines: int = 14) -> str:
     return "\n".join(tb[-lines:])
 
 
+def _penalize_window(logits: torch.Tensor, penalty, drafts) -> torch.Tensor:
+    """A verify window's logits under the request's presence / frequency penalties (upstream
+    #527 counts one logits row per request). Row j of the window has read the committed output
+    and the drafts before it, so its counts are the request's plus one per draft in
+    ``drafts[:j]`` -- what a plain decode would have counted by then had it sampled them."""
+    _, counts, presence, frequency = penalty
+    out = logits.float().clone()
+    seen = counts.clone()
+    for j in range(out.shape[0]):
+        if 0 < j <= len(drafts):
+            seen[int(drafts[j - 1])] += 1
+        out[j] -= frequency * seen + presence * (seen > 0)
+    return out
+
+
+def _count_window_tokens(penalty, accepted) -> None:
+    """Add a verified window's committed tokens to the request's penalty counts."""
+    counts = penalty[1]
+    idx = torch.tensor(list(accepted), dtype=torch.long, device=counts.device)
+    counts.index_add_(0, idx, torch.ones_like(idx, dtype=counts.dtype))
+
+
 def _expand_sampling_args(args: BatchSamplingArgs, rows: int) -> BatchSamplingArgs:
-    """Per-row sampling params for a verify window (one request, ``rows`` logits rows)."""
+    """Per-row sampling params for a verify window (one request, ``rows`` logits rows). The
+    request's penalties are left out: the window applies them itself (_penalize_window)."""
+    if args.penalties:
+        args = replace(args, penalties=[])
     if args.temperatures is None and args.force_token is None:
         return args
     if (args.temperatures is None or args.temperatures.numel() == rows) and (
@@ -2283,8 +2309,14 @@ class Engine:
         if batch.spec_verify:
             # the target's own sample at every window row decides how many drafts survive
             req = batch.reqs[0]
-            sampled = self.sampler.sample(logits[:rows], _expand_sampling_args(args, rows)).to(torch.int32)
+            window_logits = logits[:rows]
+            penalty = args.penalties[0] if args.penalties else None
+            if penalty is not None:
+                window_logits = _penalize_window(window_logits, penalty, req.spec_drafts)
+            sampled = self.sampler.sample(window_logits, _expand_sampling_args(args, rows)).to(torch.int32)
             accepted = accept_drafts(sampled.tolist(), req.spec_drafts)
+            if penalty is not None:
+                _count_window_tokens(penalty, accepted)
             if prof is not None:
                 prof.mark("sample_accept")
             self.model.spec_rollback(batch, len(accepted), self.ctx)
