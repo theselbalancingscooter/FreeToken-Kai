@@ -835,12 +835,28 @@ def test_probe_sends_the_running_serves_key(monkeypatch):
 
     monkeypatch.setattr(proxy.urllib.request, "urlopen", fake_urlopen)
     key = None
-    probe = proxy.ServeProbe(api_key=lambda: key)
+    # Kai: the probe first asks the kernel whether the port listens; nothing does here
+    probe = proxy.ServeProbe(api_key=lambda: key, listening=lambda port: None)
     probe.fresh_stats(1919)
     key = "k1"
     probe.fresh_stats(1919)
     probe.prepare_stop(1919)
     assert seen == [None, "Bearer k1", "Bearer k1"]
+
+
+@pytest.mark.parametrize("args,key", [
+    (["--moe-strategy", "hybrid", "--api-key", "k1"], "k1"),
+    (["--api-key=k2", "--pp-size", "2"], "k2"),
+    (["--api", "k3"], "k3"),            # argparse takes an unambiguous prefix
+    (["--ap=k4"], "k4"),
+    (["--api-key"], None),              # nothing after it
+    (["--api-key="], None),
+    (["--attn", "fa", "--port", "1919"], None),
+    ([], None),
+])
+def test_a_key_among_the_serve_flags_is_found(args, key):
+    """Kai: ft mgr starts a profile with its flags as they are, so the probe reads the key there."""
+    assert proxy.api_key_in_args(args) == key
 
 
 def test_start_and_switch_routes_hand_the_api_key_to_the_manager():
@@ -864,14 +880,15 @@ def test_start_and_switch_routes_hand_the_api_key_to_the_manager():
             lifecycle_pool=lifecycle_pool, proxy_pool=proxy_pool,
         )
         with TestClient(app) as client:
-            client.post("/engine/start", json={"model": "m", "port": 1919, "apiKey": "k1"})
-            client.post("/engine/start", json={"model": "m", "port": 1919, "apiKey": ""})
-            client.post("/engine/start", json={"model": "m", "port": 1919})
-            client.post("/engine/switch", json={"model": "m", "port": 1919, "apiKey": "k2"})
+            # Kai: a bare name is resolved against the local model folders, a repo id is not
+            client.post("/engine/start", json={"model": "org/m", "port": 1919, "apiKey": "k1"})
+            client.post("/engine/start", json={"model": "org/m", "port": 1919, "apiKey": ""})
+            client.post("/engine/start", json={"model": "org/m", "port": 1919})
+            client.post("/engine/switch", json={"model": "org/m", "port": 1919, "apiKey": "k2"})
             for args in (["--api-key", "k3"], ["--api-key=k3"], ["--api", "k3"], ["--ap=k3"]):
-                rejected = client.post("/engine/start", json={"model": "m", "args": args})
+                rejected = client.post("/engine/start", json={"model": "org/m", "args": args})
                 assert rejected.status_code == 400
-            allowed = client.post("/engine/start", json={"model": "m", "args": ["--attn", "fa"]})
+            allowed = client.post("/engine/start", json={"model": "org/m", "args": ["--attn", "fa"]})
             assert allowed.status_code == 200
     assert [args[-1] for args in calls] == ["k1", None, None, "k2", None]
 

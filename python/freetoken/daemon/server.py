@@ -121,7 +121,7 @@ def main(argv: Sequence[str] | None = None, *, prog: str = "ft daemon", console:
     from .metrics import FootprintCache
     from .pidfile import AlreadyRunning, ServeStateStore, SingleInstance
     from .profiles import ProfileStore
-    from .proxy import ServeProbe
+    from .proxy import ServeProbe, api_key_in_args
     from .serve_manager import ServeManager
     from .tailer import LogTailer
     from freetoken.webui.auth import load_or_create_token
@@ -143,7 +143,8 @@ def main(argv: Sequence[str] | None = None, *, prog: str = "ft daemon", console:
     ring = LogRing(capacity=args.log_capacity)
     store = ServeStateStore(os.path.join(state_dir, "serve.json"))
     # read at call time: the running serve's key, from the manager created below
-    probe = ServeProbe(api_key=lambda: manager.serve_api_key())
+    # (Kai: or the one among its flags, which is where a profile started from ft mgr keeps it)
+    probe = ServeProbe(api_key=lambda: manager.serve_api_key() or api_key_in_args(manager.serve_args()))
 
     def tailer_factory(child):
         log_path = getattr(child, "log_path", None)

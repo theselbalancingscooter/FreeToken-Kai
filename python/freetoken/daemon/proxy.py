@@ -61,6 +61,21 @@ def local_listener(port: int) -> bool | None:
     return False if readable else None
 
 
+def api_key_in_args(args) -> str | None:
+    """The key a serve was given as a flag (``--api-key K`` / ``--api-key=K``, or any prefix
+    argparse takes for it, as /engine/start's refusal reads them), else None. ``ft mgr`` starts a
+    profile with its flags as they are, so a profile that sets a key carries it here and not in
+    the manager's own key."""
+    args = list(args or [])
+    for i, arg in enumerate(args):
+        flag, eq, value = str(arg).partition("=")
+        if len(flag) >= 4 and "--api-key".startswith(flag):
+            if eq:
+                return value or None
+            return str(args[i + 1]) if i + 1 < len(args) else None
+    return None
+
+
 class ServeProbe:
     def __init__(
         self,
