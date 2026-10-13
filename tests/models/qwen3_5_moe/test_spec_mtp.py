@@ -386,6 +386,8 @@ def test_the_head_bank_is_keyed_by_the_kernels_roles():
             "down_proj": torch.randn(e, h, i, dtype=torch.bfloat16),
         },
         device=torch.device("cuda"),
+        # no --moe-expert-gguf: the bank format is the checkpoint's own, so the head goes to NVFP4
+        config=SimpleNamespace(model_config=SimpleNamespace(moe_weight_format=None)),
         _mtp_bank_host=None,
         _mtp_bank_bytes=0,
     )
