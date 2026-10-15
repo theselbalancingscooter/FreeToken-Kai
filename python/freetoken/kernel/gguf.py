@@ -47,6 +47,26 @@ def _c_compiler_for(cxx: str) -> str:
     cc = base.replace("g++", "gcc")
     return shutil.which(cc) or cc
 
+
+def _build_directory() -> str:
+    """Where the extension is built: torch's default extensions root, in a directory of this
+    torch version's own.
+
+    Every venv on a machine shares torch's default ``<root>/py313_cu130/<name>``, and two torch
+    versions read its ``lock`` file differently: torch 2.14 holds an OS lock on it and leaves
+    the file behind, torch 2.11 takes the file's mere existence for a build in progress and
+    waits for it to go, without a word, for ever. So after one run under 2.14, every 2.11 run
+    on the machine hung at its first GGUF op (on two RTX 3060s: the published build's Q2_0
+    server, in its decode graph capture, twice for 30 minutes). Apart, the versions also stop
+    rebuilding each other's objects."""
+    from torch.utils.cpp_extension import _get_build_directory
+
+    root = os.path.dirname(_get_build_directory("freetoken_gguf_kernels", verbose=False))
+    path = os.path.join(root, "freetoken_gguf_kernels-torch" + torch.__version__.split("+")[0])
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
 @functools.cache
 def _module():
     from torch.utils.cpp_extension import load
@@ -69,6 +89,7 @@ def _module():
         sources=[str(_CSRC / "gguf_kernel.cu")],
         extra_include_paths=[str(_CSRC)],
         extra_cuda_cflags=extra_cuda_cflags,
+        build_directory=_build_directory(),
         verbose=True,
     )
 
