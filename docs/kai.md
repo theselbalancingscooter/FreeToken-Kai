@@ -1,7 +1,7 @@
 # FreeToken Kai (改)
 
 An unofficial fork of [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken),
-merged with upstream `main` at commit `9c635a1` (2026-10-13). It is not affiliated with, endorsed
+merged with upstream `main` at commit `f02fbb1` (2026-10-14). It is not affiliated with, endorsed
 by, or supported by FlashML. The license is unchanged (Apache-2.0).
 
 The fork adds eleven things upstream does not have:
@@ -253,6 +253,12 @@ the log). Run `ft bench bw` again after the update. Until then a start without `
 stays on `offload`, and `--moe-hybrid-max-fetch auto` falls back to a fixed cap of one fetched
 expert per layer per step, which measured about 3% slower than the benched share on the RTX 2060
 (Ornith) and 4.5% slower on an RTX 3060 (19.33 against 18.45 tok/s).
+
+Upstream `2010271` (merged 2026-10-14) split the CPU MoE executor (`_cpu_moe`) into one source
+per expert format under `kernels/` and added a CUDA source to it, so building the extension now
+needs `nvcc` (the CUDA 13 toolkit the JIT kernels already need). The fork's Q2_0 format is
+`kernels/q2_0.cpp`. Formats are named, not numbered, from that merge on. The same
+`uv pip install -e ".[accel]"` rebuilds it (`setup.py` changed again).
 
 ## Running Ornith-1.5-35B-A3B on an RTX 2060 (6 GB) under WSL2
 
