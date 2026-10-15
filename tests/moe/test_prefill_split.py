@@ -57,6 +57,9 @@ def test_when_the_split_applies(monkeypatch):
     assert moe.prefill_split_max_tokens(_cache(prefill_overlap=True)) == moe.PREFILL_SPLIT_MAX_TOKENS
     assert moe.prefill_split_max_tokens(_cache(cpu_executor=None)) == 0
     assert moe.prefill_split_max_tokens(_cache(prefix_pinned_rows=100)) == 0   # --moe-bank-ram
+    # upstream #689: the split stages into the only slot pool; with several it stays off
+    assert moe.prefill_split_max_tokens(_cache(pool_sizes=[700])) == moe.PREFILL_SPLIT_MAX_TOKENS
+    assert moe.prefill_split_max_tokens(_cache(pool_sizes=[350, 350])) == 0
     monkeypatch.setenv("FREETOKEN_PREFILL_SPLIT_MAX_TOKENS", "512")
     assert moe.prefill_split_max_tokens(_cache(prefill_overlap=True)) == 512
     monkeypatch.setenv("FREETOKEN_PREFILL_SPLIT", "0")
@@ -71,6 +74,7 @@ def test_the_start_line_says_where_it_applies(monkeypatch):
     assert "64-1024 tokens" in line and "on 19 of 40 MoE layers" in line and "the 21 without pinned banks" in line
     assert "without pinned" not in moe.describe_prefill_split(_cache(num_layers=48, _unpinned_layers=frozenset()))
     assert "--moe-bank-ram" in moe.describe_prefill_split(_cache(num_layers=48, prefix_pinned_rows=338))
+    assert "several MoE slot pools" in moe.describe_prefill_split(_cache(num_layers=48, pool_sizes=[350, 350]))
     monkeypatch.setenv("FREETOKEN_PREFILL_SPLIT", "0")
     assert "off" in moe.describe_prefill_split(_cache(num_layers=48))
 

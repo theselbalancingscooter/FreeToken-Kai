@@ -55,7 +55,8 @@ def test_dispatch_threshold_and_disable(monkeypatch):
     monkeypatch.setattr(layer, "_expert_gemm", lambda *a, **k: "gpu")
     layer.offload_cache.materialize_layer = lambda lid: None
     layer.offload_cache.copy_missing = lambda: None
-    layer.offload_cache.bank_views = lambda n: ()
+    layer.offload_cache.stage_views = lambda lid, buffer_id: ()  # upstream #689: the whole-layer rows
+    layer.offload_cache.release_prefill_layer = lambda lid: None  # and the release after them
     layer.offload_cache.alphas_for_layer = lambda lid: None
     x = torch.zeros(40, 8)
     monkeypatch.setenv("FREETOKEN_CPU_PREFILL_MAX_TOKENS", "256")

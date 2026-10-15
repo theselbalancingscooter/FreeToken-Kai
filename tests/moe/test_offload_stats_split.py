@@ -21,6 +21,8 @@ def _cache(target: str):
         decode_target=target, num_layers=2, lru_stats=rows,
         stat_fetched=torch.tensor(0), stat_fetched_layer=torch.zeros(2, dtype=torch.int64),
         prefill_hit_rows=0, prefill_total_rows=0,
+        # the per-layer rows name each layer's slot pool (upstream #689): one pool of 8 slots
+        pool_of_layer=[0, 0], pool_slots=lambda layer: 8,
     )
 
 
