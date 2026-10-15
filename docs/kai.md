@@ -1,7 +1,7 @@
 # FreeToken Kai (改)
 
 An unofficial fork of [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken),
-merged with upstream `main` at commit `f02fbb1` (2026-10-14). It is not affiliated with, endorsed
+merged with upstream `main` at commit `0bca88f` (2026-10-15). It is not affiliated with, endorsed
 by, or supported by FlashML. The license is unchanged (Apache-2.0).
 
 The fork adds eleven things upstream does not have:
@@ -259,6 +259,17 @@ per expert format under `kernels/` and added a CUDA source to it, so building th
 needs `nvcc` (the CUDA 13 toolkit the JIT kernels already need). The fork's Q2_0 format is
 `kernels/q2_0.cpp`. Formats are named, not numbered, from that merge on. The same
 `uv pip install -e ".[accel]"` rebuilds it (`setup.py` changed again).
+
+Upstream `b416f85` (merged 2026-10-15) splits the GPU expert slot cache into pools
+(`--moe-cache-scope`, `--moe-cache-split`, and `--moe-cache-mem` to size it in bytes). With the
+defaults every layer whose experts share a format shares one pool, which is the cache as it was;
+the commands in this document need no change. The `--spec-mtp` draft head's expert layer, which
+the fork appends after the model's MoE layers, joins the pool of the layers it was quantized
+like. The fork's split prefill (a short prompt's layer computed by the CPU and the GPU at once)
+needs that single pool, so with several pools it stays off and the start line says so
+(`prefill split: off with several MoE slot pools`); short prompts then take the whole-layer
+prefill. A `--moe-cache-split profile:` file counts the model's layers only; the draft head's
+layer is given their mean.
 
 ## Running Ornith-1.5-35B-A3B on an RTX 2060 (6 GB) under WSL2
 
