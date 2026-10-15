@@ -1850,9 +1850,8 @@ class Engine:
         """Build the persistent CPU MoE executor (decode-time expert compute).
 
         Must run before CUDA graph capture: the worker pool has to be live for the
-        eager warmup forward, and the pinned IO buffers / host-func task pointers
-        must be stable for the captured nodes. Buffers/tasks themselves are
-        allocated lazily on the first (eager) forward at each batch size.
+        eager warmup forward, and the pinned IO block must be stable for the captured
+        nodes.
         """
         from freetoken.moe.cpu_executor import CpuMoeExecutor
 
@@ -1867,10 +1866,12 @@ class Engine:
         # round a batch up to the largest captured size; cover both.
         # An MTP verify window ships spec_k + 1 rows through the CPU executor at once, and a
         # short prefill extend and the CPU share of a split prefill go through it in
-        # CPU_PREFILL_PIECE-row pieces.
+        # CPU_PREFILL_PIECE-row pieces (Kai). Every one of them shares the executor's one
+        # pinned IO block of max_tokens rows.
         from freetoken.layers.moe import CPU_PREFILL_PIECE, cpu_prefill_max_tokens, prefill_split_enabled
 
-        max_tokens = max(config.max_running_req, config.cuda_graph_max_bs or 0, 1, self.spec_k + 1)
+        max_tokens = max(config.max_running_req, config.cuda_graph_max_bs or 0, *(config.cuda_graph_bs or []), 1,
+                         self.spec_k + 1)
         if cpu_prefill_max_tokens() > 0 or prefill_split_enabled():
             max_tokens = max(max_tokens, CPU_PREFILL_PIECE)
         method = sample.quant_method
@@ -3256,10 +3257,10 @@ def _cpu_moe_executor_viable(model_config) -> bool:
     """Whether an automatic CPU-decode decision may target the CPU MoE executor.
 
     A default boot must degrade to GPU offload instead of crashing in CpuMoeExecutor after the whole load; explicit cpu/hybrid/--moe-cpu-layers picks still fail loudly."""
-    from freetoken.moe.cpu_executor import _WFMT_IDS, compiled_extension_supports
+    from freetoken.moe.cpu_executor import compiled_extension_supports
 
     try:
-        from freetoken.kernel import _cpu_moe  # noqa: F401
+        from freetoken.kernel import _cpu_moe
     except ImportError:
         return False
     act = getattr(model_config, "hidden_act", "silu")
@@ -3270,7 +3271,7 @@ def _cpu_moe_executor_viable(model_config) -> bool:
         return False
     expert_quant = getattr(model_config, "expert_quant", "none")
     fmt = expert_quant if expert_quant != "none" else (moe_wfmt or "bf16")
-    return fmt == "mxfp4" or fmt in _WFMT_IDS
+    return fmt == "mxfp4" or fmt in _cpu_moe.weight_formats()
 
 
 def _pp_group_timeout(config) -> float:

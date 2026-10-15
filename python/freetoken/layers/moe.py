@@ -351,7 +351,7 @@ class OffloadMoELayer(MoELayer):
 
         The CPU pool is kicked off (``decode_submit``) before the GPU PCIe fetch + GEMM so
         the CPU overflow GEMV runs concurrently with the GPU work. Capture-safe: the
-        routing split is device-side elementwise and the CPU submit/sync are host nodes.
+        routing split runs inside the hybrid ensure kernel and the CPU submit/sync are host nodes.
         Each route is computed exactly once -- CPU-assigned routes reach the GPU as slot -1 with
         weight 0 (a kernel with ``supports_inactive_slots`` skips them without a read; any other reads
         slot 0, whose storage is a payload or the bank's zero fill) and the CPU ids are -1 for
@@ -359,23 +359,10 @@ class OffloadMoELayer(MoELayer):
         """
         executor = cache.cpu_executor
         assert executor is not None, "CPU MoE executor was not initialized"
-        raw = topk_ids.clone()  # raw expert ids for the CPU partial
-        # --moe-bank-ram: the GPU can only address the registered prefix, so a miss on a row
-        # past it must not be fetched. The fetch choice lives in the kernel, so steer it from
-        # here instead: hand those positions expert 0 (rank 0 of the renumbering -- the
-        # hottest expert, so all but certainly a hit costing no fetch), then overwrite the
-        # slot it returns with -1 so the CPU partial takes them. raw still holds the true
-        # ids, which is what the CPU executor reads.
-        cold = None
-        if cache.prefix_pinned_rows is not None:
-            cold = raw >= cache.prefix_pinned_rows
-            topk_ids.masked_fill_(cold, 0)
-        cache.ensure_experts_hybrid(self.layer_id, topk_ids)  # -> slot or -1
-        if cold is not None:
-            topk_ids.masked_fill_(cold, -1)
-        on_gpu = topk_ids >= 0
-
-        cpu_ids = torch.where(on_gpu, raw.new_full((), -1), raw).contiguous()
+        # the kernel reads every route's slot: give the inactive ones slot 0, which holds a
+        # complete payload or the bank's zero fill (never uninitialized storage), times weight 0
+        clamp = not (self.quant_method is not None and self.quant_method.kernel.supports_inactive_slots)
+        gpu_slots, gpu_w, cpu_ids = hybrid_routes(cache, self.layer_id, topk_ids, topk_weights, clamp)
         if tl is not None:
             tl.mark(self.layer_id, _ds.ROUTED)
         pending = executor.decode_submit(self.layer_id, hidden_states, topk_weights, cpu_ids)
@@ -389,12 +376,6 @@ class OffloadMoELayer(MoELayer):
         cache.copy_missing()
         if tl is not None:
             tl.mark(self.layer_id, _ds.FETCHED)
-        gpu_slots = topk_ids
-        if not (self.quant_method is not None and self.quant_method.kernel.supports_inactive_slots):
-            # the kernel reads every route's slot: give the inactive ones slot 0, which holds a
-            # complete payload or the bank's zero fill (never uninitialized storage), times weight 0
-            gpu_slots = gpu_slots.clamp_min(0)
-        gpu_w = torch.where(on_gpu, topk_weights, topk_weights.new_zeros(())).contiguous()
         gpu_routed = self._expert_gemm(
             cache,
             hidden_states,
@@ -407,8 +388,10 @@ class OffloadMoELayer(MoELayer):
         )
         if tl is not None:
             tl.mark(self.layer_id, _ds.COMPUTED)
-        cpu_routed = cpu_routed_early if not _HYBRID_OVERLAP else executor.decode_sync(pending)
-        out = gpu_routed + cpu_routed
+        if not _HYBRID_OVERLAP:
+            out = gpu_routed + cpu_routed_early
+        else:
+            out = executor.decode_sync(pending, add_to=gpu_routed)
         if tl is not None:
             tl.layer_kind(self.layer_id, "gpu")
             tl.mark(self.layer_id, _ds.DONE)
@@ -625,6 +608,29 @@ class OffloadMoELayer(MoELayer):
         raise AssertionError(
             f"offload experts without a quant method only serve {sorted(GGUF_EXPERT_FORMATS)} banks, got {fmt!r}"
         )
+
+
+def hybrid_routes(cache, layer_id: int, topk_ids: torch.Tensor, topk_weights: torch.Tensor, clamp: bool):
+    """One hybrid decode layer's routes split between the GPU and the CPU: (gpu slots, gpu weights,
+    cpu ids), as ``cache.ensure_experts_hybrid`` returns them. ``topk_ids`` is rewritten in place.
+
+    --moe-bank-ram (Kai): the GPU can only address the registered prefix of every bank
+    (``cache.prefix_pinned_rows``), so a miss on a row past it must not be fetched. The fetch
+    choice lives in the kernel, so it is steered from here: those positions go into the kernel
+    as expert 0 (rank 0 of the renumbering -- the hottest expert, so all but certainly a hit that
+    costs no fetch), and the routes it returns for them become CPU routes with their true ids
+    (slot 0 with ``clamp`` or -1, weight 0)."""
+    cold = raw = None
+    if cache.prefix_pinned_rows is not None:
+        raw = topk_ids.clone()
+        cold = raw >= cache.prefix_pinned_rows
+        topk_ids.masked_fill_(cold, 0)
+    gpu_slots, gpu_w, cpu_ids = cache.ensure_experts_hybrid(layer_id, topk_ids, topk_weights, clamp=clamp)
+    if cold is not None:
+        gpu_slots.masked_fill_(cold, 0 if clamp else -1)
+        gpu_w.masked_fill_(cold, 0.0)
+        cpu_ids = torch.where(cold, raw, cpu_ids)
+    return gpu_slots, gpu_w, cpu_ids
 
 
 def _prefill_group_continuation() -> bool:
