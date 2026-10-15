@@ -31,8 +31,11 @@ def _reference(x, packed, topk_ids, K):
 
 def _mmq(x, packed, ids, top_k, N):
     from freetoken.kernel.gguf import ggml_moe_a8, ggml_moe_get_block_size
+    # the Triton aligner, as fused_gguf uses: sgl-kernel's (freetoken.moe.fused picks it on
+    # Ampere and up) overruns its shared-memory cumsum past ~992 experts, and the 3,000-slot
+    # case below came back NaN through it on an RTX 3060 (sglang-kernel 0.4.9)
+    from freetoken.kernel.triton.moe_align import moe_align_block_size
     from freetoken.models.gguf.dequant import GGML_Q2_0
-    from freetoken.moe.fused import moe_align_block_size
 
     S = packed.shape[0]
     block = ggml_moe_get_block_size(int(GGML_Q2_0))

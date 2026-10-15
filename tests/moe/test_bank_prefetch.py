@@ -95,18 +95,24 @@ def _executor(sources):
 
 
 class _Task:
-    """Plain host tensors for one executor task (the Python wrapper's pinned IO needs CUDA)."""
+    """One executor task: its rows written into the executor's IO block (plain host tensors on a
+    CPU-device executor), named by (layer, rows) as the doorbell names it."""
 
     def __init__(self, ex, layer, ids):
         ids = torch.as_tensor(ids, dtype=torch.int32).reshape(-1, TOPK)
         n = ids.shape[0]
         g = torch.Generator().manual_seed(1)
-        self.x = torch.randn((n, H), generator=g).to(torch.bfloat16)
-        self.ids = ids.contiguous()
-        self.w = torch.full((n, TOPK), 1.0 / TOPK, dtype=torch.float32)
-        self.y = torch.zeros((n, H), dtype=torch.bfloat16)
-        self.ptr = ex._ext.create_task(layer, n, self.x.data_ptr(), self.ids.data_ptr(),
-                                       self.w.data_ptr(), self.y.data_ptr())
+        self.ex, self.layer, self.n = ex, layer, n
+        ex._io["x"][:n] = torch.randn((n, H), generator=g).to(torch.bfloat16)
+        ex._io["ids"][:n] = ids
+        ex._io["w"][:n] = 1.0 / TOPK
+
+    def prefetch(self) -> None:
+        self.ex._ext.prefetch_only(self.layer, self.n)
+
+    def run(self) -> torch.Tensor:
+        self.ex._ext.run(self.layer, self.n)
+        return self.ex._io["y"][: self.n].clone()
 
 
 def _wait_present(addr, nbytes, timeout=10.0):
@@ -155,7 +161,7 @@ def test_exactly_the_routed_cold_rows_are_advised(tmp_path):
         # two tokens: duplicates, a hybrid -1, a resident row and an out-of-range id
         t = _Task(ex, layer, [20, -1, 3, 31,
                               31, 20, E + 5, 2])
-        ex._ext.prefetch_only(t.ptr)
+        t.prefetch()
         for addr, rb, _ in blocks:
             for e in routed:
                 assert _wait_present(addr + e * rb, rb) == 1.0, (addr, e)
@@ -166,7 +172,7 @@ def test_exactly_the_routed_cold_rows_are_advised(tmp_path):
         assert s["ranges_advised"] == len(routed) * len(blocks)
         assert s["errno"] == 0
         # already in page cache: listed again, advised no more
-        ex._ext.prefetch_only(t.ptr)
+        t.prefetch()
         s2 = ex.bank_prefetch_stats()
         assert s2["tasks"] == 2 and s2["ranges_advised"] == s["ranges_advised"]
     finally:
@@ -187,10 +193,9 @@ def test_output_is_identical_with_and_without_prefetch(tmp_path):
         for layer in range(LAYERS):
             a = _Task(mapped, layer, ids)
             b = _Task(in_ram, layer, ids)
-            mapped._ext.run_task(a.ptr)
-            in_ram._ext.run_task(b.ptr)
-            assert torch.equal(a.y, b.y)
-            assert a.y.abs().sum() > 0
+            ya, yb = a.run(), b.run()
+            assert torch.equal(ya, yb)
+            assert ya.abs().sum() > 0
         # {8, 9, 12, 17, 25, 33, 39} per layer: rows at or past HOT, once each
         assert mapped.bank_prefetch_stats()["rows"] == 2 * 7
     finally:
@@ -204,7 +209,7 @@ def test_nothing_is_advised_for_blocks_the_executor_does_not_read(tmp_path):
         copy = _executor({n: [t.clone() for t in banks.sources[n]] for n in banks.sources})
         assert copy.enable_bank_prefetch(banks.cold_blocks) == 0
         t = _Task(copy, 0, [20, 21, 22, 23])
-        copy._ext.prefetch_only(t.ptr)
+        t.prefetch()
         assert copy.bank_prefetch_stats()["tasks"] == 0
     finally:
         banks.close()
@@ -220,7 +225,7 @@ def test_resident_blocks_are_dropped_and_an_empty_list_turns_it_off(tmp_path):
         assert ex.enable_bank_prefetch(banks.cold_blocks) == 2 * LAYERS
         assert ex.enable_bank_prefetch([]) == 0
         t = _Task(ex, 0, [20, 21, 22, 23])
-        ex._ext.prefetch_only(t.ptr)
+        t.prefetch()
         assert ex.bank_prefetch_stats()["tasks"] == 0
     finally:
         banks.close()
@@ -252,7 +257,7 @@ def test_the_private_form_is_advised_too(tmp_path, monkeypatch):
         if _present(addr + 30 * rb, rb) != 0.0:
             pytest.skip("the page cache would not drop the test file")
         t = _Task(ex, 0, [30, -1, -1, -1])
-        ex._ext.prefetch_only(t.ptr)
+        t.prefetch()
         assert _wait_present(addr + 30 * rb, rb) == 1.0
         assert ex.bank_prefetch_stats()["errno"] == 0
     finally:
@@ -276,10 +281,10 @@ def test_a_failing_advice_stops_the_asking_for_that_block():
     ex = _executor({"gate_up": gate_up, "down": down})
     assert ex._ext.set_bank_prefetch([0], [base], [row], [HOT], [1]) == 1
     t = _Task(ex, 0, [20, 21, 22, 23])
-    ex._ext.prefetch_only(t.ptr)
+    t.prefetch()
     s = ex.bank_prefetch_stats()
     assert s["errno"] != 0 and s["ranges_advised"] == 0
-    ex._ext.prefetch_only(t.ptr)  # the block is off now: rows listed, nothing advised
+    t.prefetch()  # the block is off now: rows listed, nothing advised
     s2 = ex.bank_prefetch_stats()
     assert s2["tasks"] == 2 and s2["ranges_advised"] == 0
 
@@ -302,7 +307,7 @@ def test_a_later_ranks_blocks_are_numbered_as_its_executor_numbers_them(tmp_path
         if _present(addr + 30 * rb, rb) != 0.0:
             pytest.skip("the page cache would not drop the test file")
         t = _Task(ex, 0, [30, -1, -1, -1])
-        ex._ext.prefetch_only(t.ptr)
+        t.prefetch()
         assert _wait_present(addr + 30 * rb, rb) == 1.0
     finally:
         banks.close()
