@@ -36,7 +36,10 @@ experts: 0.435 -> 0.253 ms on an RTX 2060; one token 2.3x. The checkpoint's own 
 `--dense-quant fp8` and the MTP draft head still work, the head's bf16 experts being rounded to
 Q2_0 with ggml's reference quantizer (amax delta) at load. The GGUF is parsed by a small reader of
 the fork's own (`models/gguf/rawreader.py`): gguf-py 0.19.0 predates Q2_0 and refuses the file.
-Q4_0 experts load through the same path.
+Q4_0 experts load through the same path. Upstream has since (2026-10-16, merged here 2026-10-18)
+added GGUF checkpoints of its own, on vendored llama.cpp kernels (`kernel/csrc/ggml`); that path
+serves a whole GGUF file as the model, while this flag swaps only the experts of a safetensors
+checkpoint, and the two keep separate kernels (see [kai.md](kai.md)).
 
 What it costs: quality. Measured on two RTX 3060s against the NVFP4 build on the same ten
 prompts, the Q2_0 build answered 9 of 10 (the miss: a translation that kept English terms),

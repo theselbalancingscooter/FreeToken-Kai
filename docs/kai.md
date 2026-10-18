@@ -1,7 +1,7 @@
 # FreeToken Kai (改)
 
 An unofficial fork of [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken),
-merged with upstream `main` at commit `0bca88f` (2026-10-15). It is not affiliated with, endorsed
+merged with upstream `main` at commit `31c6ef4` (2026-10-17). It is not affiliated with, endorsed
 by, or supported by FlashML. The license is unchanged (Apache-2.0).
 
 The fork adds eleven things upstream does not have:
@@ -271,6 +271,32 @@ needs that single pool, so with several pools it stays off and the start line sa
 prefill. A `--moe-cache-split profile:` file counts the model's layers only; the draft head's
 layer is given their mean.
 
+Upstream `e5d3bd3`..`31c6ef4` (22 commits, merged 2026-10-18) brings a GGUF stack of its own:
+llama.cpp's ggml-cuda kernels vendored under `kernel/csrc/ggml` behind a tvm-ffi module
+(`kernel/ggml.py`), ggml-cpu row kernels built once per x86 variant (`kernel/ggml_cpu`) for the
+cpu and hybrid executors, a GGUF quant kind that serves whole GGUF checkpoints (Qwen2 / Qwen3 /
+Qwen3-MoE / Qwen3.5 / Flash-Next, Gemma 4, Llama and Mistral, GLM-4.x, MiniMax-M2 / M3,
+Muse-Glimmer), one slot pool per expert format where a checkpoint mixes them, and a vendored
+gguf-py reader in place of the `gguf` PyPI package. That path serves a GGUF file as the model.
+The fork's `--moe-expert-gguf` ([gguf.md](gguf.md)) is a different thing -- it swaps only the
+routed experts of a safetensors checkpoint for a GGUF's Q2_0 or Q4_0 banks -- and keeps its own
+kernels, which upstream removed for its stack: the borrowed MMVQ / MMQ under `kernel/csrc/gguf`
+(`kernel/gguf.py`, built on first use), `kernels/q2_0.cpp` and `kernels/q4_0.cpp` on the CPU
+executor, and with them `--dense-quant q8_0` and `--spec-draft-head-quant`. The two coexist;
+moving the fork's banks onto the vendored kernels is a candidate, not done. Also in that span:
+the NVFP4 prefill MoE GEMM was rewritten around the gather-free e2m1 decode the fork had kept
+behind `FREETOKEN_NVFP4_MOE_ARITH` (the knob is gone, that decode is the only one), the Triton
+decode attention splits each request by its context length and the card's SM count with the
+split count computed on the device (the fork's `--kv-cache-dtype` dequant rides in the same
+kernels; where the wider tile a one-wave grid asks for does not fit the card's shared memory,
+as on an RTX 2060 at head_dim 256, the launch steps down to the narrow tile and remembers it),
+CUDA graphs are uploaded at capture, and transformers moves to 5.18. After pulling, run
+`uv pip install -e ".[accel]"` again: it installs transformers 5.18 and builds `_cpu_moe` and
+the fifteen ggml-cpu modules (about two minutes); the `gguf` package is no longer needed. The
+transformers step is not optional: 5.18 renames the sparse-attention layer type that
+Qwen3.8-Flash-Next's and GLM-5's configs declare, and the engine now reads the new name, so on
+5.16 those models stop at the config (`Expected exactly one attention group for layer 1, got 0`).
+
 ## Running Ornith-1.5-35B-A3B on an RTX 2060 (6 GB) under WSL2
 
 ```bash
@@ -536,7 +562,6 @@ model that does). Not yet measured on a card.
 | `FT_IMAGE_EMBED_CACHE` | `32` | `--mm-encoder-weights cpu`: images whose embeddings the tokenizer worker keeps, by content hash (chat clients resend every image each turn); `0` disables |
 | `FREETOKEN_FP8_SCRATCH_GEMM` | arch (on below Ampere) | fp8 W8A16 prefill GEMM as dequant + cuBLAS instead of the inline-dequant Triton kernel |
 | `FREETOKEN_NVFP4_MOE_SCRATCH` | arch (on below Ampere) | NVFP4 prefill MoE as chunked dequant + per-expert cuBLAS instead of the inline-dequant kernel |
-| `FREETOKEN_NVFP4_MOE_ARITH` | arch (on up to Ampere) | Arithmetic (gather-free) e2m1 dequant in the prefill MoE kernel; bit-identical, speed knob only |
 | `FREETOKEN_ATTN_SCRATCH` / `FREETOKEN_ATTN_SCRATCH_MB` / `FREETOKEN_ATTN_SCRATCH_MIN_ROWS` | arch (on below Ampere) / `48` / `1` | Prefill attention as gather + cuBLAS instead of the fused extend kernel; the query tile's scratch budget; the shortest extend that takes it (`docs/turing.md` §7) |
 | `FREETOKEN_CPU_PREFILL_MAX_TOKENS` | `256` | Prefill extends up to this many rows that do not split (below) compute their routed experts on the CPU executor (offload/hybrid) instead of streaming every layer's bank; `0` disables |
 | `FREETOKEN_PREFILL_SPLIT` / `FREETOKEN_PREFILL_SPLIT_MAX_TOKENS` / `FREETOKEN_PREFILL_SPLIT_RATIO` | on / `1024` / `4` | Split prefill (offload/hybrid, layers whose banks are pinned, 64 rows and up): the experts a forward routes to least are computed by the CPU executor while only the rest are moved to the GPU, at the same time. The ratio is what moving one expert costs in CPU routes; the cut is where both sides finish together. On two RTX 3060s (Flash-Next) the first token of a fresh 270-token prompt came after 3.0 s instead of 8.4 s (64 tokens: 2.1 s instead of 5.6; 1024: 6.8 instead of 8.0). `0` turns it off |
