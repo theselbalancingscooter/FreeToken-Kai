@@ -9,7 +9,7 @@ how they trade against each other on your card. Now a benchmark in the browser m
 with the model, tries the settings one at a time, and hands you the fastest as a launch profile.
 
 > An unofficial fork of [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken), merged
-> with upstream `main` at `31c6ef4` (2026-10-17). Not affiliated with, endorsed by, or supported by
+> with upstream `main` at `8f49e0a` (2026-10-17). Not affiliated with, endorsed by, or supported by
 > FlashML. The license is unchanged (Apache-2.0).
 >
 > **Please keep questions and bug reports about this fork in this repository.** The FreeToken
@@ -37,9 +37,11 @@ with the model, tries the settings one at a time, and hands you the fastest as a
    sglang-kernel 0.4.9). After pulling past it, run `uv pip install -e ".[accel]"` once more in
    the same venv: it moves those packages up and rebuilds the extensions against the new torch
    (from the 2026-10-14 merge on, the CPU MoE extension also builds a CUDA source with `nvcc`).
-   Then run `ft bench bw` again (or the console's benchmark): profiles written before this
-   merge are ignored, and without one a `hybrid` server fetches one expert per layer per step
-   instead of the measured share.
+   Then run `ft bench bw --model <your checkpoint>` again (or the console's benchmark, which does
+   it): since the 2026-10-18 merge the profile holds one row per MoE layer kind (version 6), the
+   engine reads each layer's own row, and profiles written before are ignored; without a row a
+   `hybrid` server fetches one expert per layer per step instead of the measured share. For the
+   Q2_0 tier add `--formats q2_0`.
 
 2. **Open the console.**
 

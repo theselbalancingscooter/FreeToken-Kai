@@ -127,10 +127,10 @@ that swing more than its bar. That verdict is changed (see **Generation** below)
 window is now tried (**Standard**), and the recommended settings the benchmark starts from are
 the ones the search found. The benchmark has not been run again on that machine since.
 
-1. **Upstream's measurement** (a few minutes per GPU): `ft bench bw --gpu <n>` runs as it is, the
-   same command the desktop app runs, on every GPU. It rewrites the profile the engine reads
-   (`~/.cache/freetoken/benchbw/<gpu-uuid>.json`: hybrid or offload per expert format, and the
-   hybrid fetch split), so everything after it runs on figures measured with this version. The
+1. **Upstream's measurement** (a few minutes per GPU): `ft bench bw --model <checkpoint> --gpu <n>`
+   (plus `--formats q2_0` for the Q2_0 tier) runs on every GPU. It rewrites the profile the engine
+   reads (`~/.cache/freetoken/benchbw/<gpu-uuid>.json`, version 6: one row per MoE layer kind with
+   the hybrid fetch split), so everything after it runs on figures measured with this version. The
    version is written into the profile; the setup card lists each GPU's profile with the version
    that measured it, and a profile from the desktop app or an older `ft bench bw` shows none.
 2. **Hardware** (a few minutes, `webui/hwbench.py` in a child process): how much host RAM this

@@ -185,14 +185,18 @@ def test_bench_profiles_say_which_version_measured_them(tmp_path, monkeypatch):
     os.makedirs(d)
     for uuid, extra in (("GPU-a", {}), ("GPU-b", {"freetoken_version": "0.0.1"})):
         with open(d / f"{uuid}.json", "w") as fh:
-            json.dump({"version": PROFILE_VERSION, "epoch": 1, "gpu": {"index": 0, "name": "RTX", "uuid": uuid}, "dtypes": {"nvfp4": "hybrid"}, **extra}, fh)
+            json.dump({"version": PROFILE_VERSION, "epoch": 1, "gpu": {"index": 0, "name": "RTX", "uuid": uuid},
+                       "layer_kinds": {"nvfp4:2560x640:top10:t7": {"format": "nvfp4", "cpu_moe_gbs": 40.0, "pcie_gather_gbs": 10.0},
+                                       "q2_0:2560x640:top10:t7": {"format": "q2_0", "cpu_moe_gbs": 30.0, "pcie_gather_gbs": 10.0}}, **extra}, fh)
     tuner.stamp_profile(str(d / "GPU-a.json"))
     doc = tuner.bench_profiles()
     assert doc["current"] == tuner.FT_VERSION
     assert [(p["uuid"], p["version"]) for p in doc["profiles"]] == [("GPU-a", tuner.FT_VERSION), ("GPU-b", "0.0.1")]
-    from freetoken.moe.bench_profile import load_backend_recommendation
+    assert doc["profiles"][0]["formats"] == ["nvfp4", "q2_0"] and doc["profiles"][0]["kinds"] == 2
+    from freetoken.moe.bench_profile import fetch_fraction, load_layer_kinds
 
-    assert load_backend_recommendation("nvfp4", "RTX", gpu_uuid="GPU-a") == "hybrid"  # the stamp does not disturb the reader
+    rows = load_layer_kinds("RTX", gpu_uuid="GPU-a")  # the stamp does not disturb the reader
+    assert fetch_fraction(rows["nvfp4:2560x640:top10:t7"]) == 0.25
 
 # ------------------------------------------------------------------ what gets tried
 ORNITH = dict(model_type="qwen3_5_moe", num_experts=256, num_layers=40, quant="modelopt", mtp=True, max_context=262144,
@@ -900,6 +904,15 @@ def test_float16_that_does_not_load_is_dropped(tmp_path):
     assert "--dtype" not in dict(tuner.parse_flags(r["args"]))
     assert [n for n in r["notes"] if n["flag"] == "--dtype"][0].get("removed")
     assert r["trials"][0]["ok"] is False
+
+
+def test_upstreams_bench_benches_the_models_own_layer_kinds():
+    # profile version 6 (upstream #734): the engine reads each MoE layer's own row, so the bench takes the checkpoint;
+    # the Q2_0 tier (the fork's GGUF banks at the checkpoint's expert shape) rides along as --formats q2_0
+    assert tuner.bench_model_args("/models/M", "checkpoint", facts={"num_experts": 512}) == ["--model", "/models/M"]
+    assert tuner.bench_model_args("/models/M", "q2", facts={"num_experts": 512}) == ["--model", "/models/M", "--formats", "q2_0"]
+    assert tuner.bench_model_args("/models/dense", "checkpoint", facts={"num_experts": None}) == []
+    assert tuner.bench_model_args("/nowhere", "q2") == []  # no config.json to read: the bare bench
 
 
 def test_upstreams_bench_runs_first_on_every_gpu_and_is_stamped(tmp_path):

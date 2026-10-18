@@ -244,6 +244,30 @@ def experts_of(args: list[str]) -> str:
     return "q2" if has_flag(args, "--moe-expert-gguf") else "checkpoint"
 
 
+def bench_model_args(model: str, experts: str | None = None, facts: dict | None = None) -> list[str]:
+    """The `ft bench bw` flags that make its profile match THIS model's MoE layers.
+
+    Since upstream #734 the profile holds one row per MoE layer kind (format, options, expert shape,
+    top_k, CPU threads) and the engine takes each layer's own row, so the canonical geometries of a
+    bare `ft bench bw` match nothing; `--model <checkpoint>` benches the checkpoint's own kinds. The
+    Q2_0 tier serves the fork's GGUF banks at the same shape, which `--formats q2_0` adds. A dense
+    model, or one whose config cannot be read, gets no flags (the bare bench still measures the
+    ceilings, and the bench refuses a checkpoint without MoE layers)."""
+    if facts is None:
+        try:
+            from .recommend import model_facts
+
+            facts = model_facts(model)
+        except Exception:  # noqa: BLE001 -- a shape this cannot read must not stop the benchmark
+            facts = {}
+    if not facts.get("num_experts"):
+        return []
+    args = ["--model", model]
+    if experts == "q2":
+        args += ["--formats", "q2_0"]
+    return args
+
+
 # ------------------------------------------------------------------ deciding from measurements
 def with_benchmark(rec: dict, result: dict | None) -> dict:
     """The recommendation for a model that was benchmarked on this PC: the benchmark's flags and
@@ -312,9 +336,12 @@ def bench_profiles() -> dict:
         except (OSError, ValueError):
             continue
         g = p.get("gpu") or {}
+        # profile version 6 (upstream #734): one row per MoE layer kind; older files listed the formats as `dtypes`
+        rows = p.get("layer_kinds") if isinstance(p.get("layer_kinds"), dict) else {}
+        formats = {r.get("format") for r in rows.values() if isinstance(r, dict) and r.get("format")} or set((p.get("dtypes") or {}).keys())
         out.append({"index": g.get("index"), "gpu": g.get("name"), "uuid": g.get("uuid"), "epoch": p.get("epoch"),
                     "version": p.get("freetoken_version"), "by": p.get("measured_by"),
-                    "formats": sorted((p.get("dtypes") or {}).keys())})
+                    "formats": sorted(formats), "kinds": len(rows)})
     return {"current": FT_VERSION, "profiles": out}
 
 
@@ -736,7 +763,7 @@ class TuneJob:
                 # upstream's own measurement first, exactly as the desktop app runs it: the engine reads
                 # this profile (hybrid or offload, the fetch split), so it is settled before anything else
                 self._ev("phase", phase="upstream")
-                result["upstream"] = self._upstream()
+                result["upstream"] = self._upstream(model, experts)
                 self._check()
                 self._ev("phase", phase="hw")
                 hw = self._hardware(model)
@@ -825,15 +852,16 @@ class TuneJob:
                 return
             yield line.strip()
 
-    def _upstream(self, quiet_s: float = UPSTREAM_QUIET_S) -> list[dict]:
+    def _upstream(self, model: str | None = None, experts: str | None = None, quiet_s: float = UPSTREAM_QUIET_S) -> list[dict]:
         indices = self._gpu_indices() or [0]
         self._ev("hw", kind="plan", steps=[{"id": f"upstream{i}", "unit": "%", "max": 100} for i in indices])
+        model_args = bench_model_args(model, experts) if model else []
         out = []
         for i in indices:
             self._check()
             sid = f"upstream{i}"
             self._ev("hw", kind="step", id=sid)
-            argv = [self.python, "-m", "freetoken.cli", "bench", "bw", "--gpu", str(i)]
+            argv = [self.python, "-m", "freetoken.cli", "bench", "bw", *model_args, "--gpu", str(i)]
             env = dict(os.environ, FREETOKEN_BENCH_PROGRESS="1")
             try:
                 proc = self._spawn(argv, env=env)

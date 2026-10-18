@@ -1,7 +1,7 @@
 # FreeToken Kai (改)
 
 An unofficial fork of [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken),
-merged with upstream `main` at commit `31c6ef4` (2026-10-17). It is not affiliated with, endorsed
+merged with upstream `main` at commit `8f49e0a` (2026-10-17). It is not affiliated with, endorsed
 by, or supported by FlashML. The license is unchanged (Apache-2.0).
 
 The fork adds eleven things upstream does not have:
@@ -296,6 +296,19 @@ the fifteen ggml-cpu modules (about two minutes); the `gguf` package is no longe
 transformers step is not optional: 5.18 renames the sparse-attention layer type that
 Qwen3.8-Flash-Next's and GLM-5's configs declare, and the engine now reads the new name, so on
 5.16 those models stop at the config (`Expected exactly one attention group for layer 1, got 0`).
+
+Upstream `ac6a15d` and `8f49e0a` (merged the same day) speed up the NVFP4 prefill MoE GEMM on
+RTX cards (its fast e2m1 decode is a bf16x2 PTX instruction of sm_80 and up, so a Turing card
+keeps the fp16 pair decode; the fork's below-Ampere scratch path is untouched) and rewrite the `ft bench bw`
+profile as version 6: one row per MoE layer kind -- format, options, expert shape, top_k and the
+CPU worker count -- and `--moe-hybrid-max-fetch auto` reads each layer's own row; older profiles
+are ignored, and a bare `ft bench bw` benches canonical geometries that match no real layer. So
+run `ft bench bw --model <checkpoint>` (the console's benchmark does), with `--formats q2_0` for
+the Q2_0 tier: the fork's GGUF banks bind no expert method, so this fork keys them by the cache's
+format at the executor's shape, which that flag benches at the checkpoint's shape. Where the
+profile has the layer's kind but not at the server's `--moe-cpu-threads`, this fork takes the row
+benched with the nearest thread count and says so in the log (upstream would fall back to one
+fetched expert per layer per step); `--cpu-threads <n>` on the bench measures the exact count.
 
 ## Running Ornith-1.5-35B-A3B on an RTX 2060 (6 GB) under WSL2
 
