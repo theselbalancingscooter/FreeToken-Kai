@@ -39,7 +39,6 @@ def _decode(
         batch, num_q_heads, max_kv_splits, head_dim, dtype=torch.float32, device=dev
     )
     attn_lse = torch.empty(batch, num_q_heads, max_kv_splits, dtype=torch.float32, device=dev)
-    num_kv_splits = torch.full((batch,), max_kv_splits, dtype=torch.int32, device=dev)
     ks, vs = scales if scales is not None else (None, None)
     return decode_paged_attention(
         q=q,
@@ -50,7 +49,6 @@ def _decode(
         q_positions=q_positions,
         attn_logits=attn_logits,
         attn_lse=attn_lse,
-        num_kv_splits=num_kv_splits,
         max_kv_splits=max_kv_splits,
         sm_scale=head_dim**-0.5,
         sliding_window=sliding_window,

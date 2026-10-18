@@ -23,7 +23,7 @@ from freetoken.distributed import (
 from freetoken.gpu_select import gpu_identity
 from freetoken.checkpoint.ftw import ftw_tensor_names, is_ftw_checkpoint
 from freetoken.layers import OffloadMoELayer, iter_moe_layers, set_rope_device
-from freetoken.layers.quantization import LayerKind, QuantBackend, finalize_quant, set_quant_backend
+from freetoken.layers.quantization import LayerKind, QuantBackend, QuantKind, finalize_quant, set_quant_backend
 from freetoken.moe.offload_cache import iter_offload_moe_layers
 from freetoken.mm.config import ENCODER_SECTIONS
 from freetoken.models import create_model, load_weight
@@ -402,7 +402,7 @@ def _make_dummy_weight_state_dict(
             # MXFP8 e8m0 exponent codes: 127 encodes scale 1.0; zeros would collapse
             # every scale to 2^-127 and zero the model. Scoped BY NAME: other uint8
             # buffers are packed payloads whose bytes mean something else entirely
-            # (GGUF qweight blocks embed fp16 scales -- 0x7F7F is fp16 NaN), so they
+            # (GGUF blocks embed fp16 scales -- 0x7F7F is fp16 NaN), so they
             # keep the benign all-zeros fill below.
             state_dict[key] = torch.full(param.shape, 127, dtype=param.dtype, device=device)
         else:
@@ -1507,10 +1507,10 @@ class Engine:
                 config.model_config,
                 method=layers[0].quant_method,
                 device=self.device,
-                dtype=self.dtype,
                 dummy=config.use_dummy_weight,
                 parallel={"serial": False, "parallel": True}.get(config.expert_load, None),
                 resident=True,
+                layer_methods=[layer.quant_method for layer in sorted(layers, key=lambda layer: layer.layer_id)],
             )
         attach_resident_banks(layers, banks)
 
@@ -1612,13 +1612,24 @@ class Engine:
         return size, pages, overlap
 
     def _init_offload_moe_cache(self, config: EngineConfig) -> OffloadMoeCache:
+        from freetoken.moe.expert_banks import is_mixed
+
         method = shared_offload_method(self.model)
         num_moe_layers = config.model_config.num_moe_layers
+        # experts of several formats: one method per MoE layer, one slot pool per format
+        layer_methods = offload_layer_methods(self.model)
+        if not is_mixed(layer_methods):
+            layer_methods = None
+        elif config.moe_strategy == "cpu" or config.moe_cpu_layers:
+            raise ValueError(
+                "this model's experts come in several formats, which are served from per-format GPU slot pools; "
+                "they do not combine with --moe-strategy cpu or --moe-cpu-layers (use offload or hybrid)"
+            )
         cpu_layer_ids = _resolve_cpu_layers(config, num_moe_layers, reserved=self._host_tables_bytes, method=method)
         if not config.moe_bank_ram:
             # --moe-bank-ram answers the pin budget its own way: the banks are a file mapping
             # and only the resident prefix is locked, so banks over the budget are the plan
-            _check_pin_budget(config, reserved=self._host_tables_bytes, method=method)
+            _check_pin_budget(config, reserved=self._host_tables_bytes, method=method, layer_methods=layer_methods)
         # the kernels were picked for model_config.decode_target; --moe-cpu-layers auto may still find that every bank fits the pin budget
         decode_target = config.model_config.decode_target
         if decode_target == "cpu" and not cpu_layer_ids:
@@ -1699,6 +1710,7 @@ class Engine:
                         decode_target=("cpu" if decode_target in ("cpu", "hybrid") else "gpu"),
                         layer_residency=requested_residency,
                         layer_sink=bank_tier.sink if bank_tier else None,
+                        layer_methods=layer_methods,
                     )
         except PinFailed as exc:
             # this refusal measured the host's cap; record it so the next start's --moe-cpu-layers
@@ -1739,7 +1751,7 @@ class Engine:
                 f"--moe-cache-split {config.moe_cache_split} is ignored: all MoE layers share one slot pool "
                 f"(--moe-cache-scope per-layer gives each layer its own)"
             )
-        self._moe_slot_limit = method.slot_limit() if method is not None else None
+        self._moe_slot_limit = _slot_limit(layer_methods) if layer_methods is not None else (method.slot_limit() if method is not None else None)
         # with GPU decode, a pool below num_experts slots bounds the batch; the startup split keeps room for one token per step
         pools = self._moe_pools(1)
         size_cap = sum(p.max_num_slots for p in pools)
@@ -1789,14 +1801,24 @@ class Engine:
             )
             if decode_target == "gpu":
                 _clamp_decode_batch_to_pools(config, pool_sizes)
-        layout = max_slots = None
-        if method is not None:
+        layout = layer_layouts = max_slots = None
+        if layer_methods is not None:
+            _check_layer_formats(banks, layer_methods)
+            layer_layouts = [m.layout() for m in layer_methods]
+            max_slots = self._moe_slot_limit
+        elif method is not None:
+            if banks.layer_formats is not None:
+                raise ValueError(
+                    f"expert banks hold experts of several formats ({sorted(set(banks.layer_formats))}) but the model "
+                    f"binds {method.kind} / {method.kernel.name} on every MoE layer; reconvert the checkpoint"
+                )
             if banks.kind is not None and (banks.kind, banks.kernel) != (method.kind, method.kernel.name):
                 raise ValueError(
                     f"expert banks were packed for {banks.kind} / {banks.kernel} but the model "
                     f"binds {method.kind} / {method.kernel.name}; reconvert or select that kernel"
                 )
-            layout = method.layout()
+            # GGUF layers keep their own ggml types, so the cache reads each layer's layout off its banks
+            layout = None if method.kind is QuantKind.GGUF else method.layout()
             max_slots = method.slot_limit()
         cache = OffloadMoeCache(
             # Models with leading dense layers (GLM-4) only have experts on the MoE
@@ -1813,6 +1835,7 @@ class Engine:
             decode_target=decode_target,
             hybrid_max_fetch=config.moe_hybrid_max_fetch,
             layout=layout,
+            layer_layouts=layer_layouts,
             max_slots=max_slots,
             pool_of_layer=pool_of_layer(pools, config.model_config.num_moe_layers + self._mtp_bank_layers),
             pool_sizes=pool_sizes,
@@ -1850,6 +1873,7 @@ class Engine:
                 else banks.layer_residency
             ),
             layer_tags=banks.layer_tags,
+            row_tail_bytes=banks.row_tail_bytes,
         )
         cache.set_alphas(banks.gate_up_alpha, banks.down_alpha)
         if decode_target == "hybrid":
@@ -1881,7 +1905,6 @@ class Engine:
         self._moe_stats_rank = (config.tp_info.rank, config.tp_info.size)
         layers = attach_offload_moe_cache(self.model, cache)
         assert len(layers) == config.model_config.num_moe_layers + self._mtp_bank_layers
-        cache.zero_inactive_route_slots = cache.decode_target == "hybrid" and not all(layer.skips_inactive_slots for layer in layers)
         if cache.decode_target in ("cpu", "hybrid"):
             self._init_cpu_moe_executor(config, cache, layers)
         if getattr(config, "moe_bank_prefetch", False):
@@ -1959,7 +1982,13 @@ class Engine:
                          self.spec_k + 1)
         if cpu_prefill_max_tokens() > 0 or prefill_split_enabled():
             max_tokens = max(max_tokens, CPU_PREFILL_PIECE)
-        method = sample.quant_method
+        by_id = sorted(layers, key=lambda layer: layer.layer_id)
+        if all(layer.quant_method is not None for layer in by_id):
+            layer_formats = [layer.quant_method.cpu_spec() for layer in by_id]
+        else:
+            # Kai: the Q2_0 / Q4_0 expert banks of --moe-expert-gguf carry no quant method; every
+            # layer (the --spec-mtp draft head's included) runs in cache.quant_format
+            layer_formats = None
         executor = CpuMoeExecutor(
             cache,
             top_k=sample.top_k,
@@ -1970,9 +1999,7 @@ class Engine:
             device=self.device,
             swiglu_alpha=float(sample.alpha),
             swiglu_limit=sample.limit,
-            # FIXME: the None branch serves GGUF q4_0 banks, which have no quant method yet; drop it once GGUF joins the quant path
-            fmt=method.cpu_format if method is not None else None,
-            act_block=method.cfg.act_block if method is not None else None,
+            layer_formats=layer_formats,
         )
         cache.set_cpu_executor(executor)
         self.cpu_moe_executor = executor
@@ -3155,11 +3182,11 @@ def _is_unified_memory_gpu(index: "int | None" = None) -> bool:
         return False
 
 
-_RESIDENT_EXPERT_QUANTS = ("none", "fp8_block", "nvfp4")
+_RESIDENT_EXPERT_QUANTS = ("none", "fp8_block", "nvfp4", "gguf")
 
 
 def _fused_resident_ok(model_config) -> bool:
-    """Whether the resident ('fused') MoE path can hold this model's experts; GGUF q4_0 and DeepSeek-V4 experts stay offload."""
+    """Whether the resident ('fused') MoE path can hold this model's experts; DeepSeek-V4 experts stay offload."""
     if getattr(model_config, "expert_quant", "none") not in _RESIDENT_EXPERT_QUANTS:
         return False
     return getattr(model_config, "moe_weight_format", None) in (None, "bf16", "mxfp4")
@@ -3360,6 +3387,10 @@ def _cpu_moe_executor_viable(model_config) -> bool:
         return False
     expert_quant = getattr(model_config, "expert_quant", "none")
     fmt = expert_quant if expert_quant != "none" else (moe_wfmt or "bf16")
+    if fmt == "gguf":
+        from freetoken.kernel import ggml_cpu
+
+        return fmt in _cpu_moe.weight_formats() and ggml_cpu.select() is not None
     return fmt == "mxfp4" or fmt in _cpu_moe.weight_formats()
 
 
@@ -3466,10 +3497,10 @@ def _pin_source() -> str:
     return source()
 
 
-def _bank_bytes(config: EngineConfig, method=None) -> int | None:
+def _bank_bytes(config: EngineConfig, method=None, layer_methods=None) -> int | None:
     from freetoken.moe.expert_banks import bank_bytes_estimate, ftw_bank_bytes
 
-    return ftw_bank_bytes(config.model_path) or bank_bytes_estimate(config.model_config, method)
+    return ftw_bank_bytes(config.model_path) or bank_bytes_estimate(config.model_config, method, layer_methods)
 
 
 def _pin_hint(reserved: int, *, cpu_layers_set: bool = False) -> str:
@@ -3490,12 +3521,12 @@ def _pin_hint(reserved: int, *, cpu_layers_set: bool = False) -> str:
     )
 
 
-def _check_pin_budget(config: EngineConfig, *, reserved: int, method=None) -> None:
+def _check_pin_budget(config: EngineConfig, *, reserved: int, method=None, layer_methods=None) -> None:
     """Stop a plain offload boot whose banks exceed a known pin budget before any bank is read."""
     if config.moe_cpu_layers or config.moe_strategy not in ("offload", "hybrid"):
         return
     budget = _pin_budget_bytes(reserved)
-    bank_bytes = _bank_bytes(config, method) if budget is not None else None
+    bank_bytes = _bank_bytes(config, method, layer_methods) if budget is not None else None
     if bank_bytes and bank_bytes > budget:
         raise ValueError(
             f"expert banks need {bank_bytes / 2**30:.1f} GiB of pinned host RAM but the pin budget is "
@@ -3583,27 +3614,58 @@ def _adjust_ftw_quant_backend(model_path: str, quant_backend: QuantBackend) -> Q
     return QuantBackend(quant_backend.items + (((LayerKind.MOE, kind), kernel),))
 
 
-def shared_offload_method(model):
-    """The expert method every offload MoE layer of ``model`` uses, or None for models whose MoE layers carry none (GGUF).
-
-    The offload cache holds one bank layout, so the layers must agree on (kind, kernel)."""
+def offload_layer_methods(model) -> list | None:
+    """The expert method of each offload MoE layer of ``model``, by MoE-layer id; None for models whose MoE layers carry none (GGUF)."""
     layers = [l for l in iter_offload_moe_layers(model) if getattr(l, "quant_method", None) is not None]
     if not layers:
         return None
-    keys = {(layer.quant_method.kind, layer.quant_method.kernel.name) for layer in layers}
-    if len(keys) != 1:
-        found = sorted(f"{kind} / {kernel}" for kind, kernel in keys)
-        raise ValueError(f"expert layers disagree on format / kernel: {found}; per-layer mixed expert formats are not supported")
-    kind, kernel = keys.pop()
-    logger.info_rank0(f"MoE experts: {kind} via {kernel}")
-    return layers[0].quant_method
+    layers.sort(key=lambda layer: layer.layer_id)
+    assert [layer.layer_id for layer in layers] == list(range(len(layers))), [layer.layer_id for layer in layers]
+    return [layer.quant_method for layer in layers]
 
 
-def offload_expert_method(config: EngineConfig):
-    """The offload expert method of ``config``'s model, from a meta-device build.
+def shared_offload_method(model):
+    """The expert method the offload MoE layers of ``model`` use, or None for models whose MoE layers carry none (GGUF).
+
+    With experts of several formats (a checkpoint that keeps some layers unquantized) this is the format of the most
+    layers; the cache then takes every layer's method (``offload_layer_methods``) and keeps one slot pool per format."""
+    from freetoken.moe.expert_banks import method_groups
+
+    methods = offload_layer_methods(model)
+    if methods is None:
+        return None
+    groups = method_groups(methods)
+    found = ", ".join(f"{m.kind} via {m.kernel.name}" + (f" on {len(ids)} layers" if len(groups) > 1 else "") for m, ids in groups)
+    logger.info_rank0(f"MoE experts: {found}")
+    return groups[0][0]
+
+
+def _slot_limit(layer_methods) -> int | None:
+    """The tightest slot cap of the layers' expert kernels (a pool never mixes kernels, but the limit is checked per pool against the largest)."""
+    limits = [limit for limit in (m.slot_limit() for m in layer_methods) if limit is not None]
+    return min(limits) if limits else None
+
+
+def _check_layer_formats(banks, layer_methods) -> None:
+    from freetoken.moe.legacy_format import legacy_format_for
+
+    want = [legacy_format_for(m.kind, m.kernel.name) for m in layer_methods]
+    have = banks.layer_formats or [banks.quant_format] * len(want)
+    bad = [layer for layer, (w, h) in enumerate(zip(want, have)) if w != h]
+    if bad:
+        raise ValueError(
+            f"expert banks of MoE layers {bad[:8]} were packed as {[have[l] for l in bad[:8]]} but the model binds "
+            f"{[want[l] for l in bad[:8]]}; reconvert the checkpoint or select those kernels"
+        )
+
+
+def offload_expert_methods(config: EngineConfig) -> tuple:
+    """``(method, layer_methods)`` of ``config``'s model, from a meta-device build: the most common expert method and,
+    for experts of several formats, one per MoE layer (else None).
 
     For tools that load expert banks without an engine (the FTW converter); they pack for GPU decode."""
     from freetoken.models import create_model
+    from freetoken.moe.expert_banks import is_mixed
     from freetoken.utils.torch_utils import torch_dtype
 
     set_quant_backend(_adjust_ftw_quant_backend(config.model_path, QuantBackend.parse(config.quant_backend)))
@@ -3611,7 +3673,13 @@ def offload_expert_method(config: EngineConfig):
     object.__setattr__(config.model_config, "decode_target", "gpu")
     with torch.device("meta"), torch_dtype(config.dtype):
         model = create_model(config.model_config)
-    return shared_offload_method(model)
+    layer_methods = offload_layer_methods(model)
+    return shared_offload_method(model), (layer_methods if is_mixed(layer_methods) else None)
+
+
+def offload_expert_method(config: EngineConfig):
+    """The (most common) offload expert method of ``config``'s model; see ``offload_expert_methods``."""
+    return offload_expert_methods(config)[0]
 
 
 def _adjust_config(config: EngineConfig):
@@ -3718,6 +3786,9 @@ def _adjust_config(config: EngineConfig):
             "--dtype float16 with MXFP8 resident weights is unsupported (the "
             "W8A16 fold is only validated exact in bfloat16); use bfloat16."
         )
+    if _dtype == torch.float16 and getattr(getattr(model_config, "quant", None), "weight_scales", False):
+        # GGUF NVFP4 results are stored in the activation dtype before weight_scale_2 (~1e-4) multiplies them, which overflows fp16.
+        raise ValueError("--dtype float16 with NVFP4 GGUF weight scales is unsupported (the unscaled results overflow float16); use bfloat16.")
     if config.attention_backend == "auto":
         override(
             "attention_backend",
@@ -3760,7 +3831,7 @@ def _adjust_config(config: EngineConfig):
     if is_moe and config.moe_strategy == "auto":
         # A MoE model always defaults to the offload family: experts stream from pinned host
         # banks into an auto-sized GPU slot cache, which is the only default that serves a model
-        # bigger than the GPU. The resident 'fused' path (every expert format but GGUF q4_0 and
+        # bigger than the GPU. The resident 'fused' path (every expert format but
         # DeepSeek-V4's) is still reachable, but only when asked for explicitly
         # -- auto never picks it, because nothing here knows whether the experts would fit in
         # HBM and a wrong guess is a weight-load OOM rather than a slower-but-working run.
@@ -3798,7 +3869,7 @@ def _adjust_config(config: EngineConfig):
         # offload -- same auto-sized GPU slot cache (_resolve_auto_moe_cache_size), plus a
         # host-RAM CPU executor -- so this never raises the OOM risk; with no profile (or one
         # from different hardware) it stays offload. offload remains the always-safe fallback.
-        # Key the lookup on the real expert format: mxfp4/q4_0 live in moe_weight_format when
+        # Key the lookup on the real expert format: mxfp4 lives in moe_weight_format when
         # expert_quant is "none", and "none" with no weight format means plain bf16 experts.
         moe_wfmt = getattr(model_config, "moe_weight_format", None)
         bench_fmt = expert_quant if expert_quant != "none" else (moe_wfmt or "bf16")

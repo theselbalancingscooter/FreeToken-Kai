@@ -259,7 +259,7 @@ def alloc_layer_banks(
 ) -> dict[str, list[HostBank]]:
     """Allocate per-layer host banks: ``{name: ([num_experts, ...] row shape, dtype)}``
     -> one independently allocated (page-aligned, independently pin/lock-able)
-    ``HostBank`` per layer per name."""
+    ``HostBank`` per layer per name (Kai's GGUF expert banks, models/qwen4_exp/gguf_experts.py)."""
     return {
         name: [HostBank(shape, dtype) for _ in range(num_layers)]
         for name, (shape, dtype) in specs.items()
@@ -315,13 +315,13 @@ def _settle(bank: HostBank, residency: str) -> None:
         bank.lock()
 
 
-def pin_banks(banks: dict[str, HostBank | list[HostBank]]) -> None:
+def pin_banks(banks: dict[str, HostBank | list[HostBank] | dict[int, HostBank]]) -> None:
     """Settle every bank after it has been filled -- pin-after-fill by default.
-    List-valued entries are per-layer and honor the ambient :func:`requested_residency` plan; scalar banks always pin."""
+    List-valued entries (indexed by layer id) and dict-valued ones (layer id -> bank) are per-layer and honor the ambient :func:`requested_residency` plan; scalar banks always pin."""
     plan = _requested_residency
     for bank in banks.values():
-        if isinstance(bank, list):
-            for layer_id, layer_bank in enumerate(bank):
+        if isinstance(bank, (list, dict)):
+            for layer_id, layer_bank in bank.items() if isinstance(bank, dict) else enumerate(bank):
                 residency = (
                     HostResidency.PINNED.value if plan is None
                     else plan.residency_for(layer_id)
@@ -529,7 +529,6 @@ __all__ = [
     "LayerCompletionTracker",
     "PinPipeline",
     "alloc_banks",
-    "alloc_layer_banks",
     "born_pinned_default",
     "pin_banks",
     "read_file_into",

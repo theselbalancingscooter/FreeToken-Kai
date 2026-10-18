@@ -89,7 +89,7 @@ def _executor(sources):
     try:
         return CpuMoeExecutor(cache, top_k=TOPK, activation="silu",
                               apply_router_weight_on_input=False, num_threads=2, max_tokens=4,
-                              device=torch.device("cpu"), fmt="bf16")
+                              device=torch.device("cpu"), layer_formats=[("bf16", {})] * cache.num_layers)
     finally:
         torch.set_num_threads(threads)  # the executor clamps torch's pool; keep the test's
 

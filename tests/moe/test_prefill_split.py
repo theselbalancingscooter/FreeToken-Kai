@@ -146,7 +146,7 @@ def _rig():
     cache.reset()
     ex = CpuMoeExecutor(cache, top_k=TOPK, activation="silu", apply_router_weight_on_input=False,
                         num_threads=4, max_tokens=moe.CPU_PREFILL_PIECE, device=dev,
-                        fmt=layer.quant_method.cpu_format)
+                        layer_formats=[layer.quant_method.cpu_spec()] * L)
     cache.set_cpu_executor(ex)
     layer.offload_cache = cache
     return layer, cache

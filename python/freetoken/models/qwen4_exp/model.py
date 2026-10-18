@@ -65,6 +65,7 @@ def build_linear_mixer(config: ModelConfig, layer_id: int, prefix: str) -> BaseO
         output_gate=g.output_gate,
         quant_config=config.quant,
         prefix=prefix,
+        out_heads_tiled=config.qwen4_args.gdn_out_heads_tiled,
     )
 
 
@@ -207,6 +208,9 @@ class Qwen4ExpModel(BaseOP):
         start, end = (0, config.num_layers) if pp is None else (pp.start, pp.end)
         self._pp_first = start == 0
         self._pp_last = end == config.num_layers
+        # the checkpoint's quant config reaches the plain table only (a GGUF embedding is quantized);
+        # the host and fp8 tables of this fork keep their own storage
+        embed_kwargs = {}
         if getattr(config, "embed_host", False):
             # --host-embedding: the table stays in pinned host memory (in the model dtype, not
             # --dense-quant's fp8) and the GPU gathers the looked-up rows in place. Frees the
@@ -218,8 +222,9 @@ class Qwen4ExpModel(BaseOP):
             embed_cls = Fp8VocabParallelEmbedding
         else:
             embed_cls = VocabParallelEmbedding
+            embed_kwargs = dict(quant_config=config.quant, prefix=f"{prefix}.embed_tokens")
         self.embed_tokens = (
-            embed_cls(num_embeddings=config.vocab_size, embedding_dim=config.hidden_size)
+            embed_cls(num_embeddings=config.vocab_size, embedding_dim=config.hidden_size, **embed_kwargs)
             if self._pp_first
             else None
         )
@@ -373,11 +378,8 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
             return 0
 
         if engine_config.ple_backend == "disk":
-            from freetoken.utils import download_hf_weight
-
             from .ple_disk import DiskRowTable, resolve_row_source
 
-            folder = download_hf_weight(engine_config.model_path)
             # one WAIT node per captured graph: the flag protocol supports a single consume
             assert len(ple_layers) == 1, "disk PLE backend expects exactly one PLE layer"
             emb, args = ple_layers[0].ple_embedding, ple_layers[0].args
@@ -391,7 +393,7 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                 "image_token_id": args.image_token_id,
             }
             disk_table = DiskRowTable(
-                resolve_row_source(folder),
+                resolve_row_source(engine_config.model_path),
                 constants,
                 max_graph_rows=max(256, engine_config.cuda_graph_max_bs or 0),
                 max_extend_tokens=engine_config.max_extend_tokens,
@@ -474,6 +476,11 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
         ctx = get_global_ctx()
         layers = m.layers.op_list
         hiddens = [c.hidden for c in chunks]
+        # one staged expert layer serves every chunk of the group, so the offload cache must not
+        # clear its staging buffers at each chunk's last layer; it clears them once, after the group
+        cache = getattr(ctx, "moe_offload_cache", None)
+        if cache is not None:
+            cache.prefill_group_open = True
         try:
             for i in m._local_ids:
                 for k, c in enumerate(chunks):
@@ -485,6 +492,9 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                             hiddens[k] = layers[i].forward(hiddens[k], c.batch)
         finally:
             ctx.prefill_group_continuation = False
+            if cache is not None:
+                cache.prefill_group_open = False
+                cache.release_prefill_staging()
         return hiddens
 
     def spec_rollback(self, batch: Batch, accepted: int, ctx) -> None:

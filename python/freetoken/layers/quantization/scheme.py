@@ -20,6 +20,7 @@ class QuantKind(Enum):
     MXFP8 = "mxfp8"
     NVFP4 = "nvfp4"
     MXFP4 = "mxfp4"
+    GGUF = "gguf"
     Q8_0 = "q8_0"  # ggml Q8_0 (--dense-quant q8_0): int8 blocks of 32 with an fp16 scale
 
     def __str__(self) -> str:
@@ -111,3 +112,15 @@ def mxfp4_scheme() -> QuantScheme:
 def q8_0_scheme() -> QuantScheme:
     """ggml Q8_0 packed rows (the scale lives inside each 34-byte block, so ``weight`` is the only role)."""
     return QuantScheme(QuantKind.Q8_0, WeightDesc("q8_0", (1, 32), "f16"), {"weight"})
+
+
+def gguf_scheme(types: Iterable[int], scaled: bool = False) -> QuantScheme:
+    """Packed ggml blocks, one ggml type per fused part (``types`` follows the parts' order).
+
+    ``scaled``: the NVFP4 tensors carry the fp32 ``<name>.scale`` (weight_scale_2) that llama.cpp's converter writes."""
+    return QuantScheme(QuantKind.GGUF, WeightDesc("ggml:" + ",".join(str(int(t)) for t in types), None, "f32" if scaled else None), {"weight"})
+
+
+def gguf_types(scheme: QuantScheme) -> tuple[int, ...]:
+    assert scheme.kind is QuantKind.GGUF, scheme
+    return tuple(int(t) for t in scheme.weight.elem.removeprefix("ggml:").split(","))

@@ -292,15 +292,10 @@ def load_gguf_moe_expert_sources(
     return loader(model_path, model_config, layer_sink=layer_sink)
 
 
-def load_q4_0_moe_expert_sources(model_path: str, model_config, *, dummy: bool = False, layer_sink=None) -> dict:
-    return load_gguf_moe_expert_sources(model_path, model_config, quant_format="q4_0", dummy=dummy, layer_sink=layer_sink)
-
-
 __all__ = [
     "load_weight",
     "load_vision_weight",
     "ftw_lacks_vision",
     "load_gguf_moe_expert_sources",
-    "load_q4_0_moe_expert_sources",
     "iter_expert_tensors_parallel",
 ]

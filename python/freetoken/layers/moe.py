@@ -84,7 +84,8 @@ class MoELayer(BaseOP):
         self.strategy = strategy
         self.decode_target = decode_target
         self.prefix = prefix
-        # offload layers without a quant config stay on the format-tag banks (GGUF q4_0)
+        # Kai: offload layers without a quant config stay on the format-tag banks (the Q2_0 / Q4_0
+        # expert banks of --moe-expert-gguf, make_moe_layer); upstream builds a method unconditionally
         self.quant_method = None
         if quant_config is not None or allocate_experts:
             self.quant_method = quant_method_for(quant_config, self, prefix)
@@ -106,7 +107,6 @@ class MoELayer(BaseOP):
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
     ) -> torch.Tensor:
-        assert self.quant_method is not None
         return self.quant_method.apply(
             hidden_states, topk_weights, topk_ids, self.quant_method.resident_view(self),
             layer=self, is_prefill=get_global_ctx().batch.is_prefill,
@@ -365,7 +365,7 @@ class OffloadMoELayer(MoELayer):
         assert executor is not None, "CPU MoE executor was not initialized"
         # the kernel reads every route's slot: give the inactive ones slot 0, which holds a
         # complete payload or the bank's zero fill (never uninitialized storage), times weight 0
-        # with several quants this holds only because the cache zeroes staged slot 0 rows (zero_inactive_route_slots)
+        # with several quants this holds only because the cache zeroes its staging area after prefill
         clamp = not self.skips_inactive_slots
         gpu_slots, gpu_w, cpu_ids = hybrid_routes(cache, self.layer_id, topk_ids, topk_weights, clamp)
         if tl is not None:
@@ -577,7 +577,6 @@ class OffloadMoELayer(MoELayer):
 
     # ------------------------------------------------------------------
     # Kernel dispatch: ``views`` are the bank tensors the movement step produced (in bank registration order) and ``topk_ids`` already index their rows.
-    # GGUF q4_0 experts still dispatch on the cache's format tag until they get a method.
     # ------------------------------------------------------------------
 
     def _expert_gemm(

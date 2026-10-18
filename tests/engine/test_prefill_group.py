@@ -322,7 +322,10 @@ def test_a_prefetched_bank_serves_every_chunk_of_a_group():
     ]
     copies = []
     original = cache._invalidate_prefill_buffer
-    cache._invalidate_prefill_buffer = lambda buffer_id: (copies.append(buffer_id), original(buffer_id))[1]
+    cache._invalidate_prefill_buffer = lambda buffer_id, layer_id: (copies.append(buffer_id), original(buffer_id, layer_id))[1]
+    # as the model's group forward does: the staging buffers are cleared after the group, not at
+    # each chunk's last layer (upstream clears them there, which would zero the layer under the next chunk)
+    cache.prefill_group_open = True
     for layer_id in range(L):
         for k, (hidden, weights, ids) in enumerate(chunks):
             if layer_id == 0 and k == 0:
@@ -335,6 +338,12 @@ def test_a_prefetched_bank_serves_every_chunk_of_a_group():
             cache.release_prefill_layer(layer_id)
             _assert_close(out, _ref_moe(sources, layer_id, hidden, weights, ids))
     assert len(copies) == L  # one copy per layer for the whole group, not one per chunk
+    cache.prefill_group_open = False
+    cache.release_prefill_staging()
+    torch.cuda.synchronize()
+    assert not any(cache._stage_dirty)
+    for (_, bank), stage in zip(cache.banks, cache._stage_bytes):
+        assert not bank.view(-1).view(torch.uint8)[: 2 * stage].any()  # the two staging buffers are clear for decode
 
 
 @cuda

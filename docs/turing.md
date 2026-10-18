@@ -86,13 +86,14 @@ TFLOPS afterwards. The M=1 GEMV (decode) is untouched. `FREETOKEN_FP8_SCRATCH_GE
 
 ## 5. Arithmetic e2m1 dequant in the prefill MoE kernel
 
-`python/freetoken/kernel/triton/nvfp4_fused_moe.py`, constexpr `ARITH_DEQUANT`.
+`python/freetoken/kernel/triton/nvfp4_fused_moe.py`.
 
 The prefill MoE kernel looked up each 4-bit code in a 16-entry LUT (two gathers per byte). The dense
 NVFP4 kernels already use a gather-free bit-placement dequant, so the same was wired into the MoE
 kernel. It is bit-identical (max diff 0 against the LUT path) but, on the 2060, **not faster**: the
-kernel stays at 0.56 TFLOPS. Kept as a knob (`FREETOKEN_NVFP4_MOE_ARITH`) since it costs nothing and
-may matter on other GPUs; the real fix is 6.
+kernel stays at 0.56 TFLOPS. It was kept as a knob (`FREETOKEN_NVFP4_MOE_ARITH`) until upstream
+rewrote the kernel around the same gather-free decode (#723, 2026-10-16); the knob is gone, the
+arithmetic form is the only one. The real fix below Ampere is 6.
 
 ## 6. NVFP4 prefill MoE: chunked dequant + per-expert cuBLAS below Ampere
 
