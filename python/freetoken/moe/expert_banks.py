@@ -20,7 +20,7 @@ from freetoken.layers.quantization import QuantKind
 from freetoken.utils import init_logger
 
 from .host_banks import HostBank
-from .offload_cache import _BANK_BYTES_PER_EXPERT, placeholder_bank
+from .offload_cache import _BANK_BYTES_PER_EXPERT, _BANK_SCHEMAS, placeholder_bank
 
 logger = init_logger(__name__)
 

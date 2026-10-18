@@ -663,6 +663,10 @@ def test_slot_pools_of_two_bank_layouts_keep_their_rows_through_prefill():
         prefill_overlap=True, prefill_hit_d2d=True, pool_of_layer=[2, 0, 3, 1], pool_sizes=[6, 5, 12, 10],
     )
     cache.set_bank_sources(sources)
+    if not cache._prefill_hit_d2d_active:
+        # the probe of cudaMemcpyBatchAsync fails on some hosts (two RTX 3060s under WSL2: "copied wrong bytes"); the cache then
+        # falls back to whole-layer copies, which is what the other tests cover, and the hit rows this test asserts stay 0
+        pytest.skip("prefill hit-D2D is unavailable on this host (cudaMemcpyBatchAsync probe)")
     assert [v[1].dtype for v in map(cache.pool_bank_views, range(L))] == [torch.bfloat16, torch.uint8] * 2
     # staging buffers take 2 x 8 rows of every bank: all of the wide pools, the first 8 slots of layer 0's pool
     assert cache._pool_stable_from == [6, 5, 8, 0]
