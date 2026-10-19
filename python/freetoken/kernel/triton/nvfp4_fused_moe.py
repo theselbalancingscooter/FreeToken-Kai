@@ -1,14 +1,14 @@
 """Inline-dequant NVFP4 fused-MoE Triton kernels.
 
 These kernels read the NVFP4 expert cache (packed FP4 codes + fp8 block scales +
-fp16 per-row global scale) *directly* and dequantize inside the GEMM K-loop, so the
+fp32 per-row global scale) *directly* and dequantize inside the GEMM K-loop, so the
 grouped MoE GEMM never materializes a BF16 copy of the experts (no separate dequant
 pass, no HBM round-trip of the 4x larger BF16 weights).
 
 Layout, for an expert weight ``W[N, K]``:
   - ``packed[slot, n, k//2]`` uint8: two FP4 codes per byte, low nibble = even k.
   - ``scale[slot, n, k//16]`` fp8-e4m3: per 16-wide block scale.
-  - ``global[slot, n]`` fp16: per-output-row scale (``weight_scale_2``).
+  - ``global[slot, n]`` fp32: per-output-row scale (``weight_scale_2``).
   - ``W[n, k] = E2M1[code] * scale[n, k//16] * global[n]``.
 
 The global scale is constant along K, so it is applied once after the K-loop.
@@ -52,7 +52,7 @@ def _decode_nvfp4_moe_kernel(
     a_ptr,             # [M, K] activations (compute dtype)
     packed_ptr,        # [S, N, K // 2] uint8
     scale_ptr,         # [S, N, K // 16] fp8-e4m3
-    global_ptr,        # [S, N] fp16
+    global_ptr,        # [S, N] fp32
     c_ptr,             # [M, TOP_K, N] output (compute dtype)
     topk_weights_ptr,  # [M, TOP_K] fp32
     topk_ids_ptr,      # [M, TOP_K] int32 -> cache slot
@@ -163,7 +163,7 @@ def _decode_nvfp4_marlin_kernel(
     a_ptr,             # [M, K] activations (compute dtype)
     packed_ptr,        # [S, N, K // 8] int32 (8 fp4 codes per word, nibble j -> k=8*w+j)
     scale_ptr,         # [S, N, K // 16] fp8-e4m3
-    global_ptr,        # [S, N] fp16
+    global_ptr,        # [S, N] fp32
     c_ptr,             # [M, TOP_K, N] output (compute dtype)
     topk_weights_ptr,  # [M, TOP_K] fp32
     topk_ids_ptr,      # [M, TOP_K] int32 -> cache slot
@@ -357,7 +357,7 @@ def _prefill_nvfp4_moe_kernel(
     a_ptr,             # [M, K] activations
     packed_ptr,        # [S, N, K // 2] uint8
     scale_ptr,         # [S, N, K // 16] fp8-e4m3 (uint8 view before sm_89)
-    global_ptr,        # [S, N] fp16
+    global_ptr,        # [S, N] fp32
     c_ptr,             # [num_valid_tokens, N] output (flat over M*top_k)
     topk_weights_ptr,
     sorted_token_ids_ptr,
@@ -385,6 +385,7 @@ def _prefill_nvfp4_moe_kernel(
     USE_TMA: tl.constexpr = False,     # needs K % 256 == 0
     TMA_SCALES: tl.constexpr = False,  # with USE_TMA: scales by TMA too, else pointer loads
     FAST_DECODE: tl.constexpr = 0,     # 0: fp16 pair decode, 1: packed_ptr / w_desc are int32 views of 8 codes, 2: bytes
+    SCALE_WORDS: tl.constexpr = False,  # with FAST_DECODE == 1 and pointer loads: scale_ptr is an int32 view of 4 scales
 ):
     # out^T = W @ X^T: wgmma reads its A operand (the decoded weights) from registers, while B must be in shared memory.
     # The token block is the MMA N dimension, so a 16-token block still fills the MMA.
@@ -420,7 +421,13 @@ def _prefill_nvfp4_moe_kernel(
         p_ptrs = packed_ptr + slot * stride_pe + offs_bn[:, None] * stride_pn + offs_kw[None, :] * stride_pkb
     else:
         p_ptrs = packed_ptr + slot * stride_pe + offs_bn[:, None] * stride_pn + offs_kb[None, :] * stride_pkb
-    s_ptrs = scale_ptr + slot * stride_se + offs_bn[:, None] * stride_sn + offs_sb[None, :] * stride_sblk
+    tl.static_assert(not SCALE_WORDS or (WORDS and not USE_TMA and BLOCK_SIZE_KB >= 32))
+    SW: tl.constexpr = BLOCK_SIZE_KB // 32
+    if SCALE_WORDS:
+        offs_sw = tl.arange(0, SW)
+        s_ptrs = scale_ptr + slot * stride_se + offs_bn[:, None] * stride_sn + offs_sw[None, :] * stride_sblk
+    else:
+        s_ptrs = scale_ptr + slot * stride_se + offs_bn[:, None] * stride_sn + offs_sb[None, :] * stride_sblk
 
     accumulator = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_M), dtype=tl.float32)
     K_BYTES = K // 2
@@ -450,7 +457,16 @@ def _prefill_nvfp4_moe_kernel(
             else:
                 byte_mask = kb * BLOCK_SIZE_KB + offs_kb < K_BYTES
                 v = tl.load(p_ptrs, mask=byte_mask[None, :], other=0).to(tl.int32)
-            if e4m3_native_cx():
+            if SCALE_WORDS:
+                # 4-byte loads can go through the cp.async pipeline, byte loads cannot; spread each word over the 8 weight words it scales
+                sw = tl.load(s_ptrs, mask=(kb * SW + offs_sw < K_BYTES // 32)[None, :], other=0)
+                sw = tl.reshape(tl.broadcast_to(sw[:, :, None], (BLOCK_SIZE_N, SW, KW // SW)), (BLOCK_SIZE_N, KW))
+                s = ((sw >> ((offs_kw // 2 % 4) * 8)[None, :]) & 0xFF).to(tl.uint8)
+                if e4m3_native_cx():
+                    s = s.to(tl.float8e4nv, bitcast=True).to(tl.float32)
+                else:
+                    s = e4m3_u8_to_f32(s)
+            elif e4m3_native_cx():
                 s = tl.load(s_ptrs, mask=sblk_mask[None, :], other=0.0).to(tl.float32)
             else:
                 s = e4m3_u8_to_f32(tl.load(s_ptrs, mask=sblk_mask[None, :], other=0))
@@ -459,8 +475,9 @@ def _prefill_nvfp4_moe_kernel(
             s = (s * 3.3230699894622794e35).to(tl.bfloat16).to(tl.uint16, bitcast=True).to(tl.uint32)
             s = s | (s << 16)
             if WORDS:
-                # one scale per 16 values, two words
-                s = tl.reshape(tl.broadcast_to(s[:, :, None], (BLOCK_SIZE_N, SB, 2)), (BLOCK_SIZE_N, KW))
+                if not SCALE_WORDS:
+                    # one scale per 16 values, two words
+                    s = tl.reshape(tl.broadcast_to(s[:, :, None], (BLOCK_SIZE_N, SB, 2)), (BLOCK_SIZE_N, KW))
                 w = _e2m1x8_bf16(v.to(tl.uint32, bitcast=True), s, BLOCK_SIZE_N, KW)
             else:
                 # one scale per 16 values, eight bytes
@@ -481,7 +498,7 @@ def _prefill_nvfp4_moe_kernel(
         if not USE_TMA:
             p_ptrs += (KW if WORDS else BLOCK_SIZE_KB) * stride_pkb
         if not (USE_TMA and TMA_SCALES):
-            s_ptrs += (BLOCK_SIZE_KB // 8) * stride_sblk
+            s_ptrs += (SW if SCALE_WORDS else BLOCK_SIZE_KB // 8) * stride_sblk
 
     g = tl.load(global_ptr + slot * stride_ge + offs_bn * stride_gn).to(tl.float32)
     if FAST_DECODE:

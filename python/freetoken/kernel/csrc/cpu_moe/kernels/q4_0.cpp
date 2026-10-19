@@ -2,6 +2,7 @@
 #include <vector>
 
 #include "../format.h"
+#include "kai_fp16.h"
 
 namespace freetoken::cpu_moe {
 namespace {

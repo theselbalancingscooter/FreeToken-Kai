@@ -2,7 +2,7 @@
 
 Produces exactly what the native ``nvfp4`` bank schema and the Triton dequant / GEMV kernels
 read (see ``kernel/triton/nvfp4_dequant.py``): two E2M1 codes per byte with the even element
-in the LOW nibble, an fp8-e4m3 scale per 16-wide block, and an fp16 global scale per output
+in the LOW nibble, an fp8-e4m3 scale per 16-wide block, and an fp32 global scale per output
 row; ``weight = e2m1 * block_scale * global``. Used to turn the checkpoint's unquantized
 (bf16) tensors -- the MTP head's stacked experts, and dense projections under a future Q4
 mode -- into the same format the routed experts already ship in.
@@ -22,15 +22,16 @@ _E2M1_MIDS = (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)
 
 def quantize_nvfp4_rows(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """``w [N, K]`` (K % 16 == 0) -> ``(packed [N, K//2] uint8, scale [N, K//16] fp8-e4m3,
-    global [N] fp16)``. Row-wise global = amax / (6 * 448) so every block scale fits e4m3;
+    global [N] fp32)``. Row-wise global = amax / (6 * 448) so every block scale fits e4m3;
     block scale = block amax / 6 / global, rounded to e4m3; codes = round-to-nearest E2M1."""
     assert w.dim() == 2 and w.shape[1] % BLOCK == 0, w.shape
     n, k = w.shape
     wf = w.to(torch.float32)
     amax_row = wf.abs().amax(dim=1)
-    # fp16-representable global; the tiny floor keeps an all-zero row finite
-    g = (amax_row / (E2M1_MAX * FP8_MAX)).clamp(min=2.0 ** -20).to(torch.float16)
-    gf = g.to(torch.float32)
+    # fp32 global (upstream #739: these sit at fp16's normal minimum, where fp16 rounds them by up to
+    # 1.7e-3); the tiny floor keeps an all-zero row finite
+    g = (amax_row / (E2M1_MAX * FP8_MAX)).clamp(min=2.0 ** -20)
+    gf = g
     blocks = wf.view(n, k // BLOCK, BLOCK)
     amax_blk = blocks.abs().amax(dim=2)
     s = (amax_blk / E2M1_MAX / gf[:, None]).clamp(max=FP8_MAX)
@@ -69,10 +70,10 @@ def nvfp4_expert_bank_specs(e: int, h: int, i: int) -> dict[str, tuple[tuple[int
     return {
         "gate_up_packed": ((e, 2 * i, h // 2), torch.uint8),
         "gate_up_scale": ((e, 2 * i, h // BLOCK), torch.float8_e4m3fn),
-        "gate_up_global": ((e, 2 * i), torch.float16),
+        "gate_up_global": ((e, 2 * i), torch.float32),
         "down_packed": ((e, h, i // 2), torch.uint8),
         "down_scale": ((e, h, i // BLOCK), torch.float8_e4m3fn),
-        "down_global": ((e, h), torch.float16),
+        "down_global": ((e, h), torch.float32),
     }
 
 

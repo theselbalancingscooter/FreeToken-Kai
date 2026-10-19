@@ -124,7 +124,7 @@ def test_nvfp4_quantizer_roundtrip_and_layout():
     packed, scale, g = quantize_nvfp4_rows(w)
     assert packed.shape == (6, 32) and packed.dtype == torch.uint8
     assert scale.shape == (6, 4) and scale.dtype == torch.float8_e4m3fn
-    assert g.shape == (6,) and g.dtype == torch.float16
+    assert g.shape == (6,) and g.dtype == torch.float32
     deq = dequant_nvfp4_rows(packed, scale, g)
     # 4-bit with 16-wide block scales: the block amax is exact-ish, the rest within a step
     assert torch.isclose(deq[0, 5], torch.tensor(3.0), rtol=0.08)
