@@ -186,7 +186,14 @@ class MappedBankLayout:
         if self.layers != other.layers:
             return f"MoE layers {self.layers[0]}..{self.layers[-1]} against {other.layers[0]}..{other.layers[-1]}"
         if self.banks != other.banks:
-            return f"bank shapes {self.banks} against {other.banks}"
+            mine = {n: (s, d) for n, s, d, _ in self.banks}
+            theirs = {n: (s, d) for n, s, d, _ in other.banks}
+
+            def fmt(x):
+                return f"{list(x[0])} {x[1]}" if x else "absent"
+
+            differ = [n for n in dict.fromkeys([*mine, *theirs]) if mine.get(n) != theirs.get(n)]
+            return "banks " + ", ".join(f"{n} {fmt(mine.get(n))} against {fmt(theirs.get(n))}" for n in differ)
         for key in sorted(set(self.meta) | set(other.meta)):
             if key not in ignore and self.meta.get(key) != other.meta.get(key):
                 return f"{key} {self.meta.get(key)!r} against {other.meta.get(key)!r}"

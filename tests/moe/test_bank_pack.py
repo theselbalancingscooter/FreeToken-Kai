@@ -449,6 +449,85 @@ def test_the_ft_bank_commands_end_to_end(tmp_path, monkeypatch, capsys):
     assert "no bank file" in capsys.readouterr().err
 
 
+# ----- rewrite: a packed bank from a build with another bank layout ---------------------------
+def _bank_as_an_older_build_wrote_it(bank_path, banks, order, slim):
+    """Replace the packed bank with one whose NVFP4 global rows are fp16 (every build before upstream #739)."""
+    from freetoken.layers.quantization.moe.base import BankSpec
+    from freetoken.moe.bank_file import file_lock
+
+    with BankFile.open(bank_path, writable=False) as bank:
+        layout = bank.layout
+    specs = {n: (BankSpec(s.shape, torch.float16) if n.endswith("_global") else s)
+             for n, s in TritonNvfp4MoEKernel().layout(CFG).items()}
+    old = layout_from_specs(specs, layout.layers, layout.num_experts, layout.meta)
+    with file_lock(bank_path):
+        bank = BankFile.create(bank_path, old)
+    for layer in range(L):
+        bank.write_layer(layer, {n: (t.to(torch.float16) if n.endswith("_global") else t) for n, t in banks[layer].items()}, order[layer])
+    bank.set_canonical_for(slim)
+    bank.close()
+
+
+def test_rewrite_brings_a_packed_bank_to_this_builds_layout(tmp_path):
+    from freetoken.moe.bank_pack import rewrite_bank
+
+    model, _, bank_path, banks, order = _served_nvfp4_bank(tmp_path)
+    slim = str(tmp_path / "slim")
+    report = pack_checkpoint(model, slim, config=CONFIG, bank_path=bank_path, log=lambda _m: None)
+    manifest = read_pack_manifest(slim)
+    _bank_as_an_older_build_wrote_it(report["bank"], banks, order, slim)
+    layout = layout_from_specs(TritonNvfp4MoEKernel().layout(CFG), range(L), E,
+                               _meta("nvfp4", "triton", CFG, manifest["fingerprint"]))
+    # the start names the way out instead of starting the only copy over
+    with pytest.raises(BankFileError, match=r"gate_up_global \[32\] float16 against \[32\] float32.*ft bank rewrite --model-path"):
+        MappedTier(report["bank"], range(L), all_layers=range(L), num_experts=E, hot_per_layer=3,
+                   layout=layout, can_write=False).prepare()
+    with pytest.raises(PackError, match="not what triton lays out in this build"):
+        verify_packed(slim, config=CONFIG, log=lambda _m: None)
+    assert rewrite_bank(slim, config=CONFIG, log=lambda _m: None)["rewritten"] is True
+    assert not os.path.exists(report["bank"] + ".rewrite")
+    # the file is in this build's layout, keeps its row order and its mark, and verifies
+    with BankFile.open(report["bank"], writable=False) as bank:
+        assert bank.layout.banks == layout.banks
+        assert bank.canonical_for() == slim
+        for layer in range(L):
+            assert bank.layer_state(layer)[0] == order[layer]
+    assert verify_packed(slim, config=CONFIG, log=lambda _m: None)["removed_tensors"] == L * E * 6
+    # and serves the fp32 globals the checkpoint holds, not the fp16 rounding of the old file
+    tier = MappedTier(report["bank"], range(L), all_layers=range(L), num_experts=E, hot_per_layer=3,
+                      layout=layout, can_write=False)
+    assert tier.prepare() is True
+    tier.finish()
+    for layer in range(L):
+        for name, per_layer in tier.sources.items():
+            for physical, logical in enumerate(order[layer]):
+                assert torch.equal(per_layer[layer][physical].reshape(-1).view(torch.uint8),
+                                   banks[layer][name][logical].reshape(-1).view(torch.uint8))
+    tier.banks.close()
+    # a second run has nothing to do
+    assert rewrite_bank(slim, config=CONFIG, log=lambda _m: None)["rewritten"] is False
+
+
+def test_rewrite_refuses_a_cache_bank_and_the_command_reports(tmp_path, monkeypatch, capsys):
+    from freetoken.moe import bank_cli
+    from freetoken.moe.bank_pack import rewrite_bank
+
+    model, _, bank_path, banks, order = _served_nvfp4_bank(tmp_path)
+    with pytest.raises(PackError, match="not a packed checkpoint.*writes it over"):
+        rewrite_bank(model, config=CONFIG, bank_path=bank_path, log=lambda _m: None)
+    monkeypatch.setattr(bank_cli, "_model_config", lambda _p: CONFIG)
+    slim = str(tmp_path / "slim")
+    assert bank_cli.main(["pack", "--model", model, "--out", slim, "--moe-bank-dir", os.path.dirname(bank_path)]) == 0
+    capsys.readouterr()
+    assert bank_cli.main(["rewrite", "--model", slim]) == 0
+    assert "already in this build's layout" in capsys.readouterr().out
+    _bank_as_an_older_build_wrote_it(os.path.join(slim, "bank.ftmb"), banks, order, slim)
+    assert bank_cli.main(["rewrite", "--model", slim]) == 0
+    out = capsys.readouterr().out
+    assert "float16 against" in out and "the old file is gone" in out
+    assert bank_cli.main(["verify", "--model", slim]) == 0
+
+
 # ----- gpt-oss (MXFP4, stacked experts with biases) -------------------------------------------
 GH, GI = 64, 32
 GPTOSS_CONFIG = SimpleNamespace(num_layers=2, num_experts=E, moe_intermediate_size=GI, num_moe_layers=2)

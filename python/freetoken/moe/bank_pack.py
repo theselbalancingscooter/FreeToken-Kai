@@ -7,8 +7,9 @@ This writes a checkpoint without them.
 
 What gets dropped is decided by the bytes, not by the names: a checkpoint tensor goes only when
 the bank reproduces it exactly. The kernel's ``unpack`` says which piece roles its ``pack`` kept
-losslessly; NVFP4's per-tensor global scales went through fp16 on the way in, so they stay (they
-are a few hundred kilobytes). Before anything is claimed, every layer is checked two ways:
+losslessly; NVFP4's per-tensor global scales are broadcast to a row each in the bank (and inverted
+for the quant-side dialects), so they stay (they are a few hundred kilobytes). Before anything is
+claimed, every layer is checked two ways:
 
 1. the bank's rows equal what the loader would pack from the original checkpoint -- every bank
    role, the lossy ones included (this is what serving from the bank means); and
@@ -32,6 +33,7 @@ Nothing here needs a GPU.
 
 from __future__ import annotations
 
+import contextlib
 import datetime
 import hashlib
 import json
@@ -217,8 +219,8 @@ def method_meta(method) -> dict:
     }
 
 
-def kernel_for(layout: MappedBankLayout):
-    """``(kernel, MoEConfig)`` rebuilt from a bank header, checked against the stored geometry."""
+def _kernel_of_meta(layout: MappedBankLayout):
+    """``(kernel, MoEConfig)`` named by a bank header, before any look at the stored geometry."""
     from freetoken.layers.quantization import LayerKind, QuantKind, method_class
     from freetoken.layers.quantization.moe.base import MoEConfig
 
@@ -238,15 +240,23 @@ def kernel_for(layout: MappedBankLayout):
         tp_rank=kc.get("tp_rank", 0), tp_size=kc.get("tp_size", 1),
     )
     kernel = kernels[meta["kernel"]]()
-    specs = kernel.layout(cfg)
-    if any(spec.resident for spec in specs.values()):
+    if any(spec.resident for spec in kernel.layout(cfg).values()):
         raise PackError(
             f"{meta['kind']} / {meta['kernel']} keeps per-expert values on the GPU that the bank file "
             f"does not hold; only a CPU-capable kernel's bank can stand in for the checkpoint"
         )
-    expected = layout_from_specs(specs, layout.layers, layout.num_experts, meta)
+    return kernel, cfg
+
+
+def kernel_for(layout: MappedBankLayout):
+    """``(kernel, MoEConfig)`` rebuilt from a bank header, checked against the stored geometry."""
+    kernel, cfg = _kernel_of_meta(layout)
+    expected = layout_from_specs(kernel.layout(cfg), layout.layers, layout.num_experts, layout.meta)
     if expected.banks != layout.banks:
-        raise PackError(f"the bank's geometry {layout.banks} is not what {meta['kernel']} lays out: {expected.banks}")
+        raise PackError(
+            f"the bank's geometry is not what {layout.meta['kernel']} lays out in this build "
+            f"({layout.mismatch(expected)}); `ft bank rewrite` writes a packed checkpoint's bank in this build's layout"
+        )
     return kernel, cfg
 
 
@@ -829,6 +839,146 @@ def verify_packed(model_path: str, *, config, bank_path: str | None = None, log=
     finally:
         bank.close()
     return {"layers": len(layout.layers), "removed_tensors": len(removed_names), "bank": bank_path}
+
+
+# ---------------------------------------------------------------------------------------
+# rewrite: the bank in this build's layout
+# ---------------------------------------------------------------------------------------
+def _removed_names(folder: str, manifest: dict, headers: dict) -> set[str]:
+    """The expert tensors the slim shards do not hold: left out with their shard, or rewritten without."""
+    removed: set[str] = set()
+    for shard, rec in manifest["shards"].items():
+        if rec["action"] == "drop":
+            removed |= set(headers[shard].entries)
+        elif rec["action"] == "rewrite":
+            removed |= set(headers[shard].entries) - set(ShardHeader.read(os.path.join(folder, shard)).entries)
+    return removed
+
+
+def rewrite_bank(model_path: str, *, config, bank_path: str | None = None, log=print) -> dict:
+    """Write a packed checkpoint's bank file again in this build's bank layout. Raises ``PackError``.
+
+    For a build that lays the same kernel's banks out differently (upstream #739 widened the NVFP4
+    global scales from fp16 to fp32): a bank file beside an original checkpoint is a cache the next
+    ``--moe-bank-ram`` start writes over from the checkpoint, but a packed checkpoint's bank is the
+    only copy of its experts, and the start stops instead. Here every layer is rebuilt the way
+    ``verify`` checks it: the tensors the old file gives back losslessly (checked against the hashes
+    ``pack`` recorded) plus the ones the slim checkpoint kept, packed by this build's kernel into a
+    new file beside the old one, which then replaces it. Each layer keeps its row order and the
+    file its mark. Needs the file's size free beside it; the old file is the one thing deleted.
+    """
+    import torch
+
+    from freetoken.layers.quantization import QuantKind
+    from freetoken.models.loader import ShardReader
+    from freetoken.models.weight import _ST_DTYPE
+    from freetoken.moe.expert_pieces import expert_sources
+
+    from .bank_file import _fsync_dir, file_lock
+
+    folder = os.path.abspath(model_path)
+    manifest = read_pack_manifest(folder)
+    if manifest is None:
+        raise PackError(
+            f"{folder} is not a packed checkpoint (no {PACK_MANIFEST}). A bank file beside an original "
+            f"checkpoint is a cache: the next --moe-bank-ram start writes it over from the checkpoint"
+        )
+    bank_path = bank_path or bank_path_for(folder, manifest)
+    if not os.path.isfile(bank_path):
+        raise PackError(f"no bank file at {bank_path} (it was {manifest.get('bank_origin')} when packed)")
+    weight_map, headers = packed_weight_map(folder, manifest)
+    kind = QuantKind(manifest["kind"])
+    sources = expert_sources(folder, config, kind, weight_map=weight_map)
+    fp = fingerprint(sources, lambda n: (headers[weight_map[n]].entries[n]["dtype"], headers[weight_map[n]].entries[n]["shape"]))
+    if fp != manifest["fingerprint"]:
+        raise PackError("the manifest's shard headers do not give the fingerprint it records")
+    removed_names = _removed_names(folder, manifest, headers)
+
+    old = BankFile.open(bank_path, writable=False)
+    try:
+        layout = old.layout
+        if layout.meta.get("fingerprint") != manifest["fingerprint"]:
+            raise PackError(f"{bank_path} was written for other expert tensors than this checkpoint's")
+        kernel, cfg = _kernel_of_meta(layout)
+        wanted = layout_from_specs(kernel.layout(cfg), layout.layers, layout.num_experts, layout.meta)
+        if wanted.banks == layout.banks:
+            log(f"ft bank rewrite: {bank_path} is already in this build's layout")
+            return {"bank": bank_path, "layers": len(layout.layers), "rewritten": False}
+        why = layout.mismatch(wanted)
+        roles = lossless_roles(kernel, cfg, layout)
+        expected_removed = {n for n, s in sources.items() if s.role in roles}
+        if removed_names != expected_removed:
+            raise PackError(
+                f"the slim shards lack {len(removed_names)} tensors, but the bank gives back "
+                f"{len(expected_removed)}: {sorted(removed_names ^ expected_removed)[:4]}"
+            )
+        manifest_bank = old.manifest()
+        missing = [l for l in layout.layers if str(l) not in manifest_bank["layers"]]
+        if missing:
+            from .mapped_bank import _ranges
+
+            raise PackError(f"{bank_path} lacks layers {_ranges(missing)}")
+        new_path = bank_path + ".rewrite"
+        free = free_bytes(bank_path)
+        if free is not None and wanted.total_bytes() > free:
+            raise PackError(
+                f"the new file needs {wanted.total_bytes() / 2**30:.1f} GiB beside {bank_path} and the "
+                f"filesystem has {free / 2**30:.1f} GiB free"
+            )
+        log(f"ft bank rewrite: {bank_path} holds {why}; writing {new_path}")
+        groups = _group(sources)
+        with file_lock(new_path):
+            new = BankFile.create(new_path, wanted)
+        try:
+            reader = ShardReader(folder, torch.device("cpu"))
+            try:
+                for layer in layout.layers:
+                    blocks = old.check_digest(layer)
+                    logical = _logical_rows(old, layer, blocks, manifest_bank)
+                    del blocks
+                    order, _ = old.layer_state(layer, manifest_bank)
+                    per_role: dict[str, hashlib._Hash] = {}
+                    regenerated = {}
+                    for role, s, data in _regenerate(kernel, cfg, logical, groups[layer], roles):
+                        per_role.setdefault(role, hashlib.sha256()).update(memoryview(data.numpy()))
+                        regenerated[s.name] = data
+                    got = {role: h.hexdigest() for role, h in per_role.items()}
+                    if got != manifest["digests"].get(str(layer)):
+                        bad = sorted(r for r in got if got[r] != manifest["digests"].get(str(layer), {}).get(r))
+                        raise PackError(f"layer {layer}: the bank no longer gives back the original bytes of {bad}")
+
+                    def tensor_of(name):
+                        if name in regenerated:
+                            e = headers[weight_map[name]].entries[name]
+                            return regenerated[name].view(_ST_DTYPE[e["dtype"]]).reshape(e["shape"])
+                        return reader.get_tensor(name)
+
+                    out = {
+                        name: torch.empty((wanted.num_experts, *shape), dtype=dtype_of(dtype))
+                        for name, shape, dtype, _ in wanted.banks
+                    }
+                    if kernel.pack(_pieces(groups[layer], tensor_of), cfg, out):
+                        raise PackError(f"{layout.meta.get('kernel')} returned GPU-resident values the bank does not hold")
+                    new.write_layer(layer, out, order)
+                    del out, logical, regenerated
+                    old.drop_cache(layer)
+                    new.drop_cache(layer)
+                    log(f"ft bank rewrite: layer {layer} written")
+            finally:
+                reader.close()
+            new.set_canonical_for(old.canonical_for(manifest_bank) or folder)
+        except BaseException:
+            new.close()
+            with contextlib.suppress(OSError):
+                os.unlink(new_path)
+            raise
+        new.close()
+    finally:
+        old.close()
+    with file_lock(bank_path):
+        os.replace(new_path, bank_path)
+        _fsync_dir(bank_path)
+    return {"bank": bank_path, "layers": len(layout.layers), "rewritten": True, "was": why}
 
 
 # ---------------------------------------------------------------------------------------

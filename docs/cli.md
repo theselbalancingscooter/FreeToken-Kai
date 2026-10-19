@@ -228,6 +228,7 @@ ft bank pack    --model-path <model> --out <slim_dir> [--dry-run] [--copy] [--ke
 ft bank verify  --model-path <slim_dir> [--moe-bank-dir D]
 ft bank unpack  --model-path <slim_dir> --out <model> [--copy] [--moe-bank-dir D]
 ft bank reorder --model-path <model> --moe-bank-stats a.rank0.json a.rank1.json ... [--moe-bank-dir D]
+ft bank rewrite --model-path <slim_dir> [--moe-bank-dir D]
 ```
 
 The bank file `--moe-bank-ram` serves the experts from, as the canonical copy of them. `pack`
@@ -235,7 +236,9 @@ writes a checkpoint without the expert tensors the bank reproduces -- after chec
 byte for byte and the bank against what the original packs to -- hard-links the shards that hold
 no experts, moves the bank file into it, and deletes nothing. `verify` repeats the check without
 the original; `unpack` writes the original files back and checks them against the SHA-256 recorded
-at pack time; `reorder` applies a new placement in place. No GPU. See
+at pack time; `reorder` applies a new placement in place; `rewrite` writes a packed checkpoint's
+bank again in this build's bank layout after a build that changed it (the fp32 NVFP4 globals of
+upstream #739), from the file and the kept tensors, and replaces the old file. No GPU. See
 [bank-ram.md](bank-ram.md#5-optional-drop-the-second-copy-ft-bank-pack).
 
 ## ft doctor disk

@@ -80,10 +80,10 @@ from .bank_file import (  # noqa: F401  (re-exported: the on-disk format lives i
 
 
 # A block this small per layer is kept whole rather than split hot/cold. The global-scale
-# blocks are 2.5 and 5 kB per expert row, so a fault on one reads a whole readahead window
-# (256 kB, the measured optimum) to use a few kilobytes -- about 13% of the I/O a cold expert
-# costs, for two blocks that fit entirely in 17 MB per rank. Residency is cheaper than
-# reading them.
+# blocks are 5 and 10 kB per expert row (fp32 since upstream #739; half that as fp16), so a
+# fault on one reads a whole readahead window (256 kB, the measured optimum) to use a few
+# kilobytes -- about 13% of the I/O a cold expert costs, for two blocks that fit entirely in
+# 34 MB per rank. Residency is cheaper than reading them.
 _WHOLE_BLOCK_BYTES = 4 * 2**20
 
 
@@ -752,10 +752,22 @@ class MappedTier:
                     with BankFile.open(self.path, writable=False) as other:
                         canonical = other.canonical_for()
                 if canonical:
+                    hint = ""
+                    if existing is not None and existing.banks != layout.banks and (
+                        (existing.meta.get("kind"), existing.meta.get("kernel"))
+                        == (layout.meta.get("kind"), layout.meta.get("kernel"))
+                    ):
+                        # the same kernel lays its banks out differently in this build (upstream #739
+                        # widened the NVFP4 globals to fp32): the file can be rewritten, not started over
+                        hint = (
+                            f". The file holds the same {self._describe(existing)} in the bank layout of "
+                            f"another build; `ft bank rewrite --model-path {canonical}` writes it in this "
+                            f"build's layout from the file and the packed checkpoint"
+                        )
                     raise BankFileError(
                         f"--moe-bank-ram: {self.path} is the only copy of the experts of "
                         f"{canonical}, and this run wants a different file ({why}). Serve that "
-                        f"checkpoint, or point --moe-bank-dir somewhere else"
+                        f"checkpoint, or point --moe-bank-dir somewhere else{hint}"
                     )
                 if not self.can_write:
                     raise BankFileError(

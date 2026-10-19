@@ -73,8 +73,11 @@ The file is tied to the checkpoint by a fingerprint of the expert tensors' names
 shapes, and by the size and modification time of the shards that hold them: a checkpoint
 downloaded again, or copied, gets its bank written again rather than served the old experts.
 The kernel (`nvfp4 / triton`, `mxfp4 / triton_gptoss`) is part of the file too; switching to one
-with a different bank layout also starts it over. `ft bank info --model-path <model>` prints what
-a file holds.
+with a different bank layout also starts it over, and so does a build that lays the same kernel's
+banks out differently (upstream #739 widened the NVFP4 global scales from fp16 to fp32; the log
+says `banks gate_up_global [...] float16 against [...] float32`). A packed checkpoint's bank is the
+only copy of its experts and is never started over: that start stops and names `ft bank rewrite`
+(section 5). `ft bank info --model-path <model>` prints what a file holds.
 
 Files written by builds before this one (`bank.rank0of2.ftmb`, ...) are not read. The first start
 writes `bank.ftmb` and warns with the old files' names and size; delete them.
@@ -397,8 +400,9 @@ What it does, in order:
 
 1. **Decides what can go by the bytes, not the names.** A checkpoint tensor is dropped only if the
    bank reproduces it exactly. NVFP4 codes and block scales are stored as they are (gate and up
-   concatenated); the per-tensor global scales went into the bank as fp16 and stay in the
-   checkpoint -- a few hundred kilobytes. gpt-oss MXFP4 blocks, scales and biases all go. Expert
+   concatenated); the per-tensor global scales are broadcast to a row each in the bank (and
+   inverted for the quant-side dialects), so they stay in the checkpoint -- a few hundred
+   kilobytes. gpt-oss MXFP4 blocks, scales and biases all go. Expert
    tensors the server never reads (`input_scale`, the `--spec-mtp` head's experts) stay.
 2. **Checks every layer twice**, in one sequential pass over the shards that hold experts: the
    bank's rows must equal what the loader packs from the original (every bank role, the lossy
@@ -427,6 +431,23 @@ ft bank unpack --model-path /models/Qwen3.8-Flash-Next-banked --out /models/Qwen
 against what the slim checkpoint's kept tensors pack to. `unpack` writes the original files back
 and compares each rebuilt shard with the original's SHA-256.
 
+When a build changes the bank layout of the kernel itself (upstream #739: the NVFP4 global scales
+are fp32 rows, they were fp16), a packed checkpoint's bank cannot be started over like a cache,
+and `ft serve` stops with `is the only copy of the experts of ... banks gate_up_global [...]
+float16 against [...] float32` and names the way out:
+
+```bash
+ft bank rewrite --model-path /models/Qwen3.8-Flash-Next-banked   # then ft bank verify
+```
+
+`rewrite` writes the bank file again in this build's layout, layer by layer, from the rows the
+old file gives back losslessly (checked against the hashes `pack` recorded first) and the tensors
+the slim checkpoint kept, packed by this build's kernel; each layer keeps its row order and the
+file its mark, and the new file replaces the old one. This is the one step here that deletes
+something: the old file, which this build cannot serve from. It needs the file's size free beside
+it, and no GPU. A bank file beside an *original* checkpoint needs none of this: the next start
+writes it over from the checkpoint.
+
 A packed checkpoint is only served with `--moe-bank-ram` and a CPU-capable expert kernel
 (`--moe-strategy hybrid`); without them the server stops before loading any weight and says so.
 A budget that covers every expert keeps them all resident. A new histogram reorders the bank in
@@ -446,6 +467,7 @@ original is not kept anywhere else, and do not point a cache cleaner at it.
 | `ft bank pack` | the shards that mix dense and expert tensors, rewritten (the dry run prints it); nothing for hard-linked ones | 3 shards rewritten, 4.9 GiB; 129 s, 3.7 GiB peak RSS |
 | `ft bank verify` | nothing | 42 s |
 | `ft bank unpack` | the whole original checkpoint, less what can be hard-linked | up to the checkpoint's size (22 GiB here) |
+| `ft bank rewrite` | the whole bank file again, beside the old one | 16.9 GiB (the old file is deleted at the end) |
 
 Measure the free space where the files actually land. **Under WSL2, `df` inside the distribution
 reports the virtual disk's own capacity, not the space left on the Windows drive that holds it**

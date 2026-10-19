@@ -5,13 +5,16 @@
     ft bank verify  --model-path SLIM [--moe-bank-dir D]
     ft bank unpack  --model-path SLIM --out FULL [--moe-bank-dir D] [--copy]
     ft bank reorder --model-path M --moe-bank-stats A.json [B.json ...] [--moe-bank-dir D]
+    ft bank rewrite --model-path SLIM [--moe-bank-dir D]
 
 ``pack`` writes a checkpoint without the expert tensors the bank file reproduces, after checking
 every one of them byte for byte, and moves the bank into it. It deletes nothing. ``verify``
 repeats the check on a packed checkpoint without the original; ``unpack`` writes the original
 files back, byte for byte, from a packed checkpoint and its bank. ``reorder`` applies a new
 placement to the bank file in place (the server does the same at startup for its own layers).
-None of them uses a GPU.
+``rewrite`` writes a packed checkpoint's bank file again in this build's bank layout, after a build
+that changed it (the fp32 NVFP4 globals of upstream #739), from the file and the tensors the slim
+checkpoint kept; it replaces the old file. None of them uses a GPU.
 """
 
 from __future__ import annotations
@@ -200,6 +203,24 @@ def cmd_reorder(args) -> int:
     return 0
 
 
+def cmd_rewrite(args) -> int:
+    from freetoken.moe.bank_pack import PackError, rewrite_bank
+
+    started = time.perf_counter()
+    try:
+        report = rewrite_bank(
+            args.model_path, config=_model_config(args.model_path),
+            bank_path=_bank_path(args) if args.moe_bank_dir else None, log=_say,
+        )
+    except PackError as exc:
+        print(f"ft bank rewrite: {exc}", file=sys.stderr)
+        return 1
+    if report["rewritten"]:
+        _say(f"wrote {report['bank']} again in this build's layout ({report['layers']} layers, "
+             f"{time.perf_counter() - started:.0f} s); the old file is gone. `ft bank verify` checks it")
+    return 0
+
+
 def main(argv: list[str] | None = None, prog: str = "ft bank") -> int:
     p = argparse.ArgumentParser(prog=prog, description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -240,6 +261,10 @@ def main(argv: list[str] | None = None, prog: str = "ft bank") -> int:
     common(sp)
     sp.add_argument("--moe-bank-stats", nargs="+", required=True, help="--moe-stats-out histograms (every rank's)")
     sp.set_defaults(fn=cmd_reorder)
+
+    sp = sub.add_parser("rewrite", help="write a packed checkpoint's bank file again in this build's bank layout")
+    common(sp)
+    sp.set_defaults(fn=cmd_rewrite)
 
     args = p.parse_args(argv)
     return args.fn(args)
