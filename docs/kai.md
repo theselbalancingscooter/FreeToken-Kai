@@ -1,7 +1,7 @@
 # FreeToken Kai (改)
 
 An unofficial fork of [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken),
-merged with upstream `main` at commit `8f49e0a` (2026-10-17). It is not affiliated with, endorsed
+merged with upstream `main` at commit `5596e6b` (2026-10-20). It is not affiliated with, endorsed
 by, or supported by FlashML. The license is unchanged (Apache-2.0).
 
 The fork adds eleven things upstream does not have:
@@ -309,6 +309,20 @@ format at the executor's shape, which that flag benches at the checkpoint's shap
 profile has the layer's kind but not at the server's `--moe-cpu-threads`, this fork takes the row
 benched with the nearest thread count and says so in the log (upstream would fall back to one
 fetched expert per layer per step); `--cpu-threads <n>` on the bench measures the exact count.
+
+Upstream `fd410ee`..`5596e6b` (6 commits, merged 2026-10-20) keeps the NVFP4 per-row global
+scales in fp32 (#739: as fp16, up to 97% of a checkpoint's expert globals were subnormal, up to
+1.7e-3 off per row; an FTW that stores them as fp16 is refused, reconvert it with `ft checkpoint`),
+reads the e4m3 scales of the Triton prefill GEMM as int32 words on GeForce sm_86 / sm_89 (#735,
+1.03-1.19x per layer on a 4090 / 3080 Ti), and runs the NVFP4 MoE prefill and dense linears on
+NVFP4 activations on sm_120 (#736, #737). The fork's side: Turing keeps the fp16 pair decode ahead
+of the new tuning table; the `fp16_to_f32` helper upstream dropped stays for the fork's GGUF Q4_0 /
+Q2_0 CPU formats (`kernels/kai_fp16.h`); the `--spec-mtp` draft head is quantized with fp32 globals
+like the banks it joins; and every NVFP4 bank file of `--moe-bank-ram` written before has fp16
+global rows, which this build's layout check rejects -- a file beside an original checkpoint is
+written again by the next start, a packed checkpoint's by the new `ft bank rewrite`
+([bank-ram.md](bank-ram.md#5-optional-drop-the-second-copy-ft-bank-pack)). The `ft bench bw`
+profile is unchanged.
 
 ## Running Ornith-1.5-35B-A3B on an RTX 2060 (6 GB) under WSL2
 

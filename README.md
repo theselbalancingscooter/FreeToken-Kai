@@ -9,7 +9,7 @@ how they trade against each other on your card. Now a benchmark in the browser m
 with the model, tries the settings one at a time, and hands you the fastest as a launch profile.
 
 > An unofficial fork of [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken), merged
-> with upstream `main` at `8f49e0a` (2026-10-17). Not affiliated with, endorsed by, or supported by
+> with upstream `main` at `5596e6b` (2026-10-20). Not affiliated with, endorsed by, or supported by
 > FlashML. The license is unchanged (Apache-2.0).
 >
 > **Please keep questions and bug reports about this fork in this repository.** The FreeToken
@@ -42,6 +42,14 @@ with the model, tries the settings one at a time, and hands you the fastest as a
    engine reads each layer's own row, and profiles written before are ignored; without a row a
    `hybrid` server fetches one expert per layer per step instead of the measured share. For the
    Q2_0 tier add `--formats q2_0`.
+
+   The merge of 2026-10-20 follows upstream #739 to fp32 NVFP4 global scales (they were fp16,
+   where most of them were subnormal). After pulling past it, rebuild the extensions (the
+   `uv pip install -e` above does), and expect every NVFP4 bank file of `--moe-bank-ram` to be
+   written again: one beside an original checkpoint by the next start, a packed checkpoint's by
+   `ft bank rewrite --model-path <slim>` (the start stops and says so;
+   [docs/bank-ram.md](docs/bank-ram.md)). An NVFP4 FTW converted by an older build is refused at
+   load; reconvert it with `ft checkpoint`. The `ft bench bw` profile is unchanged.
 
 2. **Open the console.**
 
