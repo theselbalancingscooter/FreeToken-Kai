@@ -7,7 +7,7 @@ from freetoken.core import get_global_ctx
 from freetoken.models.prefill_pieces import plan_prefill_pieces
 from freetoken.layers import (
     BaseOP,
-    GemmaRMSNorm,
+    GemmaPlusOneRMSNormFused,
     HostEmbedding,
     LinearReplicated,
     OPList,
@@ -68,8 +68,8 @@ class Qwen3_5DecoderLayer(BaseOP):
             if config.moe_enabled
             else Qwen3_5DenseMLP(config, prefix=f"{prefix}.mlp")
         )
-        self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = GemmaPlusOneRMSNormFused(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = GemmaPlusOneRMSNormFused(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward_pieces(self, hidden: torch.Tensor, residual: torch.Tensor | None, pieces, ctx):
         """forward() with the sequence mixer run over consecutive pieces of the chunk and the
@@ -77,33 +77,23 @@ class Qwen3_5DecoderLayer(BaseOP):
         them with the mixer and joining before the MoE changes no arithmetic."""
         outs, resids = [], []
         for start, end, piece in pieces:
-            h = hidden[start:end]
-            if residual is None:
-                r = h
-                h = self.input_layernorm.forward(h)
-            else:
-                h, r = self.input_layernorm.forward_add_residual(h, residual[start:end])
+            h, r = self.input_layernorm.forward(hidden[start:end], None if residual is None else residual[start:end])
             with ctx.piece_batch(piece):
                 h = self.linear_attn.forward(h) if self._is_linear else self.self_attn.forward(h)
             outs.append(h)
             resids.append(r)
         hidden = torch.cat(outs)
         residual = torch.cat(resids)
-        hidden, residual = self.post_attention_layernorm.forward_add_residual(hidden, residual)
+        hidden, residual = self.post_attention_layernorm.forward(hidden, residual)
         hidden = self.mlp.forward(hidden)
         return hidden, residual
 
     @nvtx_annotate("Layer_{}", layer_id_field="_layer_id")
     def forward(self, hidden: torch.Tensor, residual: torch.Tensor | None):
-        # Residual-stream form: fuse each residual-add into the next RMSNorm
-        # (GemmaRMSNorm.forward_add_residual) so add + norm are one kernel per sublayer.
-        if residual is None:
-            residual = hidden
-            hidden = self.input_layernorm.forward(hidden)
-        else:
-            hidden, residual = self.input_layernorm.forward_add_residual(hidden, residual)
+        # Residual-stream form: fuse each residual-add into the next RMSNorm so add + norm are one kernel per sublayer.
+        hidden, residual = self.input_layernorm.forward(hidden, residual)
         hidden = self.linear_attn.forward(hidden) if self._is_linear else self.self_attn.forward(hidden)
-        hidden, residual = self.post_attention_layernorm.forward_add_residual(hidden, residual)
+        hidden, residual = self.post_attention_layernorm.forward(hidden, residual)
         hidden = self.mlp.forward(hidden)
         return hidden, residual
 
@@ -129,8 +119,8 @@ class Qwen3_5MTP(BaseOP):
 
         hidden = config.hidden_size
         self.layer_id = layer_id
-        self.pre_fc_norm_embedding = GemmaRMSNorm(hidden, eps=config.rms_norm_eps)
-        self.pre_fc_norm_hidden = GemmaRMSNorm(hidden, eps=config.rms_norm_eps)
+        self.pre_fc_norm_embedding = GemmaPlusOneRMSNormFused(hidden, eps=config.rms_norm_eps)
+        self.pre_fc_norm_hidden = GemmaPlusOneRMSNormFused(hidden, eps=config.rms_norm_eps)
         self.fc = LinearReplicated(2 * hidden, hidden, has_bias=False)
         head_config = replace(
             draft_head_config(config, dense_from_model=False),
@@ -138,7 +128,7 @@ class Qwen3_5MTP(BaseOP):
             dense_quant="none",
         )
         self.layers = OPList([Qwen3_5DecoderLayer(head_config, layer_id, moe_layer_offset=moe_layer_offset)])
-        self.norm = GemmaRMSNorm(hidden, eps=config.rms_norm_eps)
+        self.norm = GemmaPlusOneRMSNormFused(hidden, eps=config.rms_norm_eps)
         # the head shares the target's embedding; a pipeline rank without the embedding table
         # carries its own copy (mtp.embed_tokens, duplicated by the loader) in pinned host
         # memory, gathered by the GPU in place (so the head's graphs can embed too)
@@ -157,11 +147,11 @@ class Qwen3_5MTP(BaseOP):
             # an image row's successor id is a content pad id past the vocab: the head embeds
             # the placeholder token there, as the PLE hash does
             next_ids = restore_placeholder(next_ids, self._image_token_id)
-        e = self.pre_fc_norm_embedding.forward(emb.forward(next_ids).to(hidden.dtype))
-        h = self.pre_fc_norm_hidden.forward(hidden)
+        e, _ = self.pre_fc_norm_embedding.forward(emb.forward(next_ids).to(hidden.dtype))
+        h, _ = self.pre_fc_norm_hidden.forward(hidden)
         x = self.fc.forward(torch.cat([e, h], dim=-1))
         x, residual = self.layers.op_list[0].forward(x, None)
-        x, _ = self.norm.forward_add_residual(x, residual)
+        x, _ = self.norm.forward(x, residual)
         return x
 
     @staticmethod
@@ -202,7 +192,7 @@ class Qwen3_5Model(BaseOP):
                 for layer_id in range(config.num_layers)
             ]
         )
-        self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps) if win.last else None
+        self.norm = GemmaPlusOneRMSNormFused(config.hidden_size, eps=config.rms_norm_eps) if win.last else None
         # indices, not layer objects: the offload-cache walk visits every tuple on the model
         self._local_ids = win.local_ids
 
@@ -250,7 +240,7 @@ class Qwen3_5Model(BaseOP):
                 dbg.append((i, (residual + x).detach().clone()))
         if not self._window.last:
             return x + residual  # the residual stream for the next pipeline rank
-        x, _ = self.norm.forward_add_residual(x, residual)
+        x, _ = self.norm.forward(x, residual)
         self._last_hidden = x  # the MTP draft head reads the final hidden state (lm_head input)
         return x
 

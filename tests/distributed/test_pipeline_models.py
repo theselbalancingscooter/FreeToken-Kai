@@ -202,6 +202,13 @@ def test_nvfp4_reader_leaves_bank_ids_global(monkeypatch):
     from freetoken.models.qwen4_exp.weight import nvfp4_expert_spec
     from freetoken.moe.expert_banks import _local_pieces
 
+    # since upstream #759 the spec takes the expert tensor names from the installed QuantConfig
+    import freetoken.layers.quantization.configs as configs_mod
+    from freetoken.layers.quantization import QuantConfig, set_quant_config
+    from tests.models.qwen4_exp.common import RADIXARK_NVFP4
+
+    monkeypatch.setattr(configs_mod, "_QUANT_CONFIG", configs_mod._QUANT_CONFIG)
+    set_quant_config(QuantConfig.from_hf(SimpleNamespace(quantization_config=RADIXARK_NVFP4)))
     cfg = SimpleNamespace(num_layers=48, num_moe_layers=24, first_k_dense_replace=0)
     spec = nvfp4_expert_spec("", cfg)
 

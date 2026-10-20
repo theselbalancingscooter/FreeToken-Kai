@@ -35,16 +35,6 @@ _EXPERT_KEY_RE = (
 # role -> the expert bank reader's canonical (ModelOpt) tensor kind
 _BANK_KINDS = {"weight": "weight", "weight_scale": "weight_scale", "weight_global": "weight_scale_2"}
 
-# Gemma-style (1+weight) RMSNorm weights; the GDN gated norm (linear_attn.norm) is a plain weight*x norm
-_GEMMA_NORM_SUFFIXES = (
-    ".input_layernorm.weight",
-    ".post_attention_layernorm.weight",
-    ".self_attn.q_norm.weight",
-    ".self_attn.k_norm.weight",
-    # the MTP draft head's norms (same (1+w) RMSNorm as the decoder)
-    ".pre_fc_norm_embedding.weight",
-    ".pre_fc_norm_hidden.weight",
-)
 # leaves the model builds as Linear layers: only their tensors are read under the QuantConfig, the rest passes through as stored
 _LINEAR_LEAVES = frozenset({
     "q_proj", "k_proj", "v_proj", "o_proj", "in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "out_proj",
@@ -74,10 +64,6 @@ def _rename(raw_name: str, keep_mtp: bool = False) -> str | None:
     if raw_name.endswith((".k_scale", ".v_scale", ".q_scale", ".prob_scale")):
         return None
     return rename_vl_prefix(raw_name)
-
-
-def _is_gemma_norm(name: str) -> bool:
-    return name in ("model.norm.weight", "mtp.norm.weight") or name.endswith(_GEMMA_NORM_SUFFIXES)
 
 
 def _per_row_scale(scale: torch.Tensor, rows: int) -> torch.Tensor:
@@ -162,7 +148,7 @@ class _DenseReader:
         if module.rpartition(".")[2] not in _LINEAR_LEAVES:
             return None
         stored = self.stored(module)
-        roles = {"weight": "weight"} if stored is None else {e.name: r for r, e in self.quant.storage(stored).items()}
+        roles = {"weight": "weight"} if stored is None else {n: r for r, e in self.quant.storage(stored).items() for n in e.names}
         role = roles.get(suffix)
         if role is None:
             if suffix in _DROPPED_SUFFIXES:
@@ -335,8 +321,6 @@ def _iter_shards(
                 emitted = reader.add(name, tensor)
                 if emitted is not None:
                     yield from emitted
-                elif _is_gemma_norm(name):
-                    yield name, tensor + 1.0  # (1 + weight) baked into the stored norm weight
                 else:
                     yield name, tensor
     if reader is not None and reader.pending:
