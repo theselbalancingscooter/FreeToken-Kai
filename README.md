@@ -9,7 +9,7 @@ how they trade against each other on your card. Now a benchmark in the browser m
 with the model, tries the settings one at a time, and hands you the fastest as a launch profile.
 
 > An unofficial fork of [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken), merged
-> with upstream `main` at `5596e6b` (2026-10-20). Not affiliated with, endorsed by, or supported by
+> with upstream `main` at `cc56b6b` (2026-10-20). Not affiliated with, endorsed by, or supported by
 > FlashML. The license is unchanged (Apache-2.0).
 >
 > **Please keep questions and bug reports about this fork in this repository.** The FreeToken
@@ -49,7 +49,11 @@ with the model, tries the settings one at a time, and hands you the fastest as a
    written again: one beside an original checkpoint by the next start, a packed checkpoint's by
    `ft bank rewrite --model-path <slim>` (the start stops and says so;
    [docs/bank-ram.md](docs/bank-ram.md)). An NVFP4 FTW converted by an older build is refused at
-   load; reconvert it with `ft checkpoint`. The `ft bench bw` profile is unchanged.
+   load; reconvert it with `ft checkpoint`. The `ft bench bw` profile is unchanged. The same day's
+   second merge follows upstream #755: Qwen3.5 / 3.6 / 3.8-27B add the 1 of their zero-centred
+   norm weights in fp32 at runtime, so an FTW of those models converted by an older build loads
+   without an error and answers wrongly; reconvert it with `ft checkpoint` (HF checkpoints are
+   unaffected).
 
 2. **Open the console.**
 

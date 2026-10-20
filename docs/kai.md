@@ -1,7 +1,7 @@
 # FreeToken Kai (改)
 
 An unofficial fork of [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken),
-merged with upstream `main` at commit `5596e6b` (2026-10-20). It is not affiliated with, endorsed
+merged with upstream `main` at commit `cc56b6b` (2026-10-20). It is not affiliated with, endorsed
 by, or supported by FlashML. The license is unchanged (Apache-2.0).
 
 The fork adds eleven things upstream does not have:
@@ -323,6 +323,17 @@ global rows, which this build's layout check rejects -- a file beside an origina
 written again by the next start, a packed checkpoint's by the new `ft bank rewrite`
 ([bank-ram.md](bank-ram.md#5-optional-drop-the-second-copy-ft-bank-pack)). The `ft bench bw`
 profile is unchanged.
+
+Upstream `163d1de`..`cc56b6b` (6 commits, merged the same evening) adds the 1 of the Qwen3.5 /
+3.6 / 3.8-27B zero-centred norm weights in fp32 at runtime instead of baking it into the loaded
+weight (#755: an FTW of those models converted by an older build loads and answers wrongly,
+reconvert it with `ft checkpoint`; the fork's `--spec-mtp` draft head and its pipeline-split
+model follow the same norm), rewrites the Qwen3.8-Flash-Next dense reader around the
+checkpoint's quant config (#759: llm-compressor and compressed-tensors exports; the fork reads
+each part under the scheme the shard stores it in, which is what lets `--dense-quant` report a
+bf16 projection as fp8), loads Flash-Next GGUFs with a quantized indexer (#760), serves
+GLM-5.3-Flash GGUFs on `glm5_next` (#721), accepts `file://localhost/...` image URIs (#758) and
+adds the `scripts/checkpoint_diagnose` tools (#762).
 
 ## Running Ornith-1.5-35B-A3B on an RTX 2060 (6 GB) under WSL2
 
