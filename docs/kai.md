@@ -1,7 +1,7 @@
 # FreeToken Kai (改)
 
 An unofficial fork of [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken),
-merged with upstream `main` at commit `cc56b6b` (2026-10-20). It is not affiliated with, endorsed
+merged with upstream `main` at commit `cc4aa08` (2026-10-21). It is not affiliated with, endorsed
 by, or supported by FlashML. The license is unchanged (Apache-2.0).
 
 The fork adds eleven things upstream does not have:
@@ -335,6 +335,19 @@ bf16 projection as fp8), loads Flash-Next GGUFs with a quantized indexer (#760),
 GLM-5.3-Flash GGUFs on `glm5_next` (#721), accepts `file://localhost/...` image URIs (#758) and
 adds the `scripts/checkpoint_diagnose` tools (#762).
 
+Upstream `c5b5b72`..`cc4aa08` (4 commits, release 0.2.0, merged 2026-10-21) lets hybrid decode
+fetch part of a locked layer's misses into GPU slots of its own through pinned staging that CPU
+threads fill (#742: `--moe-locked-fetch`, `--moe-locked-max-fetch`; a locked layer is one whose
+banks the pin quota could not take, which until now decoded on the CPU alone), logs decode MoE
+stats per layer group with `--moe-collect-stats`, and makes `--moe-cpu-layers auto` on WSL pin the
+banks middle-out until CUDA refuses one. The fork's side: that load-time probe is opt-in
+(`FREETOKEN_PIN_PROBE=1`): a refused `cudaHostRegister` has taken down WSL hosts of this fork's
+size, so `auto` keeps planning against the cap `ft doctor pin` recorded; `--moe-bank-ram` maps its
+banks and takes no staged fetch (its non-resident rows decode on the CPU as before); the stats
+counters stay cumulative for the web console, so the new log line diffs its own snapshot instead
+of zeroing them; and `--moe-collect-stats` is on by default here, so that line comes with it
+(`--no-moe-collect-stats` turns both off).
+
 ## Running Ornith-1.5-35B-A3B on an RTX 2060 (6 GB) under WSL2
 
 ```bash
@@ -597,6 +610,7 @@ model that does). Not yet measured on a card.
 
 | Variable | Default | Meaning |
 |---|---|---|
+| `FREETOKEN_PIN_PROBE` | unset | `1` turns on upstream's load-time pin probe under `--moe-cpu-layers auto` (#742: pin the banks from the middle layers out until CUDA refuses one, OS-lock the rest). Off here by default: a refused `cudaHostRegister` has taken down WSL hosts of this fork's size, so `auto` plans against the cap `ft doctor pin` recorded (or the estimate) |
 | `FT_IMAGE_EMBED_CACHE` | `32` | `--mm-encoder-weights cpu`: images whose embeddings the tokenizer worker keeps, by content hash (chat clients resend every image each turn); `0` disables |
 | `FREETOKEN_FP8_SCRATCH_GEMM` | arch (on below Ampere) | fp8 W8A16 prefill GEMM as dequant + cuBLAS instead of the inline-dequant Triton kernel |
 | `FREETOKEN_NVFP4_MOE_SCRATCH` | arch (on below Ampere) | NVFP4 prefill MoE as chunked dequant + per-expert cuBLAS instead of the inline-dequant kernel |
