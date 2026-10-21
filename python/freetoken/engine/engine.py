@@ -31,8 +31,9 @@ from freetoken.models import create_model, load_weight
 from freetoken.models.weight import ftw_lacks_vision
 from freetoken.moe import is_offload_moe_strategy
 from freetoken.moe.bank_file import BankFileError
-from freetoken.moe.expert_banks import attach_resident_banks, load_expert_banks
+from freetoken.moe.expert_banks import attach_resident_banks, load_expert_banks, pin_probe_enabled
 from freetoken.moe.host_banks import HostResidency as _HostResidency, PinFailed
+from freetoken.moe.locked_fetch import attach_locked_fetch, check_locked_fetch_config, locked_pool_tags, settle_banks, staging_reserve
 from freetoken.moe.offload_cache import OffloadMoeCache, attach_offload_moe_cache, bank_layouts
 from freetoken.moe.pool_policy import group_layers, make_pools, pool_of_layer, resolve_profile, split_slots
 from freetoken.utils import (
@@ -1626,44 +1627,6 @@ class Engine:
                 "this model's experts come in several formats, which are served from per-format GPU slot pools; "
                 "they do not combine with --moe-strategy cpu or --moe-cpu-layers (use offload or hybrid)"
             )
-        cpu_layer_ids = _resolve_cpu_layers(config, num_moe_layers, reserved=self._host_tables_bytes, method=method)
-        if not config.moe_bank_ram:
-            # --moe-bank-ram answers the pin budget its own way: the banks are a file mapping
-            # and only the resident prefix is locked, so banks over the budget are the plan
-            _check_pin_budget(config, reserved=self._host_tables_bytes, method=method, layer_methods=layer_methods)
-        # the kernels were picked for model_config.decode_target; --moe-cpu-layers auto may still find that every bank fits the pin budget
-        decode_target = config.model_config.decode_target
-        if decode_target == "cpu" and not cpu_layer_ids:
-            decode_target = "gpu"
-        # split residency: where pinning is quota-capped (_pin_budget_bytes), pin only the GPU layers' banks and mlock the CPU layers'
-        # uncapped hosts keep every bank pinned (CPU decode reads them the same; overlap prefill stays on)
-        # not applied to plain --moe-strategy cpu; all-locked under a cap = --moe-strategy offload --moe-cpu-layers 1.0
-        split_residency = (
-            bool(cpu_layer_ids)
-            and config.moe_strategy in ("offload", "hybrid")
-            and _pin_budget_bytes(self._host_tables_bytes) is not None
-        )
-        if config.moe_strategy == "cpu" and not split_residency:
-            # cpu mode pins every bank for the prefill double buffer; over the pin cap that dies in cudaHostRegister, so lock everything instead
-            from freetoken.moe.expert_banks import bank_bytes_estimate, ftw_bank_bytes
-
-            budget = _pin_budget_bytes(self._host_tables_bytes)
-            bank_bytes = None
-            if budget is not None:
-                bank_bytes = ftw_bank_bytes(config.model_path) or bank_bytes_estimate(config.model_config, method)
-            if bank_bytes and bank_bytes > budget:
-                split_residency = True
-                logger.info_rank0(
-                    f"--moe-strategy cpu: banks {bank_bytes / 2**30:.2f} GiB exceed the "
-                    f"pin budget; OS-locking all layers instead of pinning"
-                )
-        if split_residency and config.moe_prefill_overlap:
-            # locked (unregistered) layers cannot feed the async pinned H2D double buffer; their prefill is a synchronous pageable copy via materialize
-            logger.info_rank0(
-                "--moe-cpu-layers split residency: disabling MoE prefill overlap "
-                "(locked layers prefill via synchronous pageable copies)"
-            )
-            object.__setattr__(config, "moe_prefill_overlap", False)
         # Fast path: an FTW checkpoint loads its repacked banks directly.
         # Slow path: load_expert_banks auto-picks parallel vs serial baseline by
         # expert-tensor granularity. Both pin-after-fill.
@@ -1675,15 +1638,36 @@ class Engine:
         # checkpoint's expert tensors are not opened at all
         banks_from_file = bank_tier is not None and not config.use_dummy_weight and bank_tier.prepare()
         expert_parallel = {"serial": False, "parallel": True}.get(config.expert_load, None)
-        requested_residency = None
-        if split_residency:
+        check_locked_fetch_config(config)
+        # --moe-cpu-layers auto without a manual pin budget: load unpinned, then pin layers until the driver refuses (settle_banks)
+        # a model the CPU executor cannot serve takes the estimate path, which rejects it before the load when layers must lock
+        probe = (
+            _pin_probe_opted_in(config)
+            and pin_probe_enabled(config, mixed_formats=layer_methods is not None)
+            and _cpu_moe_executor_viable(config.model_config)
+        )
+        if probe:
             from freetoken.moe.host_banks import HostResidency
 
-            requested_residency = [
-                HostResidency.LOCKED.value if i in cpu_layer_ids
-                else HostResidency.PINNED.value
-                for i in range(config.model_config.num_moe_layers)
-            ]
+            requested_residency = [HostResidency.DEFERRED.value] * num_moe_layers
+            cpu_layer_ids, decode_target, split_residency = frozenset(), None, False
+        else:
+            reserved = self._host_tables_bytes + staging_reserve(config, lambda: _bank_bytes(config, method, layer_methods))
+            cpu_layer_ids = _resolve_cpu_layers(config, num_moe_layers, reserved=reserved, method=method)
+            if not config.moe_bank_ram:
+                # --moe-bank-ram answers the pin budget its own way: the banks are a file mapping
+                # and only the resident prefix is locked, so banks over the budget are the plan
+                _check_pin_budget(config, reserved=reserved, method=method, layer_methods=layer_methods)
+            decode_target, split_residency = self._residency_split(config, cpu_layer_ids, method, capped=_pin_budget_bytes(reserved) is not None)
+            requested_residency = None
+            if split_residency:
+                from freetoken.moe.host_banks import HostResidency
+
+                requested_residency = [
+                    HostResidency.LOCKED.value if i in cpu_layer_ids
+                    else HostResidency.PINNED.value
+                    for i in range(config.model_config.num_moe_layers)
+                ]
         # read before the expert load, so a bad profile fails in seconds
         expert_counts = resolve_profile(
             config.moe_cache_split, config.model_path,
@@ -1733,6 +1717,12 @@ class Engine:
                 # answer. Per rank, and said by every rank: each registers its own layers.
                 logger.info(f"--moe-bank-ram: disabling MoE prefill overlap ({blocker})")
                 object.__setattr__(config, "moe_prefill_overlap", False)
+        # Kai: a mapped bank (--moe-bank-ram) has no locked layers for the staged fetch to serve; its
+        # non-resident rows take the CPU executor (_mapped_cpu_layers below)
+        banks, probed, staging = settle_banks(config, banks, probe=probe, has_locked=split_residency and bank_tier is None)
+        if probe:
+            cpu_layer_ids = probed
+            decode_target, split_residency = self._residency_split(config, cpu_layer_ids, method, capped=True)
         self._mtp_bank_layers = self._append_mtp_bank(banks)
         from freetoken.engine.cache_budget import expert_bytes_per_slot, layer_slot_bytes
 
@@ -1740,11 +1730,19 @@ class Engine:
             # Kai: the profile counts the model's MoE layers; the appended draft-head layer gets their mean
             expert_counts = torch.cat([expert_counts, expert_counts.mean(dim=0, keepdim=True)])
         self._moe_layer_slot_bytes = layer_slot_bytes(banks.sources)
-        self._moe_pool_groups = group_layers(config.moe_cache_scope, bank_layouts(banks.sources, banks.layer_tags), self._moe_layer_slot_bytes)
-        if len(self._moe_pool_groups) > 1 and cpu_layer_ids:
+        # hybrid: locked layers keep GPU slots of their own pools and fetch part of their misses through the pinned staging (moe/locked_fetch.py)
+        locked_fetch = staging is not None
+        # the --spec-mtp draft head's bank layer (Kai) follows the model's MoE layers
+        layer_tags = locked_pool_tags(banks.layer_tags, cpu_layer_ids, num_moe_layers + self._mtp_bank_layers) if locked_fetch else banks.layer_tags
+        self._moe_pool_groups = group_layers(config.moe_cache_scope, bank_layouts(banks.sources, layer_tags), self._moe_layer_slot_bytes)
+        if locked_fetch:
+            # a locked refill costs a staged copy: place the locked pools after the pinned ones, which hold the prefill staging when they are big enough
+            self._moe_pool_groups.sort(key=lambda layers: layers[0] in cpu_layer_ids)
+        if len(self._moe_pool_groups) > 1 and cpu_layer_ids and not locked_fetch:
             raise ValueError(
                 "several MoE slot pools (--moe-cache-scope per-layer, or experts in several quant formats) need every MoE "
-                "layer to decode from the GPU slot cache; they do not combine with --moe-strategy cpu or --moe-cpu-layers"
+                "layer to decode from the GPU slot cache; they combine with --moe-cpu-layers only for locked layers under "
+                "--moe-strategy hybrid unless --moe-locked-fetch is 0"
             )
         self._moe_expert_counts = expert_counts if len(self._moe_pool_groups) > 1 else None
         if len(self._moe_pool_groups) == 1 and config.moe_cache_split != "equal":
@@ -1857,6 +1855,8 @@ class Engine:
             # residency label below declares, and set_bank_sources checks the two agree.
             # This costs the VRAM expert cache, so it is the fallback, not the plan.
             cache.cpu_layer_ids = frozenset(cpu_layer_ids | mapped_cpu)
+        if locked_fetch:
+            cache.locked_hybrid = cpu_layer_ids
         cache.set_bank_sources(
             banks.sources,
             # a mapped bank is mlocked, not registered, which is exactly what LOCKED
@@ -1873,7 +1873,7 @@ class Engine:
                 if bank_tier is not None
                 else banks.layer_residency
             ),
-            layer_tags=banks.layer_tags,
+            layer_tags=layer_tags,
             row_tail_bytes=banks.row_tail_bytes,
         )
         cache.set_alphas(banks.gate_up_alpha, banks.down_alpha)
@@ -1910,9 +1910,48 @@ class Engine:
             self._enable_bank_prefetch(bank_tier)
         if decode_target == "hybrid":
             self._resolve_hybrid_fetch(config, cache)
+        if locked_fetch:
+            attach_locked_fetch(cache, config, staging, lambda: self._profile_layer_rows(cache))
         self.ctx.moe_offload_cache = cache
         self.moe_offload_cache = cache
         return cache
+
+    def _residency_split(self, config: EngineConfig, cpu_layer_ids, method, *, capped: bool):
+        """(decode_target, split_residency) for a CPU-layer set; turns prefill overlap off when some layers stay unpinned."""
+        # the kernels were picked for model_config.decode_target; --moe-cpu-layers auto may still find that every bank fits the pin budget
+        decode_target = config.model_config.decode_target
+        if decode_target == "cpu" and not cpu_layer_ids:
+            decode_target = "gpu"
+        # split residency: where pinning is quota-capped (_pin_budget_bytes), pin only the GPU layers' banks and mlock the CPU layers'
+        # uncapped hosts keep every bank pinned (CPU decode reads them the same; overlap prefill stays on)
+        # not applied to plain --moe-strategy cpu; all-locked under a cap = --moe-strategy offload --moe-cpu-layers 1.0
+        split_residency = (
+            bool(cpu_layer_ids)
+            and config.moe_strategy in ("offload", "hybrid")
+            and capped
+        )
+        if config.moe_strategy == "cpu" and not split_residency:
+            # cpu mode pins every bank for the prefill double buffer; over the pin cap that dies in cudaHostRegister, so lock everything instead
+            from freetoken.moe.expert_banks import bank_bytes_estimate, ftw_bank_bytes
+
+            budget = _pin_budget_bytes(self._host_tables_bytes)
+            bank_bytes = None
+            if budget is not None:
+                bank_bytes = ftw_bank_bytes(config.model_path) or bank_bytes_estimate(config.model_config, method)
+            if bank_bytes and bank_bytes > budget:
+                split_residency = True
+                logger.info_rank0(
+                    f"--moe-strategy cpu: banks {bank_bytes / 2**30:.2f} GiB exceed the "
+                    f"pin budget; OS-locking all layers instead of pinning"
+                )
+        if split_residency and config.moe_prefill_overlap:
+            # locked (unregistered) layers cannot feed the async pinned H2D double buffer; their prefill is a synchronous pageable copy via materialize
+            logger.info_rank0(
+                "--moe-cpu-layers split residency: disabling MoE prefill overlap "
+                "(locked layers prefill via synchronous pageable copies)"
+            )
+            object.__setattr__(config, "moe_prefill_overlap", False)
+        return decode_target, split_residency
 
     def _moe_pool_bytes(self, pool_sizes: list[int]) -> int:
         return sum(s * self._moe_layer_slot_bytes[g[0]] for g, s in zip(self._moe_pool_groups, pool_sizes))
@@ -1936,43 +1975,20 @@ class Engine:
         """
         if config.moe_hybrid_max_fetch >= 0:
             return  # explicit fixed cap
-        from freetoken.moe.bench_profile import fetch_fraction, layer_kind_key, load_layer_kinds
-        from freetoken.moe.cpu_executor import _format_label
+        from freetoken.moe.bench_profile import fetch_fraction
 
         cache.hybrid_max_fetch = 1
-        gpu_name, gpu_uuid = _profile_gpu(self.device.index)
-        rows = load_layer_kinds(gpu_name=gpu_name, gpu_uuid=gpu_uuid) or {}
+        layer_rows = self._profile_layer_rows(cache)
+        if layer_rows is None:
+            logger.warning_rank0("--moe-hybrid-max-fetch auto: the MoE layers bind no expert method to look up in the `ft bench bw` profile; using a fixed fetch cap of 1")
+            return
         executor = self.cpu_moe_executor
-        methods = offload_layer_methods(self.model)
-        # (format, options, hidden, intermediate, top_k) of every bank layer the cache serves
-        if methods is None:
-            # Kai: the fork's GGUF expert banks (--moe-expert-gguf, Q2_0 / Q4_0) bind no expert method; every layer
-            # is one kind, in the cache's format at the executor's shape (`ft bench bw --model <checkpoint> --formats q2_0`)
-            kinds = [(cache.quant_format, {}, executor.H, executor.I, executor.top_k)] * int(cache.num_layers)
-        else:
-            kinds = []
-            for m in methods:
-                fmt, opts = m.cpu_spec()
-                c = m.cfg
-                kinds.append((fmt, opts, c.hidden, c.local_intermediate, c.top_k))
-            # the --spec-mtp draft head's bank layer (Kai) follows the model's MoE layers and is quantized like the last
-            kinds += [kinds[-1]] * (int(cache.num_layers) - len(kinds))
-        keys, labels, used, borrowed = [], [], [], {}
-        for fmt, opts, hidden, inter, top_k in kinds:
-            key = layer_kind_key(fmt, opts, hidden, inter, top_k, executor.num_threads)
-            row = rows.get(key)
-            if row is None:
-                # Kai: a row of the same kind benched with another worker count stands in (the nearest count) -- the
-                # bandwidths move a little with the threads, the fixed cap of 1 costs 3-5% (docs/kai.md)
-                row, threads = _nearest_thread_row(rows, key, executor.num_threads)
-                if row is not None:
-                    borrowed[key] = threads
-            keys.append(key)
-            used.append(row)
-            labels.append(f"{_format_label(fmt, tuple(sorted(opts.items())))} {hidden}x{inter}")
-        fractions = [fetch_fraction(row) for row in used]
+        keys, labels, rows = layer_rows
+        borrowed = self._profile_borrowed
+        fractions = [fetch_fraction(rows.get(key)) for key in keys]
         cache.hybrid_fetch_fraction = [f or 0.0 for f in fractions]
-        groups = collections.Counter(zip(labels, fractions))
+        # locked layers fetch the fetch_plan share instead; their own log line lists it
+        groups = collections.Counter((labels[l], fractions[l]) for l in range(len(keys)) if l not in cache.locked_hybrid)
         fetched = [f"{f:.1%} on {n} {label} layers" for (label, f), n in groups.items() if f is not None]
         if fetched:
             logger.info_rank0(
@@ -1992,12 +2008,51 @@ class Engine:
                 f"--moe-hybrid-max-fetch auto: no `ft bench bw` row for {capped} MoE layers ({', '.join(missing)}) at "
                 f"{executor.num_threads} CPU threads; using a fixed fetch cap of 1 there. `ft bench bw --model <checkpoint>` benches each layer kind"
             )
-        benched_isas = {row.get("cpu_moe_isa") for row, f in zip(used, fractions) if f is not None} - {None}
+        benched_isas = {rows[key].get("cpu_moe_isa") for key, f in zip(keys, fractions) if f is not None} - {None}
         if other := sorted(benched_isas - set(executor.isa.split(","))):
             logger.warning_rank0(
                 f"--moe-hybrid-max-fetch auto: some `ft bench bw` rows were benched on CPU kernels {other}, but this executor runs "
                 f"{executor.isa}; using them anyway"
             )
+
+    def _profile_layer_rows(self, cache=None):
+        """(row key, label) of each bank layer's kind in the `ft bench bw` profile, and the profile's rows.
+
+        Kai: the fork's GGUF expert banks (--moe-expert-gguf, Q2_0 / Q4_0) bind no expert method, so every layer is one kind,
+        in the cache's format at the executor's shape (`ft bench bw --model <checkpoint> --formats q2_0`); the --spec-mtp
+        draft head's bank layer follows the model's MoE layers and is quantized like the last. A row of the same kind
+        benched with another worker count stands in for a missing one (the nearest count, listed in
+        ``_profile_borrowed``): the bandwidths move a little with the threads, the fixed cap of 1 costs 3-5% (docs/kai.md).
+        """
+        from freetoken.moe.bench_profile import layer_kind_key, load_layer_kinds
+        from freetoken.moe.cpu_executor import _format_label
+
+        cache, executor = (cache if cache is not None else self.moe_offload_cache), self.cpu_moe_executor
+        gpu_name, gpu_uuid = _profile_gpu(self.device.index)
+        rows = dict(load_layer_kinds(gpu_name=gpu_name, gpu_uuid=gpu_uuid) or {})
+        methods = offload_layer_methods(self.model)
+        # (format, options, hidden, intermediate, top_k) of every bank layer the cache serves
+        if methods is None:
+            kinds = [(cache.quant_format, {}, executor.H, executor.I, executor.top_k)] * int(cache.num_layers)
+        else:
+            kinds = []
+            for m in methods:
+                fmt, opts = m.cpu_spec()
+                c = m.cfg
+                kinds.append((fmt, opts, c.hidden, c.local_intermediate, c.top_k))
+            kinds += [kinds[-1]] * (int(cache.num_layers) - len(kinds))
+        keys, labels, borrowed = [], [], {}
+        for fmt, opts, hidden, inter, top_k in kinds:
+            key = layer_kind_key(fmt, opts, hidden, inter, top_k, executor.num_threads)
+            if key not in rows:
+                row, threads = _nearest_thread_row(rows, key, executor.num_threads)
+                if row is not None:
+                    rows[key] = row
+                    borrowed[key] = threads
+            keys.append(key)
+            labels.append(f"{_format_label(fmt, tuple(sorted(opts.items())))} {hidden}x{inter}")
+        self._profile_borrowed = borrowed
+        return keys, labels, rows
 
     def _init_cpu_moe_executor(self, config: EngineConfig, cache, layers) -> None:
         """Build the persistent CPU MoE executor (decode-time expert compute).
@@ -3382,6 +3437,17 @@ def _parse_cpu_layers_spec(spec: str, num_moe_layers: int) -> frozenset[int]:
     return frozenset(round(i * num_moe_layers / k) for i in range(k))
 
 
+def _pin_probe_opted_in(config: EngineConfig) -> bool:
+    """Kai: upstream's load-time pin probe (#742: pin the banks until CUDA refuses one, OS-lock the rest) runs only
+    with FREETOKEN_PIN_PROBE=1. A refused cudaHostRegister has hung WSL hosts of this fork's size (pinned pages are
+    never reclaimed), so --moe-cpu-layers auto keeps planning against the cap `ft doctor pin` recorded (or the
+    estimate); --moe-bank-ram maps its banks and never probes."""
+    return (
+        os.environ.get("FREETOKEN_PIN_PROBE", "").strip().lower() in ("1", "true", "yes", "on")
+        and not config.moe_bank_ram
+    )
+
+
 def _resolve_cpu_layers(config: EngineConfig, num_moe_layers: int, *, reserved: int = 0, method=None) -> frozenset[int]:
     """MoE layer ids whose decode runs on the CPU executor.
 
@@ -3627,6 +3693,8 @@ _DENSE_MOE_SETTINGS = {
     "moe_cpu_layers": None,
     "moe_cpu_threads": 0,
     "moe_hybrid_max_fetch": -1,
+    "moe_locked_fetch": -1.0,
+    "moe_locked_max_fetch": 8,
     "moe_prefill_overlap": True,
     "moe_prefill_hit_d2d": False,
     "expert_load": "auto",

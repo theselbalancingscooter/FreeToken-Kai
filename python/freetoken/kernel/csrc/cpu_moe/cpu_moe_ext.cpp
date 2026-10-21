@@ -28,22 +28,20 @@
 #include <freetoken/hip_compat.h>
 #include <torch/extension.h>
 
+// Kai: --moe-bank-prefetch reads the rows a step routes to ahead of the executor (madvise / pread on the bank file)
 #if defined(__linux__)
 #include <cerrno>
-#include <pthread.h>
-#include <sched.h>
 #include <sys/mman.h>
 #include <unistd.h>
-#define CPU_MOE_HAS_AFFINITY 1
 #define CPU_MOE_HAS_BANK_PREFETCH 1
 #else
-#define CPU_MOE_HAS_AFFINITY 0
 #define CPU_MOE_HAS_BANK_PREFETCH 0
 #endif
 
 #include "format.h"
 #include "gpu_sync.h"
 #include "gpu_sync_io.h"
+#include "threads.h"
 
 namespace freetoken::cpu_moe {
 
@@ -58,27 +56,9 @@ void set_ggml_cpu(uintptr_t addr);
 // Kai: the packed Q4_0 / Q2_0 expert banks of --moe-expert-gguf (kernels/q4_0.cpp, kernels/q2_0.cpp)
 std::unique_ptr<MoeFormat> make_q4_0_format(const MoeParams& p, const FormatArgs& a);
 std::unique_ptr<MoeFormat> make_q2_0_format(const MoeParams& p, const FormatArgs& a);
+void bind_locked_fetch(pybind11::module_& m);
 
 namespace {
-
-inline void pin_this_thread(int cpu) {
-#if CPU_MOE_HAS_AFFINITY
-  cpu_set_t set;
-  CPU_ZERO(&set);
-  CPU_SET(cpu, &set);
-  pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
-#else
-  (void)cpu;
-#endif
-}
-
-inline void cpu_relax() {
-#if CPU_MOE_X86
-  _mm_pause();
-#elif defined(__aarch64__)
-  asm volatile("yield" ::: "memory");
-#endif
-}
 
 constexpr int kMaxTopK = 64;
 
@@ -754,6 +734,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            [](CpuMoeExecutor& e, bool v) { e.spin_wait.store(v, std::memory_order_relaxed); },
            py::arg("enabled"))
       .def("get_spin_wait", [](const CpuMoeExecutor& e) { return e.spin_wait.load(); });
+  freetoken::cpu_moe::bind_locked_fetch(m);
   m.def("memops_probe", &GpuSync::probe, py::arg("stream"));
   m.def("kernel_io_probe", &freetoken::cpu_moe::KernelIo::probe, py::arg("stream"));
   m.def("host_func_capture_safe", &GpuSync::host_func_capture_safe);
