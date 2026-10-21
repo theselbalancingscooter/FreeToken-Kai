@@ -1,7 +1,7 @@
 # FreeToken Kai (改)
 
 An unofficial fork of [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken),
-merged with upstream `main` at commit `cc4aa08` (2026-10-21). It is not affiliated with, endorsed
+merged with upstream `main` at commit `b10c0c4` (2026-10-22). It is not affiliated with, endorsed
 by, or supported by FlashML. The license is unchanged (Apache-2.0).
 
 The fork adds eleven things upstream does not have:
@@ -346,7 +346,10 @@ size, so `auto` keeps planning against the cap `ft doctor pin` recorded; `--moe-
 banks and takes no staged fetch (its non-resident rows decode on the CPU as before); the stats
 counters stay cumulative for the web console, so the new log line diffs its own snapshot instead
 of zeroing them; and `--moe-collect-stats` is on by default here, so that line comes with it
-(`--no-moe-collect-stats` turns both off).
+(`--no-moe-collect-stats` turns both off). Upstream `161ffa5`..`b10c0c4` (merged 2026-10-22)
+scans a hybrid slot pool wider than 8192 in tiles (#778, with `FREETOKEN_HYBRID_FETCH_ROUND` for
+how a fetch fraction rounds to a count) and adds a prefill guide (#785,
+[performance/prefill.md](performance/prefill.md)); nothing of the fork's changed.
 
 ## Running Ornith-1.5-35B-A3B on an RTX 2060 (6 GB) under WSL2
 
