@@ -153,3 +153,21 @@ def test_defaults_do_not_collide():
 
     assert server.DEFAULT_PORT == 1900 and server.MGR_PORT == 1901
     assert server._default_state_dir(False) != server._default_state_dir(True)
+
+
+def test_a_log_stream_can_start_from_the_tail_of_the_ring():
+    """The dashboard's log pane asks for the newest lines (`tail=`), not for everything since the
+    start of the log: replaying a long run's whole ring on every reload, one layout per line, made
+    the page slower to reload the longer the server had run. A resume keeps its own cursor."""
+    from freetoken.daemon.app import tail_cursor
+
+    ring = LogRing(capacity=10)
+    for i in range(25):
+        ring.append(f"line {i}")
+    assert ring.cursor() == 25
+    assert tail_cursor(ring, 0, None) == 0  # everything the ring still holds (the gap sentinel covers the rest)
+    assert tail_cursor(ring, 0, 3) == 22  # the newest three
+    assert tail_cursor(ring, 0, 100) == 0  # a tail longer than the log
+    assert tail_cursor(ring, 24, 3) == 24  # a reconnect keeps its cursor past the tail
+    assert tail_cursor(ring, 0, -1) == 0
+    assert [r["seq"] for r in ring.since(tail_cursor(ring, 0, 3))[0]] == [22, 23, 24]

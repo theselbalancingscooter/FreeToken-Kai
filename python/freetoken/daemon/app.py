@@ -395,8 +395,12 @@ def build_app(
         return doc
 
     @app.get("/engine/logs", dependencies=auth)
-    async def engine_logs(request: Request, since: int = 0):
-        return _log_stream(request, ring, since)
+    async def engine_logs(request: Request, since: int = 0, tail: int | None = None):
+        # tail: at most that many of the newest records before the live stream. A page that opens
+        # the log pane wants the end of the log, not the whole ring from since=0: replaying all
+        # 4000 lines of a long-running server, each laid out on arrival, is what made the dashboard
+        # slower to reload the longer the server had run.
+        return _log_stream(request, ring, since, tail=tail)
 
     # ---- checkpoint (phase 3; optional) ----
 
@@ -751,7 +755,17 @@ def _shutting_down(request: Request) -> bool:
     return bool(check and check())
 
 
-def _log_stream(request: Request, ring, since: int) -> StreamingResponse:
+def tail_cursor(ring, since: int, tail: int | None) -> int:
+    """The cursor a log stream starts from: ``since``, or with ``tail`` the newest ``tail`` records at most.
+
+    A resume (``since`` / ``Last-Event-ID``) past that point keeps its cursor, so a reconnect never replays what the
+    page already holds; None or a negative ``tail`` means everything from ``since``."""
+    if tail is None or tail < 0:
+        return since
+    return max(since, ring.cursor() - tail)
+
+
+def _log_stream(request: Request, ring, since: int, tail: int | None = None) -> StreamingResponse:
     """SSE log stream with replay + live tail. Correctness points:
       * subscribe BEFORE snapshotting the backlog, then dedupe live records by seq → no gap and
         no duplicate across the replay→live boundary;
@@ -765,6 +779,7 @@ def _log_stream(request: Request, ring, since: int) -> StreamingResponse:
     lei = request.headers.get("last-event-id")
     if lei and lei.isdigit():
         since = int(lei) + 1  # exclusive next-cursor
+    since = tail_cursor(ring, since, tail)
 
     q: asyncio.Queue = asyncio.Queue(maxsize=1000)
     drop = {"n": 0, "from": None, "to": None}

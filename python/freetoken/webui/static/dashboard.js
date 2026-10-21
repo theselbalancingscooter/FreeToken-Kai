@@ -364,20 +364,39 @@
     FTProfileEditor.open(p, { onSaved: loadProfiles });
   }
 
+  // The pane keeps the last LOG_KEEP lines. The first connection asks the manager for that many
+  // (`tail=`), not for everything since the start of the log: replaying the whole ring of a server
+  // that had run for hours, one layout per line, made every reload slower than the last. Lines are
+  // appended a frame at a time, so a burst (the replay, a prefill's progress) costs one layout.
+  const LOG_KEEP = 1500;
   async function followLogs() {
     const el = $("#log");
-    let since = 0;
+    let since = 0, first = true;
+    let pending = [], flushing = false;
+    const flush = () => {
+      flushing = false;
+      const lines = pending; pending = [];
+      const frag = document.createDocumentFragment();
+      for (const line of lines) frag.append(document.createTextNode(line));
+      el.append(frag);
+      while (el.childNodes.length > LOG_KEEP) el.removeChild(el.firstChild);
+      if ($("#log-follow").checked) el.scrollTop = el.scrollHeight;
+    };
+    const show = (line) => {
+      pending.push(line);
+      if (pending.length > LOG_KEEP) pending.splice(0, pending.length - LOG_KEEP);
+      if (!flushing) { flushing = true; requestAnimationFrame(flush); }
+    };
     for (;;) {
       try {
-        await FT.sse(`/engine/logs?since=${since}`, (ev) => {
+        await FT.sse(`/engine/logs?since=${since}${first ? `&tail=${LOG_KEEP}` : ""}`, (ev) => {
           if (!ev.data) return;
           let rec; try { rec = JSON.parse(ev.data); } catch { return; }
-          if (rec.kind === "gap") { el.append(t("dash_log_gap", { n: rec.dropped }) + "\n"); return; }
+          if (rec.kind === "gap") { show(t("dash_log_gap", { n: rec.dropped }) + "\n"); return; }
+          first = false;
           since = rec.seq + 1;
           if (rec.kind === "progress") return;
-          el.append(homePath(rec.text) + "\n");
-          while (el.childNodes.length > 1500) el.removeChild(el.firstChild);
-          if ($("#log-follow").checked) el.scrollTop = el.scrollHeight;
+          show(homePath(rec.text) + "\n");
         });
       } catch {}
       await new Promise((r) => setTimeout(r, 3000));
