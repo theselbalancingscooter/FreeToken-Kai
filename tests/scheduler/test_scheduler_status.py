@@ -176,6 +176,16 @@ def test_spec_line_reports_mean_accept_and_step_time():
     assert "gen throughput (token/s): 25.00" in logs[0]
 
 
+def test_moe_stats_line_follows_each_spec_line_too():
+    # a --spec-mtp server logs "Spec decode" lines instead of "Decode batch" ones
+    logs: list[str] = []
+    rep = SchedulerStatusReporter(log=logs.append, clock=lambda: 1.0, decode_log_interval=2, moe_stats=lambda: "MoE decode, x")
+    batch = SimpleNamespace(is_prefill=True, is_decode=False, reqs=[_req(4, 0)], log_new_tokens=0, log_cached_tokens=0)
+    for a in (1, 3, 2, 4):
+        rep.report_batch(batch, running_reqs=1, queue_reqs=0, kv_used_pages=1, kv_total_pages=100, page_size=64, spec_accepted=a)
+    assert [line.split(",")[0] for line in logs] == ["Spec decode", "MoE decode"] * 2
+
+
 def test_moe_stats_line_follows_each_decode_line():
     logs: list[str] = []
     calls = []

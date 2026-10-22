@@ -189,6 +189,10 @@ class SchedulerStatusReporter:
             f"gen throughput (token/s): {tokens / gap if gap > 0 else 0.0:.2f}, "
             f"#queue-req: {queue_reqs}"
         )
+        # the decode MoE stats line (--moe-collect-stats) follows the spec line too: a --spec-mtp server logs
+        # no "Decode batch" line, so without this the line never appeared (seen on the two RTX 3060s)
+        if self.moe_stats is not None and (line := self.moe_stats()):
+            self.log(line)
 
 
 def _usage_ratio(used: int, total: int) -> float:
