@@ -38,6 +38,8 @@ class EngineConfig:
     # become the expert banks, q2_0 / q4_0) while every other weight stays with --model. The
     # expert format tag is read from the file at config time (models/qwen4_exp/gguf_experts.py).
     moe_expert_gguf: str | None = None
+    # --embed-weights: "gpu" (default) keeps the input embedding tables in VRAM; "host" keeps the untied ones in pinned host RAM, read zero-copy by the lookup.
+    embed_weights: str = "gpu"
     # DeepSeek-V4.1 Decoder SWA Bounded Replay: "bounded" (default) runs the decoder layers on each
     # prompt's last window; "exact" runs them on every token.
     swa_decoder_replay: str = "bounded"

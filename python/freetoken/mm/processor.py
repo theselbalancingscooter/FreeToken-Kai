@@ -73,7 +73,14 @@ _PIL_IMAGE_PROCESSORS = {
 def _load_image_processor(model_path: str) -> Any:
     """AutoImageProcessor, or -- where torchvision is not installed, which AutoImageProcessor itself
     requires -- the PIL backend of the checkpoint's processor class. A server loads one or the other
-    in every process (same environment), so the pixel_values content hashes agree within it."""
+    in every process (same environment), so the pixel_values content hashes agree within it.
+    A GGUF builds it from the preprocessor_config its family derives (``utils.load_image_processor``)."""
+    from freetoken.models.gguf.reader import gguf_config_source
+
+    if gguf_config_source(model_path) is not None:
+        from freetoken.utils import load_image_processor
+
+        return load_image_processor(model_path)
     try:
         from transformers import AutoImageProcessor
 

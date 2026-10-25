@@ -498,7 +498,7 @@ def test_graph_capture_reuses_warm_offload_cache_before_capture(monkeypatch):
     monkeypatch.setattr("torch.cuda.reset_peak_memory_stats", lambda device=None: None)
     monkeypatch.setattr("freetoken.engine.graph.get_free_memory", lambda device: 1024)
     # upstream #697 uploads each captured graph through libcuda; the fake graph has no executable
-    monkeypatch.setattr("freetoken.engine.graph._cu_graph_upload", lambda: None)
+    monkeypatch.setattr("freetoken.engine.graph._upload_graph", lambda graph, stream: None)
 
     dummy_req = Req(
         input_ids=torch.tensor([0], dtype=torch.int32),
@@ -1304,3 +1304,36 @@ def test_lock_failure_downgrades_echoed_residency(monkeypatch):
         with hb.PinPipeline() as pins:
             pins(1, {"gate_up": hb.HostBank((4,), torch.uint8)})
     assert plan2.actual == {1: hb.HostResidency.PAGEABLE.value}
+
+
+def test_host_ram_fits_parallel_sizes_subdirectory_shards(tmp_path, monkeypatch):
+    """The RAM probe must size the shards the reader will actually open, indexed subdirectory layouts included."""
+    import builtins
+    import io
+    import json
+
+    from freetoken.moe.expert_banks import _host_ram_fits_parallel
+
+    sub = tmp_path / "tensors"
+    sub.mkdir()
+    for i in (1, 2):
+        (sub / f"model-{i:05d}-of-00002.safetensors").write_bytes(b"x" * (1 << 20))
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    "model.layers.0.mlp.experts.0.gate_proj.weight": "tensors/model-00001-of-00002.safetensors",
+                    "model.layers.0.mlp.experts.0.down_proj.weight": "tensors/model-00002-of-00002.safetensors",
+                }
+            }
+        )
+    )
+    real_open = builtins.open
+
+    def fake_open(file, *args, **kwargs):
+        if str(file) == "/proc/meminfo":
+            return io.StringIO("MemAvailable:           512 kB\n")
+        return real_open(file, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", fake_open)
+    assert not _host_ram_fits_parallel(str(tmp_path))

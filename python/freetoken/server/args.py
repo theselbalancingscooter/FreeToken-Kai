@@ -223,6 +223,8 @@ def parse_args(
             " ".join(str(v) for v in text_cfg.get("architectures", []) or []),
         ]
         marker = " ".join(candidates).lower()
+        if "flint" in marker:
+            return "glm47"
         if "gpt_oss" in marker or "gpt-oss" in marker or "gptoss" in marker:
             return "gpt_oss"
         # M3 first: its marker also contains the bare "minimax" substring, but the
@@ -274,6 +276,8 @@ def parse_args(
             " ".join(str(v) for v in text_cfg.get("architectures", []) or []),
         ]
         marker = " ".join(candidates).lower()
+        if "flint" in marker:
+            return "flint"
         if "gpt_oss" in marker or "gpt-oss" in marker or "gptoss" in marker:
             return "gpt_oss"
         if "deepseek" in marker and any(
@@ -608,6 +612,15 @@ def parse_args(
         metavar="{vision,audio}",
         help="Encoder towers to leave unbuilt; every input they would serve is rejected.",
     )
+    parser.add_argument(
+        "--mmproj",
+        type=str,
+        default=None,
+        metavar="FILE",
+        help="llama.cpp vision tower (mmproj GGUF) for a GGUF model. Default: a *mmproj*.gguf that fits the model "
+        "in the model file's folder (BF16 > F32 > F16 > quantized when several are there); none found, or files of "
+        "several models, serves text only.",
+    )
 
     parser.add_argument(
         "--image-min-tokens",
@@ -758,7 +771,7 @@ def parse_args(
         default="auto",
         choices=[
             "auto", "off", "deepseekv32", "gpt_oss", "qwen3", "glm",
-            "minimax", "minimax_m3", "muse_glimmer", "gemma4",
+            "minimax", "minimax_m3", "muse_glimmer", "gemma4", "flint",
         ],
         help=(
             "Reasoning parser that splits chain-of-thought into reasoning_content "
@@ -820,6 +833,17 @@ def parse_args(
             "the expert banks (2.25 bit for Q2_0: half the host RAM and the per-token traffic of "
             "NVFP4, twice the experts per GPU cache). Needs --moe-strategy offload or hybrid; the "
             "experts of every layer must share one ggml type (Q2_0 or Q4_0). Qwen3.8-Flash-Next."
+        ),
+    )
+
+    parser.add_argument(
+        "--embed-weights",
+        default=ServerArgs.embed_weights,
+        choices=["gpu", "host"],
+        help=(
+            "Where the input token embedding table lives. 'gpu' (default) keeps it in VRAM; 'host' keeps it in "
+            "pinned host RAM and each lookup reads its rows over PCIe, so its VRAM goes to the expert cache and KV. "
+            "Not for a table tied to the LM head."
         ),
     )
 
@@ -1385,6 +1409,17 @@ def parse_args(
 
     if kwargs["model_path"].startswith("~"):
         kwargs["model_path"] = os.path.expanduser(kwargs["model_path"])
+
+    # every process reads the GGUF config, tokenizer workers included, so the choice travels in the environment
+    from freetoken.models.gguf.mmproj import MMPROJ_ENV
+
+    os.environ.pop(MMPROJ_ENV, None)
+    if (mmproj := kwargs.pop("mmproj")) is not None:
+        from freetoken.models.gguf.reader import is_gguf_path
+
+        if not is_gguf_path(kwargs["model_path"]):
+            parser.error("--mmproj needs a .gguf model file")
+        os.environ[MMPROJ_ENV] = os.path.abspath(os.path.expanduser(mmproj))
 
     # a bad media root is a deployment mistake; fail at startup, not per request
     if kwargs["allowed_local_media_path"]:

@@ -7,7 +7,7 @@ from .activation import (
     swiglu_clamp_and_mul,
     swigluoai_and_mul,
 )
-from .base import BaseOP, OPList, StateLessOP
+from .base import BaseOP, OPList, StateLessOP, iter_ops
 from .embedding import (
     Fp8VocabParallelEmbedding,
     HostEmbedding,
@@ -44,6 +44,7 @@ __all__ = [
     "BaseOP",
     "StateLessOP",
     "OPList",
+    "iter_ops",
     "VocabParallelEmbedding",
     "HostEmbedding",
     "ParallelLMHead",

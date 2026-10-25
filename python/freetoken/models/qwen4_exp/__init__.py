@@ -10,7 +10,7 @@ Contracts shared across modules (do not rename):
 """
 
 from .config import parse_config
-from .gguf import iter_gguf_weights, parse_gguf_config, to_gguf
+from .gguf import gguf_mm_config, iter_gguf_weights, parse_gguf_config, to_gguf
 from .gguf_experts import (
     dummy_q2_0_expert_sources,
     dummy_q4_0_expert_sources,
@@ -40,6 +40,7 @@ __all__ = [
     "load_ple_table",
     "parse_config",
     "iter_expert_pieces",
+    "gguf_mm_config",
     "iter_gguf_weights",
     "parse_gguf_config",
     "to_gguf",
